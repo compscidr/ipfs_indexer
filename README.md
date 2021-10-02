@@ -18,7 +18,7 @@ https://stackoverflow.com/questions/62861623/should-cargo-lock-be-committed-when
 
 Requirements: `xcode`
 
-Run `xcode-select --install` if you do not have xcode installed, need to update xcode, or run into build errors
+Run `xcode-select --install` if you do not have xcode installed, need to update xcode, or run into xcode related build errors
 
 ## CI
 I setup a workflow that should run a build at least on push, but doesnt run any tests because I have no idea how test
