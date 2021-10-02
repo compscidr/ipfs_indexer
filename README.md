@@ -14,6 +14,12 @@ https://doc.rust-lang.org/cargo/commands/cargo-init.html
 Adding Cargo.lock to version control - it *seems* like it might be best practice for a binary (app):
 https://stackoverflow.com/questions/62861623/should-cargo-lock-be-committed-when-the-crate-is-both-a-rust-library-and-an-exec
 
+## Building on mac
+
+Requirements: `xcode`
+
+Run `xcode-select --install` if you do not have xcode installed, need to update xcode, or run into build errors
+
 ## CI
 I setup a workflow that should run a build at least on push, but doesnt run any tests because I have no idea how test
 suites work yet for rust.
