@@ -1,6 +1,21 @@
 # ipfs_indexer
 An ipfs indexer / search engine
 
+## What Needs to be Done
+- Discover content to be indexed, add them to the index queue
+  - Listen in on the gossip protocol
+  - Start from some collection of pages on ipfs.io/ipfs
+- Implement an index queue processor
+  - Fetch the ipfs content
+  - Process the page for more ipfs links, Add those links into the index queue
+  - Index the pages somehow
+    - Ranked keywords by frequency or something?
+  - Store the index somehow (start with in-memory, then figure out how to do storage later)
+    - A hashmap of map[keyword] -> sorted tree where the entries are sorted by keyword frequency and entries contain ipfs hash?
+    - Probably also want to store an excerpt, page title of the page to present to front-end
+- Implement a front-end which queries the index storage and displays the page title, ipfs/io/ipfs link to the page and excerpt
+  from the browser
+
 ## Build notes
 Did init as a "binary" - not sure if this makes sense, or if other people think we should split this into a library
 bit and an application bit. I suppose we can always change it later as it grows.
