@@ -121,7 +121,9 @@ impl Indexer {
                     continue;
                 } else {
                     let res = Self::retreive_content(cid.clone());
-                    map.insert(cid.clone(), res.0.unwrap());
+                    if res.0.is_some() {
+                        map.insert(cid.clone(), res.0.unwrap());
+                    }
                     info!("indexed cid {}. Have {} entries. Have {} more cids to add to the queue", cid, map.len(),  res.1.len());
                     for new_cid in res.1 {
                         if map.contains_key(&new_cid) {
