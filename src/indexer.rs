@@ -147,8 +147,19 @@ impl Indexer {
         let url = format!("https://ipfs.io/ipfs/{}", cid);
         info!("retreiving content from {}", url);
         let client = reqwest::blocking::Client::new();
-        // assume we get an ok response and not an error
-        let response = client.get(&url).send().unwrap();
+        
+        let result = client.get(&url).send();
+        let mut result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("error retrieving content from {}: {}", url, e);
+                if e.is_timeout() {
+                    cids.push(cid);
+                }
+                return (None, cids);
+            }
+        };
+        let response = result;
 
         // todo: check the file type header and only proceed this way if it is actually html, otherwise index as some other file type
         // plus some meta data
@@ -165,19 +176,30 @@ impl Indexer {
             let inner_html = noscript.unwrap().inner_html();
             if inner_html.find("meta http-equiv=\"refresh\"").is_none() {
                 warn!("no meta http-equiv=\"refresh\" found");
-                return (None, cids);
             } else {
                 info!("found meta http-equiv=\"refresh\"");
+                let start_bytes = inner_html.find("url=").unwrap_or(0);
+                let end_bytes = inner_html[start_bytes..].find("\"").unwrap_or(inner_html.len()) + start_bytes;
+                let redirect_url = &inner_html[start_bytes + 4..end_bytes];
+                // assuming relative
+                let newurl = format!("{}/{}", url, redirect_url);
+
+                fullcid = cid.clone() + redirect_url;
+                let result = client.get(&newurl).send();
+                let result = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("error retrieving content from {}: {}", url, e);
+                        if e.is_timeout() {
+                            cids.push(fullcid);
+                        }
+                        return (None, cids);
+                    }
+                };
+                let response = result;
+                html = response.text().unwrap();
+                document = Html::parse_document(html.as_str());
             }
-            let start_bytes = inner_html.find("url=").unwrap_or(0);
-            let end_bytes = inner_html[start_bytes..].find("\"").unwrap_or(inner_html.len()) + start_bytes;
-            let redirect_url = &inner_html[start_bytes + 4..end_bytes];
-            // assuming relative
-            let newurl = format!("{}/{}", url, redirect_url);
-            let response = client.get(&newurl).send().unwrap();
-            html = response.text().unwrap();
-            document = Html::parse_document(html.as_str());
-            fullcid = cid.clone() + redirect_url;
         }
         //info!("recevied: {:?}", html.as_str());
 
@@ -240,7 +262,8 @@ impl Indexer {
                 }
             }
 
-            excerpt = content[..128].to_string();
+            let end = content.char_indices().map(|(i, _)| i).nth(128).unwrap();
+            excerpt = content[..end].to_string();
         }
         let result = IndexResult::new(fullcid, title, excerpt.to_string(), keywords);
 
