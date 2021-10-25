@@ -4,7 +4,7 @@ use std::{sync, thread, time};
 use std::sync::atomic::{AtomicBool, Ordering};
 use cid::multihash::{Code, MultihashDigest};
 use cid::Cid;
-use log::{info,warn};
+use log::{trace,info,warn};
 use std::fmt;
 use scraper::{Html,Selector};
 use std::collections::HashMap;
@@ -75,7 +75,7 @@ impl Indexer {
     pub fn enqueue_cid_with_path(&mut self, cid: Cid, relative_path: String) {
         let key = cid.to_string() + "/" + &relative_path;
         if self.map.contains_key(&key) {
-            info!("cid {} already in map", key);
+            trace!("cid {} already in map", key);
             return;
         } else {
             info!("enqueueing cid {}", key);
@@ -117,17 +117,17 @@ impl Indexer {
                     break;
                 }
                 if map.contains_key(&cid) {
-                    info!("cid {} already in queue", cid);
-                    return;
+                    trace!("cid {} already in map", cid);
+                    continue;
                 } else {
                     let res = Self::retreive_content(cid.clone());
                     map.insert(cid.clone(), res.0.unwrap());
-                    info!("indexed cid {}. Got {} more cids", cid, res.1.len());
+                    info!("indexed cid {}. Have {} entries. Have {} more cids to add to the queue", cid, map.len(),  res.1.len());
                     for new_cid in res.1 {
                         if map.contains_key(&new_cid) {
-                            info!("cid {} already in map", new_cid);
+                            trace!("cid {} already in map", new_cid);
                         } else {
-                            info!("enqueueing cid {}", new_cid);
+                            // info!("enqueueing cid {}", new_cid);
                             tx.send(new_cid.clone()).unwrap();
                         }
                     }
@@ -178,8 +178,6 @@ impl Indexer {
             html = response.text().unwrap();
             document = Html::parse_document(html.as_str());
             fullcid = cid.clone() + redirect_url;
-        } else {
-            info!("not a direct");
         }
         //info!("recevied: {:?}", html.as_str());
 
@@ -207,9 +205,10 @@ impl Indexer {
             } else {
                 // relative link to current top cid
                 //info!("found relative link to {}", link);
-                let root_cid = fullcid.clone()[0..fullcid.find("/").unwrap_or(fullcid.len())].to_string();
-                let full_relative = root_cid + "/" + link;
-                info!("relative link with cid: {}", full_relative);
+                //let root_cid = fullcid.clone()[0..fullcid.find("/").unwrap_or(fullcid.len())].to_string();
+                //let full_relative = root_cid + "/" + link;
+                let full_relative = fullcid.clone() + link;
+                //info!("relative link with cid: {}", full_relative);
                 cids.push(full_relative);
             }
         }
