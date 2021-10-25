@@ -35,6 +35,10 @@ Requirements: `xcode`
 
 Run `xcode-select --install` if you do not have xcode installed, need to update xcode, or run into xcode related build errors
 
+## Running with logging output
+- Run `cargo build` to build
+- Run `RUST_LOG=info ./target/debug/ipfs_indexer` to see logging output (adjust level accordingly)
+
 ## CI
 I setup a workflow that should run a build at least on push, but doesnt run any tests because I have no idea how test
 suites work yet for rust.
