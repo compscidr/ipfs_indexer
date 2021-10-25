@@ -5,10 +5,8 @@ use libp2p::swarm::{Swarm, SwarmEvent};
 use libp2p::{identity, PeerId};
 use std::error::Error;
 use std::task::Poll;
-use cid::multihash::{Code, MultihashDigest};
 use cid::Cid;
 use log::info;
-use std::{thread, time};
 use simple_logger::SimpleLogger;
 use std::convert::TryFrom;
 

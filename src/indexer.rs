@@ -8,7 +8,6 @@ use log::{info,warn};
 use std::fmt;
 use scraper::{Html,Selector};
 use std::collections::HashMap;
-use std::convert::TryFrom;
 
 pub const RAW: u64 = 0x55;
 
@@ -57,7 +56,7 @@ pub struct Indexer {
     queue: (Option<Sender<String>>, Option<Receiver<String>>),
     running: sync::Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
-    POISON_PILL: Cid,
+    poison_pill: Cid,
 }
 
 // took some ideas from here: https://stackoverflow.com/questions/42043823/design-help-threading-within-a-struct
@@ -69,7 +68,7 @@ impl Indexer {
             queue: (Some(tx), Some(rx)),
             running: sync::Arc::new(AtomicBool::new(false)),
             handle: None,
-            POISON_PILL: Cid::new_v1(RAW, Code::Sha2_256.digest(b"Poison Pill")),
+            poison_pill: Cid::new_v1(RAW, Code::Sha2_256.digest(b"Poison Pill")),
         }
     }
 
@@ -105,7 +104,7 @@ impl Indexer {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let rx = self.queue.1.take().unwrap();
-        let POISON_PILL = self.POISON_PILL.clone();
+        let poison_pill = self.poison_pill.clone();
         let map = sync::Arc::clone(&self.map);
         let tx = self.queue.0.clone().unwrap();
         self.handle = Some(thread::spawn(move || {
@@ -113,7 +112,7 @@ impl Indexer {
             while running.load(Ordering::SeqCst) {
                 let cid = rx.recv().unwrap();
                 info!("processing cid {}", cid);
-                if cid == POISON_PILL.to_string() {
+                if cid == poison_pill.to_string() {
                     info!("received poison pill, stopping indexer thread");
                     break;
                 }
@@ -255,7 +254,7 @@ impl Indexer {
             warn!("trying to stop before indexer started");
             return;
         }
-        self.enqueue_cid(self.POISON_PILL);
+        self.enqueue_cid(self.poison_pill);
         self.running.store(false, Ordering::SeqCst);
         self.handle.take().unwrap().join().unwrap();
     }
