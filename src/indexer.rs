@@ -151,7 +151,7 @@ impl Indexer {
         let client = reqwest::blocking::Client::new();
         
         let result = client.get(&url).send();
-        let mut result = match result {
+        let result = match result {
             Ok(r) => r,
             Err(e) => {
                 warn!("error retrieving content from {}: {}", url, e);
@@ -226,12 +226,15 @@ impl Indexer {
                 cids.push(cid);
             } else if link.starts_with("http") || link.starts_with("https") {
                 //info!("found link to external url: {}", link);
+            } else if link.starts_with("#") {
+                // ignore anchors on same page
             } else {
                 // relative link to current top cid
                 //info!("found relative link to {}", link);
                 //let root_cid = fullcid.clone()[0..fullcid.find("/").unwrap_or(fullcid.len())].to_string();
                 //let full_relative = root_cid + "/" + link;
-                let full_relative = fullcid.clone() + link;
+                let last_slash = fullcid.rfind("/").unwrap_or(fullcid.len());
+                let full_relative = fullcid.clone()[0..last_slash].to_string() + "/" + link;
                 //info!("relative link with cid: {}", full_relative);
                 cids.push(full_relative);
             }
@@ -262,6 +265,10 @@ impl Indexer {
                         keywords.insert(word, 1);
                     }
                 }
+            }
+            
+            if content.contains("no link named") {
+                warn!("ipfs error on page {}, likely doesn't exist", fullcid);
             }
 
             let end = content.char_indices().map(|(i, _)| i).nth(128).unwrap();
