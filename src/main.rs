@@ -10,6 +10,7 @@ use cid::Cid;
 use log::info;
 use std::{thread, time};
 use simple_logger::SimpleLogger;
+use std::convert::TryFrom;
 
 mod indexer;
 use indexer::Indexer;
@@ -24,15 +25,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut index = Indexer::new();
     index.start();
 
-    index.enqueue_cid(Cid::new_v1(indexer::RAW, Code::Sha2_256.digest(b"Hello World")));
-
-    thread::sleep(time::Duration::from_millis(100));
-
-    index.enqueue_cid(Cid::new_v1(indexer::RAW, Code::Sha2_256.digest(b"Hello World")));
-
-    thread::sleep(time::Duration::from_millis(100));
-
-    index.stop();
+    // enqueue the same cid twice to make sure we get the output that it's already in the map
+    // note: delays are so that we don't stop before the indexer has a chance to work, in reality we don't need them
+    let wikipedia_cid = Cid::try_from("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco").unwrap();
+    index.enqueue_cid(wikipedia_cid);
+    // thread::sleep(time::Duration::from_millis(100));
+    // index.enqueue_cid(wikipedia_cid);
+    // thread::sleep(time::Duration::from_millis(100));
     
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
@@ -72,6 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Poll::Pending => return Poll::Pending
         }
     }));
-
+    
+    index.stop();
     Ok(())
 }
