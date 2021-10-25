@@ -29,9 +29,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     // note: delays are so that we don't stop before the indexer has a chance to work, in reality we don't need them
     let wikipedia_cid = Cid::try_from("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco").unwrap();
     index.enqueue_cid(wikipedia_cid);
-    // thread::sleep(time::Duration::from_millis(100));
-    // index.enqueue_cid(wikipedia_cid);
-    // thread::sleep(time::Duration::from_millis(100));
     
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
@@ -71,7 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Poll::Pending => return Poll::Pending
         }
     }));
-    
+
     index.stop();
     Ok(())
 }
