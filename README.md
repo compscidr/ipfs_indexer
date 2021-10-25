@@ -1,5 +1,7 @@
 # ipfs_indexer
-An ipfs indexer / search engine
+[![.github/workflows/build-and-test.yml](https://github.com/compscidr/ipfs_indexer/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/compscidr/ipfs_indexer/actions/workflows/build-and-test.yml)
+
+An ipfs indexer / search engine built in rust.
 
 ## What Needs to be Done
 - Discover content to be indexed, add them to the index queue
