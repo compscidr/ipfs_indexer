@@ -3,11 +3,11 @@ An ipfs indexer / search engine
 
 ## What Needs to be Done
 - Discover content to be indexed, add them to the index queue
-  - Listen in on the gossip protocol
-  - Start from some collection of pages on ipfs.io/ipfs
+  - [ ] Listen in on the gossip protocol
+  - [X] Start from some collection of pages on ipfs.io/ipfs
 - Implement an index queue processor
-  - Fetch the ipfs content
-  - Process the page for more ipfs links, Add those links into the index queue
+  - [X] Fetch the ipfs content
+  - [X] Process the page for more ipfs links, Add those links into the index queue
   - Index the pages somehow
     - Ranked keywords by frequency or something?
   - Store the index somehow (start with in-memory, then figure out how to do storage later)
