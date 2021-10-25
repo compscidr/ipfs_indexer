@@ -14,3 +14,4 @@ log = "0.4.14"
 simple_logger = "1.13.0"
 reqwest = { version = "0.11.6", features = ["gzip", "blocking"] }
 scraper = "0.12.0"
+ctrlc = "3.2.1"

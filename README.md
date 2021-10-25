@@ -38,6 +38,7 @@ Run `xcode-select --install` if you do not have xcode installed, need to update 
 ## Running with logging output
 - Run `cargo build` to build
 - Run `RUST_LOG=info ./target/debug/ipfs_indexer` to see logging output (adjust level accordingly)
+- RUn `RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080` to use your own ipfs gateway instead of ipfs.io
 
 ## CI
 I setup a workflow that should run a build at least on push, but doesnt run any tests because I have no idea how test

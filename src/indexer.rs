@@ -57,11 +57,12 @@ pub struct Indexer {
     running: sync::Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     poison_pill: Cid,
+    ipfs_gateway: String,
 }
 
 // took some ideas from here: https://stackoverflow.com/questions/42043823/design-help-threading-within-a-struct
 impl Indexer {
-    pub fn new() -> Indexer {
+    pub fn new(ipfs_gateway: String) -> Indexer {
         let (tx, rx) = channel();
         Indexer {
             map: sync::Arc::new(CHashMap::new()),
@@ -69,6 +70,7 @@ impl Indexer {
             running: sync::Arc::new(AtomicBool::new(false)),
             handle: None,
             poison_pill: Cid::new_v1(RAW, Code::Sha2_256.digest(b"Poison Pill")),
+            ipfs_gateway: ipfs_gateway
         }
     }
 
@@ -107,6 +109,7 @@ impl Indexer {
         let poison_pill = self.poison_pill.clone();
         let map = sync::Arc::clone(&self.map);
         let tx = self.queue.0.clone().unwrap();
+        let gateway = self.ipfs_gateway.clone();
         self.handle = Some(thread::spawn(move || {
             info!("indexer thread started");
             while running.load(Ordering::SeqCst) {
@@ -120,7 +123,7 @@ impl Indexer {
                     trace!("cid {} already in map", cid);
                     continue;
                 } else {
-                    let res = Self::retreive_content(cid.clone());
+                    let res = Self::retreive_content(gateway.clone(), cid.clone());
                     if res.0.is_some() {
                         map.insert(cid.clone(), res.0.unwrap());
                     }
@@ -144,9 +147,9 @@ impl Indexer {
         info!("indexer started");
     }
 
-    fn retreive_content(cid: String) -> (Option<IndexResult>, Vec<String>) {
+    fn retreive_content(gateway: String, cid: String) -> (Option<IndexResult>, Vec<String>) {
         let mut cids = Vec::new();
-        let url = format!("https://ipfs.io/ipfs/{}", cid);
+        let url = format!("http://{}/ipfs/{}", gateway, cid);
         info!("retreiving content from {}", url);
         let client = reqwest::blocking::Client::new();
         
@@ -216,12 +219,12 @@ impl Indexer {
         let selector = Selector::parse("a").unwrap();
         for element in document.select(&selector) {
             let link = element.value().attr("href").unwrap_or("");
-            if link.starts_with("http://ipfs.io/ipfs/") {
-                let cid = link[20..].to_string();
+            if link.starts_with(format!("http://{}/ipfs/", gateway).as_str()) {
+                let cid = link[12 + gateway.len() ..].to_string();
                 info!("found link to {}", cid);
                 cids.push(cid);
-            } else if link.starts_with("https://ipfs.io/ipfs/") {
-                let cid = link[21..].to_string();
+            } else if link.starts_with(format!("https://{}/ipfs/", gateway).as_str()) {
+                let cid = link[13 + gateway.len() ..].to_string();
                 info!("found link to {}", cid);
                 cids.push(cid);
             } else if link.starts_with("http") || link.starts_with("https") {
