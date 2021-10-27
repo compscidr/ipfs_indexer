@@ -5,11 +5,11 @@ An ipfs indexer / search engine built in rust.
 
 ## What Needs to be Done
 - Discover content to be indexed, add them to the index queue
-  - Listen in on the gossip protocol
-  - Start from some collection of pages on ipfs.io/ipfs
+  - [ ] Listen in on the gossip protocol
+  - [X] Start from some collection of pages on ipfs.io/ipfs
 - Implement an index queue processor
-  - Fetch the ipfs content
-  - Process the page for more ipfs links, Add those links into the index queue
+  - [X] Fetch the ipfs content
+  - [X] Process the page for more ipfs links, Add those links into the index queue
   - Index the pages somehow
     - Ranked keywords by frequency or something?
   - Store the index somehow (start with in-memory, then figure out how to do storage later)
@@ -36,6 +36,11 @@ https://stackoverflow.com/questions/62861623/should-cargo-lock-be-committed-when
 Requirements: `xcode`
 
 Run `xcode-select --install` if you do not have xcode installed, need to update xcode, or run into xcode related build errors
+
+## Running with logging output
+- Run `cargo build` to build
+- Run `RUST_LOG=info ./target/debug/ipfs_indexer` to see logging output (adjust level accordingly)
+- RUn `RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080` to use your own ipfs gateway instead of ipfs.io
 
 ## CI
 I setup a workflow that should run a build at least on push, but doesnt run any tests because I have no idea how test
