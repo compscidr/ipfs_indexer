@@ -61,6 +61,9 @@ Run `xcode-select --install` if you do not have xcode installed, need to update 
 - Run `RUST_LOG=info ./target/debug/ipfs_indexer` to see logging output (adjust level accordingly)
 - Run `RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080` to use your own ipfs gateway instead of ipfs.io
 
+## Running with docker
+From the docker directory, run `docker-compose up`. Currently image is only ~26MB.
+
 ## CI
 I setup a workflow that should run a build at least on push, but doesnt run any tests because I have no idea how test
 suites work yet for rust.
