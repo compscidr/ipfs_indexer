@@ -132,7 +132,7 @@ impl Indexer {
                         if map.contains_key(&new_cid) {
                             trace!("cid {} already in map", new_cid);
                         } else {
-                            // info!("enqueueing cid {}", new_cid);
+                            trace!("enqueueing cid {}", new_cid);
                             tx.send(new_cid.clone()).unwrap();
                         }
                     }
@@ -206,7 +206,7 @@ impl Indexer {
                 document = Html::parse_document(html.as_str());
             }
         }
-        //info!("recevied: {:?}", html.as_str());
+        trace!("recevied: {:?}", html.as_str());
 
         let selector = Selector::parse("title").unwrap();
         let titletag = document.select(&selector).next(); // = document.select(&selector).next().unwrap().text().collect();
