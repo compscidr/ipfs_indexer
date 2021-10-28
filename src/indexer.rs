@@ -23,7 +23,7 @@ impl IndexResult {
         IndexResult {
             cid: cid,
             title: title,
-            excerpt: excerpt,
+            excerpt: excerpt,   
             keywords: keywords
         }
     }
@@ -159,6 +159,11 @@ impl Indexer {
             Err(e) => {
                 warn!("error retrieving content from {}: {}", url, e);
                 if e.is_timeout() {
+                    cids.push(cid);
+                } else {
+                    // had to add this so we keep retrying if the indexer comes up
+                    // before ipfs service does in docker
+                    warn!("ipfs service may be down");
                     cids.push(cid);
                 }
                 return (None, cids);
