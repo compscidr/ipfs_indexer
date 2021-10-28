@@ -48,8 +48,21 @@ impl fmt::Display for IndexResult {
 
 #[cfg(test)]
 mod tests {
+    use std::array::IntoIter;
+    use std::{collections::HashMap, iter::FromIterator};
+
+    use crate::index_result::IndexResult;
+
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn single_keyword() {
+        let keywords = HashMap::<_, _>::from_iter(IntoIter::new([("key1".to_string(), 1)]));
+
+        let result = IndexResult::new(
+            "1".to_string(),
+            "title".to_string(),
+            "excerpt".to_string(),
+            keywords,
+        );
+        assert_eq!(result.top_n_keywords(10).len(), 1);
     }
 }
