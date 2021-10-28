@@ -30,9 +30,9 @@ An ipfs indexer / search engine built in rust.
 - Implement a front-end which queries the index storage and displays the page title, ipfs/io/ipfs link to the page and excerpt
   from the browser
 - Feedback loop from what people click on more often to rank those higher
-- Might a docker container:
-  - deploy will auto restart itself on crash (will also make it easy to see consumed memory with docker stats and other tools)
-  - will be able to deploy with a local ipfs instance all ready to go within the container
+- [X] Might a docker container:
+  - [X] deploy will auto restart itself on crash (will also make it easy to see consumed memory with docker stats and other tools)
+  - [X] will be able to deploy with a local ipfs instance all ready to go within the container
   - can artificially restrict memory so we can test things like ejection mechanisms
 - Farther out -> hook into papertrail or some logging service so we can see what's up if it dies
 - Tests! - **Conor working on**
@@ -60,6 +60,9 @@ Run `xcode-select --install` if you do not have xcode installed, need to update 
 - Run `cargo build` to build
 - Run `RUST_LOG=info ./target/debug/ipfs_indexer` to see logging output (adjust level accordingly)
 - Run `RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080` to use your own ipfs gateway instead of ipfs.io
+
+## Running with docker
+From the docker directory, run `docker-compose up`. Currently image is only ~26MB.
 
 ## CI
 I setup a workflow that should run a build at least on push, but doesnt run any tests because I have no idea how test
