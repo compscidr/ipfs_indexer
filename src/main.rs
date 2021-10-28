@@ -1,15 +1,11 @@
-use futures::executor::block_on;
-use futures::prelude::*;
-use libp2p::ping::{Ping, PingConfig};
-use libp2p::swarm::{Swarm, SwarmEvent};
-use libp2p::{identity, PeerId};
-use std::error::Error;
-use std::task::Poll;
 use cid::Cid;
-use log::{info,warn};
+use futures::executor::block_on;
+use libp2p::{identity, PeerId};
+use log::{info, warn};
 use simple_logger::SimpleLogger;
 use std::convert::TryFrom;
 use std::env;
+use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -31,7 +27,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         gateway = &args[1];
     }
 
-
     let mut index = Indexer::new(gateway.to_string());
     index.start();
 
@@ -39,16 +34,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     // note: delays are so that we don't stop before the indexer has a chance to work, in reality we don't need them
     let wikipedia_cid = Cid::try_from("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco").unwrap();
     index.enqueue_cid(wikipedia_cid);
-    
+
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
     info!("Local peer id: {:?}", local_peer_id);
 
-    let transport = block_on(libp2p::development_transport(local_key))?;
+    let _transport = block_on(libp2p::development_transport(local_key))?;
 
     // this stuff conflicts with the running ipfs node,
     // so need to rejig it otherwise it panics before indexing starts
-    
+
     // Create a ping network behaviour.
     //
     // For illustrative purposes, the ping protocol is configured to
@@ -87,7 +82,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
-    }).expect("Error setting Ctrl-C handler");
+    })
+    .expect("Error setting Ctrl-C handler");
 
     info!("Waiting for Ctrl-C...");
     while running.load(Ordering::SeqCst) {}
