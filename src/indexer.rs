@@ -1,13 +1,13 @@
 use chashmap::CHashMap;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::{sync, thread, time};
-use std::sync::atomic::{AtomicBool, Ordering};
 use cid::multihash::{Code, MultihashDigest};
 use cid::Cid;
-use log::{trace,info,warn};
-use std::fmt;
-use scraper::{Html,Selector};
+use log::{info, trace, warn};
+use scraper::{Html, Selector};
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::{sync, thread, time};
 
 pub const RAW: u64 = 0x55;
 
@@ -15,16 +15,21 @@ struct IndexResult {
     pub cid: String,
     pub title: String,
     pub excerpt: String,
-    pub keywords: HashMap<String, u32>
+    pub keywords: HashMap<String, u32>,
 }
 
 impl IndexResult {
-    pub fn new(cid: String, title: String, excerpt: String, keywords: HashMap<String, u32>) -> IndexResult {
+    pub fn new(
+        cid: String,
+        title: String,
+        excerpt: String,
+        keywords: HashMap<String, u32>,
+    ) -> IndexResult {
         IndexResult {
             cid: cid,
             title: title,
-            excerpt: excerpt,   
-            keywords: keywords
+            excerpt: excerpt,
+            keywords: keywords,
         }
     }
 
@@ -32,7 +37,7 @@ impl IndexResult {
      * Returns the top n keywords. Todo: use a tree structure to store the rankings of the keywords
      * so that this is faster
      */
-    pub fn top_n_keywords(&self, n: u32) -> Vec<(&String, &u32)>{
+    pub fn top_n_keywords(&self, n: u32) -> Vec<(&String, &u32)> {
         let mut hash_vec: Vec<(&String, &u32)> = self.keywords.iter().collect();
         hash_vec.sort_by(|a, b| b.1.cmp(a.1));
         hash_vec.iter().take(n as usize).cloned().collect()
@@ -41,7 +46,14 @@ impl IndexResult {
 
 impl fmt::Display for IndexResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CID: {} \nTitle: {}\n{}\nKeywords: {:?}", self.cid, self.title, self.excerpt, self.top_n_keywords(10))
+        write!(
+            f,
+            "CID: {} \nTitle: {}\n{}\nKeywords: {:?}",
+            self.cid,
+            self.title,
+            self.excerpt,
+            self.top_n_keywords(10)
+        )
     }
 }
 
@@ -70,7 +82,7 @@ impl Indexer {
             running: sync::Arc::new(AtomicBool::new(false)),
             handle: None,
             poison_pill: Cid::new_v1(RAW, Code::Sha2_256.digest(b"Poison Pill")),
-            ipfs_gateway: ipfs_gateway
+            ipfs_gateway: ipfs_gateway,
         }
     }
 
@@ -127,7 +139,12 @@ impl Indexer {
                     if res.0.is_some() {
                         map.insert(cid.clone(), res.0.unwrap());
                     }
-                    info!("indexed cid {}. Have {} entries. Have {} more cids to add to the queue", cid, map.len(),  res.1.len());
+                    info!(
+                        "indexed cid {}. Have {} entries. Have {} more cids to add to the queue",
+                        cid,
+                        map.len(),
+                        res.1.len()
+                    );
                     for new_cid in res.1 {
                         if map.contains_key(&new_cid) {
                             trace!("cid {} already in map", new_cid);
@@ -152,7 +169,7 @@ impl Indexer {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
         info!("retreiving content from {}", url);
         let client = reqwest::blocking::Client::new();
-        
+
         let result = client.get(&url).send();
         let result = match result {
             Ok(r) => r,
@@ -189,7 +206,10 @@ impl Indexer {
             } else {
                 info!("found meta http-equiv=\"refresh\"");
                 let start_bytes = inner_html.find("url=").unwrap_or(0);
-                let end_bytes = inner_html[start_bytes..].find("\"").unwrap_or(inner_html.len()) + start_bytes;
+                let end_bytes = inner_html[start_bytes..]
+                    .find("\"")
+                    .unwrap_or(inner_html.len())
+                    + start_bytes;
                 let redirect_url = &inner_html[start_bytes + 4..end_bytes];
                 // assuming relative
                 let newurl = format!("{}/{}", url, redirect_url);
@@ -225,11 +245,11 @@ impl Indexer {
         for element in document.select(&selector) {
             let link = element.value().attr("href").unwrap_or("");
             if link.starts_with(format!("http://{}/ipfs/", gateway).as_str()) {
-                let cid = link[12 + gateway.len() ..].to_string();
+                let cid = link[12 + gateway.len()..].to_string();
                 info!("found link to {}", cid);
                 cids.push(cid);
             } else if link.starts_with(format!("https://{}/ipfs/", gateway).as_str()) {
-                let cid = link[13 + gateway.len() ..].to_string();
+                let cid = link[13 + gateway.len()..].to_string();
                 info!("found link to {}", cid);
                 cids.push(cid);
             } else if link.starts_with("http") || link.starts_with("https") {
@@ -250,14 +270,14 @@ impl Indexer {
         let selector = Selector::parse("body").unwrap();
         let body = document.select(&selector).next();
         let mut excerpt = "".to_string();
-        let mut keywords : HashMap<String, u32> = HashMap::new();
+        let mut keywords: HashMap<String, u32> = HashMap::new();
         if body.is_some() {
             // collect up the tags in the body, and get the contents within them without their tags
             let inner = body.unwrap().text().collect::<Vec<_>>();
             let mut content = inner.join(" ");
             // this leaves a ton of whitespace between things, so do this next step to remove that
             let iter = content.split_whitespace();
-            content = iter.fold(String::new(), | a,b| a + b + " ");
+            content = iter.fold(String::new(), |a, b| a + b + " ");
             content = content.trim_start().trim_end().to_string();
 
             // get the frequency of words and turn it into a btree
@@ -274,7 +294,7 @@ impl Indexer {
                     }
                 }
             }
-            
+
             if content.contains("no link named") {
                 warn!("ipfs error on page {}, likely doesn't exist", fullcid);
             }
@@ -287,7 +307,7 @@ impl Indexer {
         info!("retreived content for cid {}:\n{}", cid, result);
         (Some(result), cids)
     }
-    
+
     pub fn stop(&mut self) {
         if !self.running.load(Ordering::SeqCst) {
             warn!("trying to stop before indexer started");
