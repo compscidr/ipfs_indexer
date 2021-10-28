@@ -65,4 +65,37 @@ mod tests {
         );
         assert_eq!(result.top_n_keywords(10).len(), 1);
     }
+    #[test]
+
+    fn all_keywords() {
+        let keywords = HashMap::<_, _>::from_iter(IntoIter::new([
+            ("key1".to_string(), 1),
+            ("key2".to_string(), 2),
+        ]));
+
+        let result = IndexResult::new(
+            "1".to_string(),
+            "title".to_string(),
+            "excerpt".to_string(),
+            keywords,
+        );
+        assert_eq!(result.top_n_keywords(2).len(), 2);
+    }
+
+    #[test]
+    fn subset_of_keywords() {
+        let keywords = HashMap::<_, _>::from_iter(IntoIter::new([
+            ("key1".to_string(), 1),
+            ("key2".to_string(), 2),
+            ("key2".to_string(), 3),
+        ]));
+
+        let result = IndexResult::new(
+            "1".to_string(),
+            "title".to_string(),
+            "excerpt".to_string(),
+            keywords,
+        );
+        assert_eq!(result.top_n_keywords(2).len(), 2);
+    }
 }
