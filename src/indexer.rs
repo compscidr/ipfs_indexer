@@ -287,7 +287,7 @@ impl Indexer {
                 if word.len() > 3 {
                     let word = word.to_lowercase();
                     if keywords.contains_key(&word) {
-                        let count = keywords.get(&word).unwrap();
+                        let count = keywords.get(&word).cloned().unwrap();
                         keywords.insert(word, count + 1);
                     } else {
                         keywords.insert(word, 1);
