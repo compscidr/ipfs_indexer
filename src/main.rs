@@ -9,7 +9,9 @@ use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+mod index_result;
 mod indexer;
+
 use indexer::Indexer;
 
 fn main() -> Result<(), Box<dyn Error>> {
