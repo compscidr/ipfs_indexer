@@ -1345,6 +1345,7 @@ dependencies = [
  "futures",
  "libp2p",
  "log",
+ "prost-build",
  "reqwest",
  "scraper",
  "simple_logger",
