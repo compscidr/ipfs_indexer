@@ -475,9 +475,9 @@ dependencies = [
 
 [[package]]
 name = "cid"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d0ea4e55ba266552ca1a04e8232e930680d93bd71cc269d040c1e6ad34c8dd2"
+checksum = "dd5d90881dc52bb7867dd4341dfe6836077370f879df51cee353daa74e035a13"
 dependencies = [
  "core2",
  "multibase",
