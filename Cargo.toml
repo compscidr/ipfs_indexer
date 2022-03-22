@@ -10,7 +10,7 @@ libp2p = "0.40.0"
 futures = "0.3.21"
 cid = "0.8.3"
 chashmap = "2.2.2"
-log = "0.4.14"
+log = "0.4.16"
 simple_logger = "2.1.0"
 reqwest = { version = "0.11.10", features = ["gzip", "blocking"] }
 scraper = "0.12.0"
