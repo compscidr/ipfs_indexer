@@ -38,6 +38,8 @@ An ipfs indexer / search engine built in rust.
 - Tests! - **Conor working on**
 
 ## Build notes
+As of libp2p 0.44.0, it seems to require rust nightly: https://stackoverflow.com/questions/69848319/unable-to-specify-edition2021-in-order-to-use-unstable-packages-in-rust
+
 Did init as a "binary" - not sure if this makes sense, or if other people think we should split this into a library
 bit and an application bit. I suppose we can always change it later as it grows.
 
