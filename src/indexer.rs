@@ -41,7 +41,7 @@ impl Indexer {
     }
 
     pub fn enqueue_cid_with_path(&mut self, cid: Cid, relative_path: String) {
-        let key = cid.to_string() + "/" + &relative_path;
+        let key = cid.to_string() + "/" + relative_path.as_str();
         if self.map.contains_key(&key) {
             trace!("cid {} already in map", key);
             return;
