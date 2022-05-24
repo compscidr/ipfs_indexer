@@ -8,7 +8,7 @@ edition = "2018"
 [dependencies]
 libp2p = "0.44.0"
 futures = "0.3.21"
-cid = "0.8.4"
+cid = "0.8.5"
 chashmap = "2.2.2"
 log = "0.4.17"
 simple_logger = "2.1.0"
