@@ -12,6 +12,6 @@ cid = "0.8.6"
 chashmap = "2.2.2"
 log = "0.4.17"
 simple_logger = "2.3.0"
-reqwest = { version = "0.11.11", features = ["gzip", "blocking"] }
+reqwest = { version = "0.11.12", features = ["gzip", "blocking"] }
 scraper = "0.13.0"
 ctrlc = "3.2.3"
