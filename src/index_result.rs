@@ -1,10 +1,11 @@
 use std::{collections::HashMap, fmt};
 
+#[derive(Clone)]
 pub struct IndexResult {
     pub cid: String,
     pub title: String,
     pub excerpt: String,
-    pub keywords: HashMap<String, u32>,
+    pub keywords: HashMap<String, u32>, // maps keyword to occurrence count
 }
 
 impl IndexResult {
@@ -46,11 +47,23 @@ impl fmt::Display for IndexResult {
     }
 }
 
+impl fmt::Debug for IndexResult {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "CID: {} \nTitle: {}\n{}\nKeywords: {:?}",
+            self.cid,
+            self.title,
+            self.excerpt,
+            self.top_n_keywords(10)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::array::IntoIter;
     use std::{collections::HashMap, iter::FromIterator};
-
     use crate::index_result::IndexResult;
 
     #[test]

@@ -1,77 +1,87 @@
-use std::borrow::Borrow;
-use std::cell::{Cell, RefCell};
+use std::convert::TryFrom;
+use std::fmt::format;
+use std::sync::Arc;
+
+use threadpool::ThreadPool;
+
+use actix_web::{App, get, HttpServer, web};
 use cid::Cid;
-use futures::executor::block_on;
-use libp2p::{identity, PeerId};
 use log::{info, warn};
 use simple_logger::SimpleLogger;
-use std::convert::TryFrom;
-use std::env;
-use futures::mpsc::channel;
-use std::sync::{Arc, Mutex, RwLock};
-use actix_rt::task;
-use futures::{future, io};
-use actix_web::{get, App, HttpServer, web::{self, Data}, HttpResponse};
-use futures::channel::mpsc::channel;
-use crate::index_queue::{IndexQueue, IndexQueueConsumer};
-use mime::APPLICATION_JSON;
 
-mod index_result;
+use crate::index_queue::IndexQueue;
+
 mod index_queue;
-//mod indexer;
+mod index_result;
 
-//use indexer::Indexer;
+#[get("/status")]
+async fn status(queue: web::Data<IndexQueue>) -> String {
+    format!("Queue length: {} Index size: {} Number of Keywords: {}",
+            queue.queue_length(), queue.index_length(), queue.keyword_length())
+}
 
-#[actix_rt::main]
-async fn main() {
-    // uncomment to enable hardcoded logging
-    // simple_logger::init_with_level(log::Level::Info).unwrap();
+#[get("/enqueue/{item}")]
+async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> String {
+    let item = item.into_inner();
+    data.enqueue(item.clone());
+    format!("Enqueued {}", item)
+}
 
-    // otherwise run with log level set via RUST_LOG=info ./ipfs_indexer
-    SimpleLogger::new().env().init().unwrap();
+#[get("/search/{query}")]
+async fn search(data: web::Data<IndexQueue>, item: web::Path<String>) -> String {
+    let query = item.into_inner();
+    info!("Searching for {}", query.clone());
+    let results = data.search(query.clone());
+    if results.is_empty() {
+        format!("No results found for {}", query)
+    } else {
+        format!("Results for {}: {:?}", query, results)
+    }
+}
 
-    let args: Vec<String> = env::args().collect();
-    let mut gateway = "ipfs.io"; // another good and fast one is: ipfs-gateway.cloud
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    //uncomment to enable hardcoded logging
+    simple_logger::init_with_level(log::Level::Info).unwrap();
+
+    //otherwise run with log level set via RUST_LOG=info ./ipfs_indexer
+    //SimpleLogger::new().env().init().unwrap();
+
+    let mut gateway :String = "ipfs.io".to_string();
+    let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         warn!("Running with ipfs.io gateway. Usage: ipfs_indexer <ipfs_node_address>");
     } else {
-        gateway = &args[1];
+        info!("Running with ifps gateway {}", args[1]);
+        gateway = args[1].clone();
     }
 
-    // let mut index = Indexer::new(gateway.to_string());
-    // index.start();
-    //
-    // // enqueue the same cid twice to make sure we get the output that it's already in the map
-    // // note: delays are so that we don't stop before the indexer has a chance to work, in reality we don't need them
-    // // we need to start from some known page, so for now we're starting from a known hash for
-    // // a wikipedia mirror
+    let index_queue = web::Data::new(IndexQueue::new());
     let wikipedia_cid = Cid::try_from("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco").unwrap();
-    // index.enqueue_cid(wikipedia_cid);
+    index_queue.enqueue(wikipedia_cid.to_string());
 
-    let queue_size = Arc::new(RwLock::new(0));
-    let (tx, rx) = channel(100);
-    let mut index_queue = IndexQueue::new(queue_size.clone(), tx);
-    index_queue.enqueue(wikipedia_cid, "".to_string());
+    // if we don't have multiple workers, we can get the case where we run out of room in the
+    // queue if a doc has many links
+    let n_workers = 10;
+    let pool = ThreadPool::new(n_workers);
 
-    // this will run and block until control-c
-    // let server_result = HttpServer::new(move || {
-    //     App::new()
-    //         .app_data(web::Data::new(queue_size.clone()))
-    //         // enable logger - always register actix-web Logger middleware last
-    //         .service(index_queue::get_queue)
-    // }).bind("0.0.0.0:9090")?.run().await;
+    // todo: find some way to shutdown the pool when the server stops
+    for _ in 0..n_workers {
+        let inner_config = Arc::clone(&index_queue);
+        let inner_gateway = gateway.clone();
+        pool.execute(move || {
+            inner_config.start(inner_gateway);
+        });
+    }
 
-    let mut index_queue_consumer = IndexQueueConsumer::new(queue_size.clone(), rx);
-    task::spawn_blocking(move || {
-        index_queue_consumer.process_queue()
-    });
-
-    let f2 = HttpServer::new(move || {
-            App::new()
-                .app_data(web::Data::new(queue_size.clone()))
-                // enable logger - always register actix-web Logger middleware last
-                .service(index_queue::get_queue)
-        }).bind("0.0.0.0:9090").expect("").run().await;
-
-    //return server_result;
+    HttpServer::new(move || {
+        App::new()
+            .app_data(index_queue.clone())
+            .service(status)
+            .service(enqueue)
+            .service(search)
+    })
+        .bind("0.0.0.0:9090")?
+        .run()
+        .await
 }
