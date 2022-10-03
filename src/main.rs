@@ -42,10 +42,10 @@ async fn search(data: web::Data<IndexQueue>, item: web::Path<String>) -> String 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     //uncomment to enable hardcoded logging
-    simple_logger::init_with_level(log::Level::Info).unwrap();
+    //simple_logger::init_with_level(log::Level::Info).unwrap();
 
     //otherwise run with log level set via RUST_LOG=info ./ipfs_indexer
-    //SimpleLogger::new().env().init().unwrap();
+    SimpleLogger::new().env().init().unwrap();
 
     let mut gateway :String = "ipfs.io".to_string();
     let args: Vec<String> = std::env::args().collect();
