@@ -62,9 +62,9 @@ impl fmt::Debug for IndexResult {
 
 #[cfg(test)]
 mod tests {
+    use crate::index_result::IndexResult;
     use std::array::IntoIter;
     use std::{collections::HashMap, iter::FromIterator};
-    use crate::index_result::IndexResult;
 
     #[test]
     fn single_keyword() {

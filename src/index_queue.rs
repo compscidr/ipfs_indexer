@@ -1,20 +1,20 @@
-use std::collections::HashMap;
-use crossbeam_queue::ArrayQueue;
+use crate::index_result::IndexResult;
 use chashmap::CHashMap;
+use crossbeam_queue::ArrayQueue;
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
-use crate::index_result::IndexResult;
+use std::collections::HashMap;
 
 pub struct IndexQueue {
     // queue of items to index
     pub queue: ArrayQueue<String>,
-    pub queue_set: CHashMap<String, ()>,     // used to quickly determine duplicates in queue
+    pub queue_set: CHashMap<String, ()>, // used to quickly determine duplicates in queue
 
     // index results (cid -> result)
     pub map: CHashMap<String, IndexResult>,
 
     // used for searching. Maps keyword to unique set of cids
-    pub keywords: CHashMap<String, CHashMap<String, ()>>
+    pub keywords: CHashMap<String, CHashMap<String, ()>>,
 }
 
 impl IndexQueue {
@@ -23,7 +23,7 @@ impl IndexQueue {
             queue: ArrayQueue::new(1000),
             queue_set: CHashMap::new(),
             map: CHashMap::new(),
-            keywords: CHashMap::new()
+            keywords: CHashMap::new(),
         }
     }
 
@@ -110,7 +110,7 @@ impl IndexQueue {
             Err(err) => {
                 info!("Error: {}, not re-enqueue-ing cid", err);
                 // self.enqueue(cid.clone()); // for now give up on error
-                return None
+                return None;
             }
         };
         let response = result;
@@ -166,7 +166,7 @@ impl IndexQueue {
                         if e.is_timeout() {
                             self.enqueue(fullcid.clone());
                         }
-                        return None
+                        return None;
                     }
                 };
                 let response = result;
@@ -261,9 +261,13 @@ impl IndexQueue {
             let end = content.char_indices().map(|(i, _)| i).nth(128).unwrap();
             excerpt = content[..end].to_string();
 
-            return Some(IndexResult::new(fullcid, title, excerpt.to_string(), index_keywords));
+            return Some(IndexResult::new(
+                fullcid,
+                title,
+                excerpt.to_string(),
+                index_keywords,
+            ));
         }
         None
     }
-
 }

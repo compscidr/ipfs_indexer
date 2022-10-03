@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use threadpool::ThreadPool;
 
-use actix_web::{App, get, HttpServer, web};
+use actix_web::{get, web, App, HttpServer};
 use cid::Cid;
 use log::{info, warn};
 use simple_logger::SimpleLogger;
@@ -16,8 +16,12 @@ mod index_result;
 
 #[get("/status")]
 async fn status(queue: web::Data<IndexQueue>) -> String {
-    format!("Queue length: {} Index size: {} Number of Keywords: {}",
-            queue.queue_length(), queue.index_length(), queue.keyword_length())
+    format!(
+        "Queue length: {} Index size: {} Number of Keywords: {}",
+        queue.queue_length(),
+        queue.index_length(),
+        queue.keyword_length()
+    )
 }
 
 #[get("/enqueue/{item}")]
@@ -47,7 +51,7 @@ async fn main() -> std::io::Result<()> {
     //otherwise run with log level set via RUST_LOG=info ./ipfs_indexer
     SimpleLogger::new().env().init().unwrap();
 
-    let mut gateway :String = "ipfs.io".to_string();
+    let mut gateway: String = "ipfs.io".to_string();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         warn!("Running with ipfs.io gateway. Usage: ipfs_indexer <ipfs_node_address>");
@@ -81,7 +85,7 @@ async fn main() -> std::io::Result<()> {
             .service(enqueue)
             .service(search)
     })
-        .bind("0.0.0.0:9090")?
-        .run()
-        .await
+    .bind("0.0.0.0:9090")?
+    .run()
+    .await
 }
