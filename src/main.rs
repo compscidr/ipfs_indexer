@@ -1,96 +1,91 @@
-use cid::Cid;
-use futures::executor::block_on;
-use libp2p::{identity, PeerId};
-use log::{info, warn};
-use simple_logger::SimpleLogger;
 use std::convert::TryFrom;
-use std::env;
-use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fmt::format;
 use std::sync::Arc;
 
+use threadpool::ThreadPool;
+
+use actix_web::{get, web, App, HttpServer};
+use cid::Cid;
+use log::{info, warn};
+use simple_logger::SimpleLogger;
+
+use crate::index_queue::IndexQueue;
+
+mod index_queue;
 mod index_result;
-mod indexer;
 
-use indexer::Indexer;
+#[get("/status")]
+async fn status(queue: web::Data<IndexQueue>) -> String {
+    format!(
+        "Queue length: {} Index size: {} Number of Keywords: {}",
+        queue.queue_length(),
+        queue.index_length(),
+        queue.keyword_length()
+    )
+}
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[get("/enqueue/{item}")]
+async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> String {
+    let item = item.into_inner();
+    data.enqueue(item.clone());
+    format!("Enqueued {}", item)
+}
+
+#[get("/search/{query}")]
+async fn search(data: web::Data<IndexQueue>, item: web::Path<String>) -> String {
+    let query = item.into_inner();
+    info!("Searching for {}", query.clone());
+    let results = data.search(query.clone());
+    if results.is_empty() {
+        format!("No results found for {}", query)
+    } else {
+        format!("Results for {}: {:?}", query, results)
+    }
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     //uncomment to enable hardcoded logging
     //simple_logger::init_with_level(log::Level::Info).unwrap();
 
     //otherwise run with log level set via RUST_LOG=info ./ipfs_indexer
     SimpleLogger::new().env().init().unwrap();
 
-    let args: Vec<String> = env::args().collect();
-    let mut gateway = "ipfs.io";
+    let mut gateway: String = "ipfs.io".to_string();
+    let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         warn!("Running with ipfs.io gateway. Usage: ipfs_indexer <ipfs_node_address>");
     } else {
-        gateway = &args[1];
+        info!("Running with ifps gateway {}", args[1]);
+        gateway = args[1].clone();
     }
 
-    let mut index = Indexer::new(gateway.to_string());
-    index.start();
-
-    // enqueue the same cid twice to make sure we get the output that it's already in the map
-    // note: delays are so that we don't stop before the indexer has a chance to work, in reality we don't need them
+    let index_queue = web::Data::new(IndexQueue::new());
     let wikipedia_cid = Cid::try_from("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco").unwrap();
-    index.enqueue_cid(wikipedia_cid);
+    index_queue.enqueue(wikipedia_cid.to_string());
 
-    let local_key = identity::Keypair::generate_ed25519();
-    let local_peer_id = PeerId::from(local_key.public());
-    info!("Local peer id: {:?}", local_peer_id);
+    // if we don't have multiple workers, we can get the case where we run out of room in the
+    // queue if a doc has many links
+    let n_workers = 10;
+    let pool = ThreadPool::new(n_workers);
 
-    let _transport = block_on(libp2p::development_transport(local_key))?;
+    // todo: find some way to shutdown the pool when the server stops
+    for _ in 0..n_workers {
+        let inner_config = Arc::clone(&index_queue);
+        let inner_gateway = gateway.clone();
+        pool.execute(move || {
+            inner_config.start(inner_gateway);
+        });
+    }
 
-    // this stuff conflicts with the running ipfs node,
-    // so need to rejig it otherwise it panics before indexing starts
-
-    // Create a ping network behaviour.
-    //
-    // For illustrative purposes, the ping protocol is configured to
-    // keep the connection alive, so a continuous sequence of pings
-    // can be observed.
-    // let behaviour = Ping::new(PingConfig::new().with_keep_alive(true));
-
-    // let mut swarm = Swarm::new(transport, behaviour, local_peer_id);
-
-    // // Tell the swarm to listen on all interfaces and a random, OS-assigned
-    // // port.
-    // swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-
-    // // Dial the peer identified by the multi-address given as the second
-    // // command-line argument, if any.
-    // if let Some(addr) = std::env::args().nth(1) {
-    //     let remote = addr.parse()?;
-    //     swarm.dial_addr(remote)?;
-    //     info!("Dialed {}", addr)
-    // }
-
-    // block_on(future::poll_fn(move |cx| loop {
-    //     match swarm.poll_next_unpin(cx) {
-    //         Poll::Ready(Some(event)) => match event {
-    //             SwarmEvent::NewListenAddr { address, .. } => info!("Listening on {:?}", address),
-    //             SwarmEvent::Behaviour(event) => info!("{:?}", event),
-    //             _ => {}
-    //         },
-    //         Poll::Ready(None) => return Poll::Ready(()),
-    //         Poll::Pending => return Poll::Pending
-    //     }
-    // }));
-
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
+    HttpServer::new(move || {
+        App::new()
+            .app_data(index_queue.clone())
+            .service(status)
+            .service(enqueue)
+            .service(search)
     })
-    .expect("Error setting Ctrl-C handler");
-
-    info!("Waiting for Ctrl-C...");
-    while running.load(Ordering::SeqCst) {}
-    info!("Got it! Exiting...");
-
-    index.stop();
-    Ok(())
+    .bind("0.0.0.0:9090")?
+    .run()
+    .await
 }
