@@ -83,7 +83,7 @@ impl IndexQueue {
                     self.queue_set.remove(&*item);
                     info!("Indexing {}", item);
 
-                    let result = self.retreive_content(gateway.clone(), item.clone());
+                    let result = self.retrieve_content(gateway.clone(), item.clone());
 
                     if result.is_some() {
                         self.map.insert(item.clone(), result.unwrap());
@@ -100,7 +100,7 @@ impl IndexQueue {
      * Use the http client to obtain the page from the ipfs gateway. If there is a failure to
      * obtain the CID, we give up for now.
      */
-    fn retreive_content(&self, gateway: String, cid: String) -> Option<IndexResult> {
+    fn retrieve_content(&self, gateway: String, cid: String) -> Option<IndexResult> {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
         info!("Retreiving {}", url);
         let client = reqwest::blocking::Client::new();
