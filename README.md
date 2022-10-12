@@ -19,7 +19,7 @@ An ipfs indexer / search engine built in rust.
     - Will probably want to think of ejection mechanism sooner than later so we can eject to storage (least recently used? oldest? who knows?)
     - Farther out - need to think about how the store will be designed
    - [X] Probably also want to store an excerpt, page title of the page to present to front-end
-- Implement a backend API which a future front-end can use, and in short term we can use to debug
+- [X] Implement a backend API which a future front-end can use, and in short term we can use to debug
   - search -> search result
     - ordered list of <title, link, excerpts>, possibly grouped by text, images, videos, other
   - stats:
@@ -62,6 +62,11 @@ Run `xcode-select --install` if you do not have xcode installed, need to update 
 - Run `cargo build` to build
 - Run `RUST_LOG=info ./target/debug/ipfs_indexer` to see logging output (adjust level accordingly)
 - Run `RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080` to use your own ipfs gateway instead of ipfs.io
+
+By default runs an endpoing on `0.0.0.0:9090` so you can go to 
+- http://localhost:9090/status
+- http://localhost:9090/enqueue/somecid
+- http://localhost:9090/search/somequery
 
 ## Running with docker
 From the docker directory, run `docker-compose up`. Currently image is only ~26MB.
