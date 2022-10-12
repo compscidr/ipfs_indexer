@@ -1,6 +1,7 @@
 use std::convert::TryFrom;
 use std::fmt::format;
 use std::sync::Arc;
+use std::thread;
 
 use threadpool::ThreadPool;
 
@@ -8,11 +9,13 @@ use actix_web::{get, web, App, HttpServer};
 use cid::Cid;
 use log::{info, warn};
 use simple_logger::SimpleLogger;
+use crate::gossip::Gossip;
 
 use crate::index_queue::IndexQueue;
 
 mod index_queue;
 mod index_result;
+mod gossip;
 
 #[get("/status")]
 async fn status(queue: web::Data<IndexQueue>) -> String {
@@ -77,6 +80,12 @@ async fn main() -> std::io::Result<()> {
             inner_config.start(inner_gateway);
         });
     }
+
+    // todo, stop the gossip thread when the server stops
+    let gossip = Gossip::new(index_queue.clone());
+    thread::spawn(move || {
+        gossip.start();
+    });
 
     HttpServer::new(move || {
         App::new()

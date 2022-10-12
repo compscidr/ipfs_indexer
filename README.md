@@ -4,7 +4,7 @@
 An ipfs indexer / search engine built in rust.
 
 ## Build notes
-On Ubuntu you may need to apt install: `libssl-dev`.
+On Ubuntu you may need to apt install: `libssl-dev` and `protobuf-compiler`.
 
 As of libp2p 0.44.0, it seems to require rust nightly: https://stackoverflow.com/questions/69848319/unable-to-specify-edition2021-in-order-to-use-unstable-packages-in-rust
 
