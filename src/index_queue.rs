@@ -105,7 +105,7 @@ impl IndexQueue {
         info!("Retreiving {}", url);
         let client = reqwest::blocking::Client::new();
         let result = client.get(&url).send();
-        let result = match result {
+        let response = match result {
             Ok(result) => result,
             Err(err) => {
                 info!("Error: {}, not re-enqueue-ing cid", err);
@@ -113,7 +113,6 @@ impl IndexQueue {
                 return None;
             }
         };
-        let response = result;
 
         // todo: check the file type header and only proceed this way if it is actually html, otherwise index as some other file type
         // plus some meta data
@@ -184,7 +183,7 @@ impl IndexQueue {
         let mut fullcid = cid.clone();
 
         let selector = Selector::parse("title").unwrap();
-        let titletag = document.select(&selector).next(); // = document.select(&selector).next().unwrap().text().collect();
+        let titletag = document.select(&selector).next();
         let mut title: String = "".to_string();
         if titletag.is_some() {
             title = titletag.unwrap().text().collect();
