@@ -3,41 +3,9 @@
 
 An ipfs indexer / search engine built in rust.
 
-## What Needs to be Done
-- Discover content to be indexed, add them to the index queue
-  - [ ] Listen in on the gossip protocol **Jason working on**
-  - [X] Start from some collection of pages on ipfs.io/ipfs
-- Implement an index queue processor
-  - [X] Fetch the ipfs content
-  - [X] Process the page for more ipfs links, Add those links into the index queue
-  - Index the pages somehow
-    - Ranked keywords by frequency or something?
-    - Need to update to support more than just html content (look at header and index files)
-    - Update the except to be flexible - for images, it could be a small crop render of the original image, for videos it could be a gif preview render
-  - Store the index somehow (start with in-memory, then figure out how to do storage later) - **Conor working on**
-    - A hashmap of map[keyword] -> sorted tree where the entries are sorted by keyword frequency and entries contain ipfs hash? - **Conor working on**
-    - Will probably want to think of ejection mechanism sooner than later so we can eject to storage (least recently used? oldest? who knows?)
-    - Farther out - need to think about how the store will be designed
-   - [X] Probably also want to store an excerpt, page title of the page to present to front-end
-- [X] Implement a backend API which a future front-end can use, and in short term we can use to debug
-  - search -> search result
-    - ordered list of <title, link, excerpts>, possibly grouped by text, images, videos, other
-  - stats:
-    - indexed entries
-    - outstanding index queue
-    - memory used / free
-    - stoage used / free
-- Implement a front-end which queries the index storage and displays the page title, ipfs/io/ipfs link to the page and excerpt
-  from the browser
-- Feedback loop from what people click on more often to rank those higher
-- [X] Might a docker container:
-  - [X] deploy will auto restart itself on crash (will also make it easy to see consumed memory with docker stats and other tools)
-  - [X] will be able to deploy with a local ipfs instance all ready to go within the container
-  - can artificially restrict memory so we can test things like ejection mechanisms
-- Farther out -> hook into papertrail or some logging service so we can see what's up if it dies
-- Tests! - **Conor working on**
-
 ## Build notes
+On Ubuntu you may need to apt install: `libssl-dev`.
+
 As of libp2p 0.44.0, it seems to require rust nightly: https://stackoverflow.com/questions/69848319/unable-to-specify-edition2021-in-order-to-use-unstable-packages-in-rust
 
 Did init as a "binary" - not sure if this makes sense, or if other people think we should split this into a library
@@ -74,3 +42,38 @@ From the docker directory, run `docker-compose up`. Currently image is only ~26M
 ## CI
 I setup a workflow that should run a build at least on push, but doesnt run any tests because I have no idea how test
 suites work yet for rust.
+
+
+## What Needs to be Done
+- Discover content to be indexed, add them to the index queue
+  - [ ] Listen in on the gossip protocol **Jason working on**
+  - [X] Start from some collection of pages on ipfs.io/ipfs
+- Implement an index queue processor
+  - [X] Fetch the ipfs content
+  - [X] Process the page for more ipfs links, Add those links into the index queue
+  - Index the pages somehow
+    - Ranked keywords by frequency or something?
+    - Need to update to support more than just html content (look at header and index files)
+    - Update the except to be flexible - for images, it could be a small crop render of the original image, for videos it could be a gif preview render
+  - Store the index somehow (start with in-memory, then figure out how to do storage later) - **Conor working on**
+    - A hashmap of map[keyword] -> sorted tree where the entries are sorted by keyword frequency and entries contain ipfs hash? - **Conor working on**
+    - Will probably want to think of ejection mechanism sooner than later so we can eject to storage (least recently used? oldest? who knows?)
+    - Farther out - need to think about how the store will be designed
+   - [X] Probably also want to store an excerpt, page title of the page to present to front-end
+- [X] Implement a backend API which a future front-end can use, and in short term we can use to debug
+  - search -> search result
+    - ordered list of <title, link, excerpts>, possibly grouped by text, images, videos, other
+  - stats:
+    - indexed entries
+    - outstanding index queue
+    - memory used / free
+    - stoage used / free
+- Implement a front-end which queries the index storage and displays the page title, ipfs/io/ipfs link to the page and excerpt
+  from the browser
+- Feedback loop from what people click on more often to rank those higher
+- [X] Might a docker container:
+  - [X] deploy will auto restart itself on crash (will also make it easy to see consumed memory with docker stats and other tools)
+  - [X] will be able to deploy with a local ipfs instance all ready to go within the container
+  - can artificially restrict memory so we can test things like ejection mechanisms
+- Farther out -> hook into papertrail or some logging service so we can see what's up if it dies
+- Tests! - **Conor working on**
