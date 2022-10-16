@@ -1,5 +1,4 @@
 use std::convert::TryFrom;
-use std::fmt::format;
 use std::sync::Arc;
 
 use threadpool::ThreadPool;
