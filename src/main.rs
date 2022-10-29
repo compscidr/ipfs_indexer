@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use threadpool::ThreadPool;
 
-use actix_web::{get, web, App, HttpServer};
+use actix_web::{get, web, App, HttpResponse, HttpServer};
 use cid::Cid;
 use log::{info, warn};
 use simple_logger::SimpleLogger;
@@ -15,31 +15,31 @@ mod index_queue;
 mod index_result;
 
 #[get("/status")]
-async fn status(queue: web::Data<IndexQueue>) -> String {
-    format!(
+async fn status(queue: web::Data<IndexQueue>) -> HttpResponse {
+    HttpResponse::Ok().body(format!(
         "Queue length: {} Index size: {} Number of Keywords: {}",
         queue.queue_length(),
         queue.index_length(),
         queue.keyword_length()
-    )
+    ))
 }
 
 #[get("/enqueue/{item}")]
-async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> String {
+async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpResponse {
     let item = item.into_inner();
     data.enqueue(item.clone());
-    format!("Enqueued {}", item)
+    HttpResponse::Ok().body(format!("Enqueued {}", item))
 }
 
 #[get("/search/{query}")]
-async fn search(data: web::Data<IndexQueue>, item: web::Path<String>) -> String {
+async fn search(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpResponse {
     let query = item.into_inner();
     info!("Searching for {}", query.clone());
     let results = data.search(query.clone());
     if results.is_empty() {
-        format!("No results found for {}", query)
+        HttpResponse::Ok().body(format!("No results found for {}", query))
     } else {
-        format!("Results for {}: {:?}", query, results)
+        HttpResponse::Ok().body(format!("Results for {}: {:?}", query, results))
     }
 }
 
@@ -88,4 +88,54 @@ async fn main() -> std::io::Result<()> {
     .bind("0.0.0.0:9090")?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{test, web, App};
+
+    use super::*;
+
+    #[actix_web::test]
+    async fn test_status_get() {
+        let index_queue = web::Data::new(IndexQueue::new());
+
+        let req = test::TestRequest::get().uri("/status").to_request();
+
+        let app =
+            test::init_service(App::new().app_data(index_queue.clone()).service(status)).await;
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_enqueue_get() {
+        let index_queue = web::Data::new(IndexQueue::new());
+
+        let req = test::TestRequest::get()
+            .uri("/enqueue/enqueueItem")
+            .to_request();
+
+        let app =
+            test::init_service(App::new().app_data(index_queue.clone()).service(enqueue)).await;
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_search_get() {
+        let index_queue = web::Data::new(IndexQueue::new());
+
+        let req = test::TestRequest::get()
+            .uri("/search/searchItem")
+            .to_request();
+
+        let app =
+            test::init_service(App::new().app_data(index_queue.clone()).service(search)).await;
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
 }
