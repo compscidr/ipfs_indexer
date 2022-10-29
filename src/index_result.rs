@@ -63,12 +63,11 @@ impl fmt::Debug for IndexResult {
 #[cfg(test)]
 mod tests {
     use crate::index_result::IndexResult;
-    use std::array::IntoIter;
     use std::{collections::HashMap, iter::FromIterator};
 
     #[test]
     fn single_keyword() {
-        let keywords = HashMap::<_, _>::from_iter(IntoIter::new([("key1".to_string(), 1)]));
+        let keywords = HashMap::<_, _>::from_iter([("key1".to_string(), 1)]);
 
         let result = IndexResult::new(
             "1".to_string(),
@@ -81,10 +80,8 @@ mod tests {
     #[test]
 
     fn all_keywords() {
-        let keywords = HashMap::<_, _>::from_iter(IntoIter::new([
-            ("key1".to_string(), 1),
-            ("key2".to_string(), 2),
-        ]));
+        let keywords =
+            HashMap::<_, _>::from_iter([("key1".to_string(), 1), ("key2".to_string(), 2)]);
 
         let result = IndexResult::new(
             "1".to_string(),
@@ -97,11 +94,11 @@ mod tests {
 
     #[test]
     fn subset_of_keywords() {
-        let keywords = HashMap::<_, _>::from_iter(IntoIter::new([
+        let keywords = HashMap::<_, _>::from_iter([
             ("key1".to_string(), 1),
             ("key2".to_string(), 2),
             ("key2".to_string(), 3),
-        ]));
+        ]);
 
         let result = IndexResult::new(
             "1".to_string(),
