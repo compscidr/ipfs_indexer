@@ -180,7 +180,7 @@ impl IndexQueue {
      * Process the content of the page, extract keywords, enqueue more cids, return the IndexResult
      */
     fn process_content(&self, gateway: String, cid: String, document: Html) -> Option<IndexResult> {
-        let mut fullcid = cid.clone();
+        let fullcid = cid.clone();
 
         let selector = Selector::parse("title").unwrap();
         let titletag = document.select(&selector).next();
@@ -218,7 +218,6 @@ impl IndexQueue {
         }
         let selector = Selector::parse("body").unwrap();
         let body = document.select(&selector).next();
-        let mut excerpt = "".to_string();
         let mut index_keywords: HashMap<String, u32> = HashMap::new();
         if body.is_some() {
             // collect up the tags in the body, and get the contents within them without their tags
@@ -258,7 +257,7 @@ impl IndexQueue {
             }
 
             let end = content.char_indices().map(|(i, _)| i).nth(128).unwrap();
-            excerpt = content[..end].to_string();
+            let excerpt = content[..end].to_string();
 
             return Some(IndexResult::new(
                 fullcid,
