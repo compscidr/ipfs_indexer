@@ -38,7 +38,7 @@ impl fmt::Display for IndexResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "CID: {} \nTitle: {}\n{}\nKeywords: {:?}",
+            "CID: {}\nTitle: {}\nExcerpt:\n{}\nKeywords:{:?}",
             self.cid,
             self.title,
             self.excerpt,
@@ -51,7 +51,7 @@ impl fmt::Debug for IndexResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "CID: {} \nTitle: {}\n{}\nKeywords: {:?}",
+            "CID: {}\nTitle: {}\nExcerpt:{}\nKeywords:{:?}",
             self.cid,
             self.title,
             self.excerpt,
