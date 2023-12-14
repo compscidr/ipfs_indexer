@@ -10,7 +10,7 @@ cid = "0.11.0"
 log = "0.4.20"
 simple_logger = "4.3.0"
 actix-web = "4"
-crossbeam-queue = "0.3.8"
+crossbeam-queue = "0.3.9"
 chashmap = "2.2.2"
 reqwest = { version = "0.11.22", features = ["gzip", "blocking"] }
 scraper = "0.18.1"
