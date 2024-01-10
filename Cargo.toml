@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 cid = "0.11.0"
 log = "0.4.20"
-simple_logger = "4.3.0"
+simple_logger = "4.3.3"
 actix-web = "4"
 crossbeam-queue = "0.3.11"
 chashmap = "2.2.2"
