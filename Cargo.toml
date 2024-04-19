@@ -12,6 +12,6 @@ simple_logger = "4.3.3"
 actix-web = "4"
 crossbeam-queue = "0.3.11"
 chashmap = "2.2.2"
-reqwest = { version = "0.12.3", features = ["gzip", "blocking"] }
+reqwest = { version = "0.12.4", features = ["gzip", "blocking"] }
 scraper = "0.19.0"
 threadpool = "1.8"
