@@ -4,6 +4,7 @@ use crossbeam_queue::ArrayQueue;
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
 use std::collections::HashMap;
+use std::ops::Not;
 use actix_web::body::MessageBody;
 
 pub struct IndexQueue {
@@ -268,15 +269,25 @@ impl IndexQueue {
                 warn!("ipfs error on page {}, likely doesn't exist", fullcid);
             }
 
-            let end = content.char_indices().map(|(i, _)| i).nth(128).unwrap();
-            let excerpt = content[..end].to_string();
-
-            return Some(IndexResult::new(
-                fullcid,
-                title,
-                excerpt.to_string(),
-                index_keywords,
-            ));
+            if content.len() < 128 {
+                let end = content.char_indices().map(|(i, _)| i).nth(content.len()).unwrap();
+                let excerpt = content[..end].to_string();
+                return Some(IndexResult::new(
+                    fullcid,
+                    title,
+                    excerpt.to_string(),
+                    index_keywords,
+                ))
+            } else {
+                let end = content.char_indices().map(|(i, _)| i).nth(128).unwrap();
+                let excerpt = content[..end].to_string();
+                return Some(IndexResult::new(
+                    fullcid,
+                    title,
+                    excerpt.to_string(),
+                    index_keywords,
+                ))
+            }
         }
         None
     }
