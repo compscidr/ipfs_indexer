@@ -60,7 +60,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let index_queue = web::Data::new(IndexQueue::new());
-    let wikipedia_cid = Cid::try_from("Qme2sLfe9ZMdiuWsEtajWMDzx6B7VbjzpSC2VWhtB6GoB1").unwrap();
+    let wikipedia_cid = Cid::try_from("bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze").unwrap();
     index_queue.enqueue(wikipedia_cid.to_string());
 
     // if we don't have multiple workers, we can get the case where we run out of room in the
