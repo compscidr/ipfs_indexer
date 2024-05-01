@@ -23,6 +23,11 @@ async fn status(queue: web::Data<IndexQueue>) -> HttpResponse {
     ))
 }
 
+#[get("keywords")]
+async fn keywords(queue: web::Data<IndexQueue>) -> HttpResponse {
+    HttpResponse::Ok().body(format!("ok"))
+}
+
 #[get("/enqueue/{item}")]
 async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpResponse {
     let item = item.into_inner();

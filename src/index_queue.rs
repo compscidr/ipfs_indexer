@@ -4,6 +4,7 @@ use crossbeam_queue::ArrayQueue;
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
 use std::collections::HashMap;
+use actix_web::body::MessageBody;
 
 pub struct IndexQueue {
     // queue of items to index
@@ -81,14 +82,14 @@ impl IndexQueue {
                 if try_item.is_some() {
                     let item = try_item.unwrap();
                     self.queue_set.remove(&*item);
-                    info!("Indexing {}", item);
+                    warn!("Indexing {}", item);
 
                     let result = self.retrieve_content(gateway.clone(), item.clone());
 
                     if result.is_some() {
                         self.map.insert(item.clone(), result.unwrap());
                     } else {
-                        info!("Error retrieving CID {}", item);
+                        warn!("Error retrieving CID {}", item);
                         // self.enqueue(item.clone()); // for now give up on error
                     }
                 }
@@ -102,13 +103,13 @@ impl IndexQueue {
      */
     fn retrieve_content(&self, gateway: String, cid: String) -> Option<IndexResult> {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
-        info!("Retreiving {}", url);
+        warn!("Retreiving {}", url);
         let client = reqwest::blocking::Client::new();
         let result = client.get(&url).send();
         let response = match result {
             Ok(result) => result,
             Err(err) => {
-                info!("Error: {}, not re-enqueue-ing cid", err);
+                warn!("Error: {}, not re-enqueue-ing cid", err);
                 // self.enqueue(cid.clone()); // for now give up on error
                 return None;
             }
@@ -151,7 +152,7 @@ impl IndexQueue {
                     .unwrap_or(inner_html.len())
                     + start_bytes;
                 let redirect_url = &inner_html[start_bytes + 4..end_bytes];
-                info!("Redirecting to {}", redirect_url);
+                warn!("Redirecting to {}", redirect_url);
                 // assuming relative
                 let newurl = format!("{}/{}", url, redirect_url);
 
@@ -195,11 +196,11 @@ impl IndexQueue {
             let link = element.value().attr("href").unwrap_or("");
             if link.starts_with(format!("http://{}/ipfs/", gateway).as_str()) {
                 let cid = link[12 + gateway.len()..].to_string();
-                info!("found link to {}", cid);
+                warn!("found link to {}", cid);
                 self.enqueue(cid);
             } else if link.starts_with(format!("https://{}/ipfs/", gateway).as_str()) {
                 let cid = link[13 + gateway.len()..].to_string();
-                info!("found link to {}", cid);
+                warn!("found link to {}", cid);
                 self.enqueue(cid);
             } else if link.starts_with("http") || link.starts_with("https") {
                 //info!("found link to external url: {}", link);
@@ -210,10 +211,21 @@ impl IndexQueue {
                 //info!("found relative link to {}", link);
                 //let root_cid = fullcid.clone()[0..fullcid.find("/").unwrap_or(fullcid.len())].to_string();
                 //let full_relative = root_cid + "/" + link;
+
                 let last_slash = fullcid.rfind("/").unwrap_or(fullcid.len());
-                let full_relative = fullcid.clone()[0..last_slash].to_string() + "/" + link;
-                //info!("relative link with cid: {}", full_relative);
-                self.enqueue(full_relative);
+
+                if link.is_empty() {
+                    // warn!("link is empty, just a link to the same doc, skipping")
+                } else if link.starts_with("../A") {
+                    // handle weird issue where index pages have a ../A/ relative link when they shouldn't
+                    let full_relative = fullcid.clone()[0..last_slash].to_string() + "/" + &link[4..];
+                    warn!("relative link with cid: {}, link: {}", full_relative, link);
+                    self.enqueue(full_relative);
+                } else {
+                    let full_relative = fullcid.clone()[0..last_slash].to_string() + "/" + link;
+                    warn!("relative link with cid: {}, link: {}", full_relative, link);
+                    self.enqueue(full_relative);
+                }
             }
         }
         let selector = Selector::parse("body").unwrap();
