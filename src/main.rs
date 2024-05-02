@@ -23,9 +23,12 @@ async fn status(queue: web::Data<IndexQueue>) -> HttpResponse {
     ))
 }
 
-#[get("keywords")]
+// returns the top keywords
+#[get("/keywords")]
 async fn keywords(queue: web::Data<IndexQueue>) -> HttpResponse {
-    HttpResponse::Ok().body(format!("ok"))
+    HttpResponse::Ok().body(format!("Keywords: {:?}",
+        queue.top_keywords(10)
+    ))
 }
 
 #[get("/enqueue/{item}")]
@@ -88,6 +91,7 @@ async fn main() -> std::io::Result<()> {
             .service(status)
             .service(enqueue)
             .service(search)
+            .service(keywords)
     })
     .bind("0.0.0.0:9090")?
     .run()

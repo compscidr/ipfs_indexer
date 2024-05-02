@@ -1,5 +1,5 @@
 use crate::index_result::IndexResult;
-use chashmap::CHashMap;
+use dashmap::{DashMap, Map};
 use crossbeam_queue::ArrayQueue;
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
@@ -10,22 +10,26 @@ use actix_web::body::MessageBody;
 pub struct IndexQueue {
     // queue of items to index
     pub queue: ArrayQueue<String>,
-    pub queue_set: CHashMap<String, ()>, // used to quickly determine duplicates in queue
+    pub queue_set: DashMap<String, ()>, // used to quickly determine duplicates in queue
 
     // index results (cid -> result)
-    pub map: CHashMap<String, IndexResult>,
+    pub map: DashMap<String, IndexResult>,
 
     // used for searching. Maps keyword to unique set of cids
-    pub keywords: CHashMap<String, CHashMap<String, ()>>,
+    pub keywords: DashMap<String, DashMap<String, ()>>,
+    // used to rank the keywords. Everytime keywords is updated, rank should be updated with the
+    // number of cids in the dashmap above
+    pub keyword_rank: DashMap<String, u32>,
 }
 
 impl IndexQueue {
     pub fn new() -> Self {
         IndexQueue {
             queue: ArrayQueue::new(1000),
-            queue_set: CHashMap::new(),
-            map: CHashMap::new(),
-            keywords: CHashMap::new(),
+            queue_set: DashMap::new(),
+            map: DashMap::new(),
+            keywords: DashMap::new(),
+            keyword_rank: DashMap::new(),
         }
     }
 
@@ -56,6 +60,16 @@ impl IndexQueue {
         self.keywords.len()
     }
 
+    /*
+     * Returns the top n keywords by the number of CIDs they map to
+     */
+    pub fn top_keywords(&self, n: usize) -> Vec<(String, u32)> {
+        let all_keywords_iter = self.keyword_rank.clone().into_iter();
+        let mut all_keywords: Vec<(String, u32)> = all_keywords_iter.collect();
+        all_keywords.sort_by(|a, b| b.1.cmp(&a.1));
+        all_keywords.iter().take(n).cloned().collect()
+    }
+
     pub fn search(&self, query: String) -> Vec<IndexResult> {
         let mut results = Vec::new();
 
@@ -64,7 +78,7 @@ impl IndexQueue {
         // which will give us a list of CIDs that contain the keyword.
 
         if self.keywords.contains_key(&query) {
-            let cid_map: CHashMap<String, ()> = self.keywords.get(&query).unwrap().clone();
+            let cid_map: DashMap<String, ()> = self.keywords.get(&query).unwrap().clone();
             cid_map.into_iter().for_each(|(cid, _)| {
                 if self.map.contains_key(&cid) {
                     let index_result: IndexResult = self.map.get(&cid).unwrap().clone();
@@ -257,10 +271,14 @@ impl IndexQueue {
                     if self.keywords.contains_key(word.as_str()) {
                         let keyword_map = self.keywords.get(word.as_str()).unwrap();
                         keyword_map.insert(cid.clone(), ());
+                        let size = keyword_map.len();
+                        self.keyword_rank.insert(word.clone(), size as u32);
                     } else {
-                        let keyword_map: CHashMap<String, ()> = CHashMap::new();
+                        let keyword_map: DashMap<String, ()> = DashMap::new();
                         keyword_map.insert(cid.clone(), ());
+                        let size = keyword_map.len();
                         self.keywords.insert(word.clone(), keyword_map);
+                        self.keyword_rank.insert(word.clone(), size as u32);
                     }
                 }
             }
@@ -269,22 +287,26 @@ impl IndexQueue {
                 warn!("ipfs error on page {}, likely doesn't exist", fullcid);
             }
 
-            if content.len() < 128 {
-                let end = content.char_indices().map(|(i, _)| i).nth(content.len()).unwrap();
-                let excerpt = content[..end].to_string();
+            let excerpt_len = if content.len() < 128 {
+                content.len()
+            } else {
+                128
+            };
+            let end = content.char_indices().map(|(i, _)| i).nth(excerpt_len);
+            if end.is_some() {
+                let endunwrap = end.unwrap();
+                let excerpt = content[..endunwrap].to_string();
                 return Some(IndexResult::new(
                     fullcid,
                     title,
-                    excerpt.to_string(),
+                    excerpt,
                     index_keywords,
                 ))
             } else {
-                let end = content.char_indices().map(|(i, _)| i).nth(128).unwrap();
-                let excerpt = content[..end].to_string();
                 return Some(IndexResult::new(
                     fullcid,
                     title,
-                    excerpt.to_string(),
+                    "".to_string(),
                     index_keywords,
                 ))
             }
