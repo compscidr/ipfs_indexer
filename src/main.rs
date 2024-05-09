@@ -26,9 +26,7 @@ async fn status(queue: web::Data<IndexQueue>) -> HttpResponse {
 // returns the top keywords
 #[get("/keywords")]
 async fn keywords(queue: web::Data<IndexQueue>) -> HttpResponse {
-    HttpResponse::Ok().body(format!("Keywords: {:?}",
-        queue.top_keywords(10)
-    ))
+    HttpResponse::Ok().body(format!("Keywords: {:?}", queue.top_keywords(10)))
 }
 
 #[get("/enqueue/{item}")]
@@ -68,7 +66,8 @@ async fn main() -> std::io::Result<()> {
     }
 
     let index_queue = web::Data::new(IndexQueue::new());
-    let wikipedia_cid = Cid::try_from("bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze").unwrap();
+    let wikipedia_cid =
+        Cid::try_from("bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze").unwrap();
     index_queue.enqueue(wikipedia_cid.to_string());
 
     // if we don't have multiple workers, we can get the case where we run out of room in the

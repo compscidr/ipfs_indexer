@@ -1,11 +1,11 @@
 use crate::index_result::IndexResult;
-use dashmap::{DashMap, Map};
+use actix_web::body::MessageBody;
 use crossbeam_queue::ArrayQueue;
+use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
 use std::collections::HashMap;
 use std::ops::Not;
-use actix_web::body::MessageBody;
 
 pub struct IndexQueue {
     // queue of items to index
@@ -233,7 +233,8 @@ impl IndexQueue {
                     // warn!("link is empty, just a link to the same doc, skipping")
                 } else if link.starts_with("../A") {
                     // handle weird issue where index pages have a ../A/ relative link when they shouldn't
-                    let full_relative = fullcid.clone()[0..last_slash].to_string() + "/" + &link[4..];
+                    let full_relative =
+                        fullcid.clone()[0..last_slash].to_string() + "/" + &link[4..];
                     warn!("relative link with cid: {}, link: {}", full_relative, link);
                     self.enqueue(full_relative);
                 } else {
@@ -296,19 +297,14 @@ impl IndexQueue {
             if end.is_some() {
                 let endunwrap = end.unwrap();
                 let excerpt = content[..endunwrap].to_string();
-                return Some(IndexResult::new(
-                    fullcid,
-                    title,
-                    excerpt,
-                    index_keywords,
-                ))
+                return Some(IndexResult::new(fullcid, title, excerpt, index_keywords));
             } else {
                 return Some(IndexResult::new(
                     fullcid,
                     title,
                     "".to_string(),
                     index_keywords,
-                ))
+                ));
             }
         }
         None
