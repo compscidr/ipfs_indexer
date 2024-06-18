@@ -14,4 +14,4 @@ crossbeam-queue = "0.3.11"
 reqwest = { version = "0.12.4", features = ["gzip", "blocking"] }
 scraper = "0.19.0"
 threadpool = "1.8"
-dashmap = "5.5.3"
+dashmap = "6.0.0"
