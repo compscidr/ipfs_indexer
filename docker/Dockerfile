@@ -10,6 +10,6 @@ COPY ./src ./src
 RUN cargo build --release
 RUN rm ./target/release/deps/* && rm src/*.rs
 
-FROM alpine:3.21 as indexer
+FROM alpine:3.22 as indexer
 COPY --from=builder /home/rust/src/ipfs_indexer/target/x86_64-unknown-linux-musl/release/ipfs_indexer /usr/local/bin/ipfs_indexer
 CMD /usr/local/bin/ipfs_indexer ipfs:8080
