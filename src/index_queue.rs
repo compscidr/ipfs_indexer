@@ -471,11 +471,21 @@ mod tests {
             queue.map.insert(item, result);
         }
 
+        queue.set_denylist(Denylist::parse(&format!("{}/badbits-page\n", good)));
         queue.set_local_denylist(Denylist::parse(&format!("{}/page\n", bad)));
 
         assert_eq!(queue.index_length(), 1);
         assert_eq!(queue.enqueue(format!("{}/page", bad)), Enqueued::Blocked);
+        // setting the local list left badbits in place
+        assert_eq!(
+            queue.enqueue(format!("{}/badbits-page", good)),
+            Enqueued::Blocked
+        );
         assert_eq!(queue.enqueue(good.to_string()), Enqueued::Queued);
+
+        // and reloading badbits leaves the local list in place
+        queue.set_denylist(Denylist::empty());
+        assert_eq!(queue.enqueue(format!("{}/page", bad)), Enqueued::Blocked);
     }
 
     #[test]
