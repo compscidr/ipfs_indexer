@@ -1,6 +1,7 @@
 use crate::denylist::Denylist;
 use crate::index_result::IndexResult;
 use actix_web::body::MessageBody;
+use cid::Cid;
 use crossbeam_queue::ArrayQueue;
 use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
@@ -93,10 +94,20 @@ impl IndexQueue {
         blocked
     }
 
-    pub fn enqueue(&self, item: String) {
+    /**
+     * Queue a "cid" or "cid/path" for indexing. Returns false (and queues nothing) if the item
+     * doesn't start with a valid CID.
+     */
+    pub fn enqueue(&self, item: String) -> bool {
+        let root = item.split('/').next().unwrap_or("");
+        if Cid::try_from(root).is_err() {
+            warn!("Not a CID, ignoring {}", item);
+            return false;
+        }
+
         if self.map.contains_key(&item) {
             trace!("Already indexed {}", item);
-            return;
+            return true;
         }
 
         if self.queue_set.contains_key(&*item) {
@@ -106,6 +117,7 @@ impl IndexQueue {
             let _ = self.queue.push(item.clone());
             self.queue_set.insert(item.clone(), ());
         }
+        true
     }
 
     pub fn queue_length(&self) -> usize {
