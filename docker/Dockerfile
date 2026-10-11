@@ -1,15 +1,16 @@
-FROM ekidd/rust-musl-builder:stable as builder
-# without this step, build fails with an os error 13 permission denied
-# https://blog.logrocket.com/packaging-a-rust-web-service-using-docker/
-RUN USER=root cargo new --bin ipfs_indexer
-WORKDIR /home/rust/src/ipfs_indexer
-COPY ./Cargo.lock ./Cargo.lock
-COPY ./Cargo.toml ./Cargo.toml
-COPY ./src ./src
-
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 RUN cargo build --release
-RUN rm ./target/release/deps/* && rm src/*.rs
 
-FROM alpine:3.24 as indexer
-COPY --from=builder /home/rust/src/ipfs_indexer/target/x86_64-unknown-linux-musl/release/ipfs_indexer /usr/local/bin/ipfs_indexer
-CMD /usr/local/bin/ipfs_indexer ipfs:8080
+FROM debian:bookworm-slim
+# rustls verifies against the system trust store
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/ipfs_indexer /usr/local/bin/ipfs_indexer
+# localhost inside a container is unreachable, so listen on all interfaces
+ENV BIND_ADDR=0.0.0.0:9090
+EXPOSE 9090
+# args (optional): gateway, e.g. `ipfs:8080` for a local node
+ENTRYPOINT ["/usr/local/bin/ipfs_indexer"]
