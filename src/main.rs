@@ -15,14 +15,37 @@ mod denylist;
 mod index_queue;
 mod index_result;
 
+// crate version, plus the commit when built with GIT_SHA set (the docker build passes it)
+fn version() -> String {
+    match option_env!("GIT_SHA").filter(|sha| !sha.is_empty()) {
+        Some(sha) => format!(
+            "{} ({})",
+            env!("CARGO_PKG_VERSION"),
+            &sha[..sha.len().min(7)]
+        ),
+        None => env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+// the gateway the workers fetch through, for /status
+struct Gateway(String);
+
 #[get("/status")]
-async fn status(queue: web::Data<IndexQueue>) -> HttpResponse {
+async fn status(queue: web::Data<IndexQueue>, gateway: web::Data<Gateway>) -> HttpResponse {
     HttpResponse::Ok().body(format!(
-        "Queue length: {} Index size: {} Number of Keywords: {}",
+        "Queue length: {} Index size: {} Number of Keywords: {} Gateway: {} ({}) Version: {}",
         queue.queue_length(),
         queue.index_length(),
-        queue.keyword_length()
+        queue.keyword_length(),
+        gateway.0,
+        queue.gateway_health(),
+        version()
     ))
+}
+
+#[get("/version")]
+async fn version_handler() -> HttpResponse {
+    HttpResponse::Ok().body(version())
 }
 
 // returns the top keywords
@@ -139,10 +162,13 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
+    let gateway_data = web::Data::new(Gateway(gateway));
     HttpServer::new(move || {
         App::new()
             .app_data(index_queue.clone())
+            .app_data(gateway_data.clone())
             .service(status)
+            .service(version_handler)
             .service(enqueue)
             .service(search)
             .service(keywords)
@@ -165,11 +191,26 @@ mod tests {
 
         let req = test::TestRequest::get().uri("/status").to_request();
 
-        let app =
-            test::init_service(App::new().app_data(index_queue.clone()).service(status)).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(index_queue.clone())
+                .app_data(web::Data::new(Gateway("gw.example".to_string())))
+                .service(status),
+        )
+        .await;
 
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_success());
+        let body = test::call_and_read_body(&app, req).await;
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains("Gateway: gw.example (no fetches yet)"),
+            "{}",
+            body
+        );
+        assert!(
+            body.ends_with(&format!("Version: {}", version())),
+            "{}",
+            body
+        );
     }
 
     #[actix_web::test]
