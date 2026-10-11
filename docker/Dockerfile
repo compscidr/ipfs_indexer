@@ -2,7 +2,9 @@ FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release
+# optional: commit shown in /version and /status (.git isn't in the build context)
+ARG GIT_SHA=""
+RUN GIT_SHA="$GIT_SHA" cargo build --release
 
 FROM debian:bookworm-slim
 # rustls verifies against the system trust store

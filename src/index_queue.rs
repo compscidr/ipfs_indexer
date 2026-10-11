@@ -9,8 +9,9 @@ use scraper::{Html, Selector};
 use std::collections::HashMap;
 use std::io::Read;
 use std::ops::Not;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
+use std::time::Instant;
 
 // skip anything bigger than this rather than pulling it all into memory
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
@@ -70,6 +71,9 @@ pub struct IndexQueue {
     // badbits and the hand-maintained local list, checked before every enqueue and fetch
     denylist: RwLock<Denylist>,
     local_denylist: RwLock<Denylist>,
+
+    // when the gateway last answered a fetch, and the error if it didn't
+    last_fetch: Mutex<Option<(Instant, Result<(), String>)>>,
 }
 
 impl IndexQueue {
@@ -82,6 +86,16 @@ impl IndexQueue {
             keyword_rank: DashMap::new(),
             denylist: RwLock::new(Denylist::empty()),
             local_denylist: RwLock::new(Denylist::empty()),
+            last_fetch: Mutex::new(None),
+        }
+    }
+
+    /// e.g. "ok 12s ago" or "error 3s ago: <reason>", for /status
+    pub fn gateway_health(&self) -> String {
+        match &*self.last_fetch.lock().unwrap() {
+            None => "no fetches yet".to_string(),
+            Some((at, Ok(()))) => format!("ok {}s ago", at.elapsed().as_secs()),
+            Some((at, Err(err))) => format!("error {}s ago: {}", at.elapsed().as_secs(), err),
         }
     }
 
@@ -216,7 +230,12 @@ impl IndexQueue {
     fn retrieve_content(&self, gateway: String, cid: String) -> Option<IndexResult> {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
         warn!("Retreiving {}", url);
-        let html = match fetch_html(&url) {
+        let fetched = fetch_html(&url);
+        *self.last_fetch.lock().unwrap() = Some((
+            Instant::now(),
+            fetched.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+        ));
+        let html = match fetched {
             Ok(Some(html)) => html,
             Ok(None) => return None,
             Err(err) => {
@@ -486,6 +505,27 @@ mod tests {
         // and reloading badbits leaves the local list in place
         queue.set_denylist(Denylist::empty());
         assert_eq!(queue.enqueue(format!("{}/page", bad)), Enqueued::Blocked);
+    }
+
+    #[test]
+    fn gateway_health_reflects_last_fetch() {
+        let queue = IndexQueue::new();
+        assert_eq!(queue.gateway_health(), "no fetches yet");
+
+        let gateway = serve_once("text/html", b"<title>t</title>".to_vec())
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        queue.retrieve_content(gateway, "bafy".to_string());
+        assert_eq!(queue.gateway_health(), "ok 0s ago");
+
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        queue.retrieve_content(format!("127.0.0.1:{}", port), "bafy".to_string());
+        assert!(queue.gateway_health().starts_with("error 0s ago: "));
     }
 
     #[test]
