@@ -1,3 +1,4 @@
+use crate::denylist::Denylist;
 use crate::index_result::IndexResult;
 use actix_web::body::MessageBody;
 use crossbeam_queue::ArrayQueue;
@@ -7,6 +8,7 @@ use scraper::{Html, Selector};
 use std::collections::HashMap;
 use std::io::Read;
 use std::ops::Not;
+use std::sync::RwLock;
 use std::time::Duration;
 
 // skip anything bigger than this rather than pulling it all into memory
@@ -56,6 +58,9 @@ pub struct IndexQueue {
     // used to rank the keywords. Everytime keywords is updated, rank should be updated with the
     // number of cids in the dashmap above
     pub keyword_rank: DashMap<String, u32>,
+
+    // checked before every fetch, see set_denylist
+    denylist: RwLock<Denylist>,
 }
 
 impl IndexQueue {
@@ -66,7 +71,26 @@ impl IndexQueue {
             map: DashMap::new(),
             keywords: DashMap::new(),
             keyword_rank: DashMap::new(),
+            denylist: RwLock::new(Denylist::empty()),
         }
+    }
+
+    /**
+     * Replace the denylist and drop anything already indexed that is now on it. Search only
+     * returns cids still in the map, so purged pages disappear from results.
+     */
+    pub fn set_denylist(&self, denylist: Denylist) {
+        self.map
+            .retain(|item, result| !denylist.is_blocked(item) && !denylist.is_blocked(&result.cid));
+        *self.denylist.write().unwrap() = denylist;
+    }
+
+    fn is_blocked(&self, item: &str) -> bool {
+        let blocked = self.denylist.read().unwrap().is_blocked(item);
+        if blocked {
+            warn!("Denylisted, not fetching {}", item);
+        }
+        blocked
     }
 
     pub fn enqueue(&self, item: String) {
@@ -133,6 +157,9 @@ impl IndexQueue {
                 if try_item.is_some() {
                     let item = try_item.unwrap();
                     self.queue_set.remove(&*item);
+                    if self.is_blocked(&item) {
+                        continue;
+                    }
                     warn!("Indexing {}", item);
 
                     let result = self.retrieve_content(gateway.clone(), item.clone());
@@ -203,6 +230,9 @@ impl IndexQueue {
                 let newurl = format!("{}/{}", url, redirect_url);
 
                 let fullcid = cid.clone() + "/" + redirect_url;
+                if self.is_blocked(&fullcid) {
+                    return None;
+                }
                 return match fetch_html(&newurl) {
                     Ok(Some(html)) => Some((fullcid, Html::parse_document(html.as_str()))),
                     Ok(None) => None,
@@ -341,6 +371,7 @@ impl IndexQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use std::io::Write;
     use std::net::TcpListener;
 
@@ -370,6 +401,29 @@ mod tests {
             let _ = stream.write_all(&body);
         });
         url
+    }
+
+    #[test]
+    fn set_denylist_purges_indexed_and_blocks_fetches() {
+        let bad = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let good = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
+        let queue = IndexQueue::new();
+        for cid in [bad, good] {
+            let item = format!("{}/page", cid);
+            let result = IndexResult::new(item.clone(), "".into(), "".into(), HashMap::new());
+            queue.map.insert(item, result);
+        }
+
+        let hash: String = sha2::Sha256::digest(format!("{}/", bad).as_bytes())
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        queue.set_denylist(Denylist::parse(&format!("//{}\n", hash)));
+
+        assert_eq!(queue.index_length(), 1);
+        assert!(queue.map.contains_key(&format!("{}/page", good)));
+        assert!(queue.is_blocked(bad));
+        assert!(!queue.is_blocked(good));
     }
 
     #[test]
