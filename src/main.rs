@@ -31,11 +31,15 @@ async fn keywords(queue: web::Data<IndexQueue>) -> HttpResponse {
     HttpResponse::Ok().body(format!("Keywords: {:?}", queue.top_keywords(10)))
 }
 
-#[get("/enqueue/{item}")]
+// {item:.*} so "cid/path" submissions match too
+#[get("/enqueue/{item:.*}")]
 async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpResponse {
     let item = item.into_inner();
-    data.enqueue(item.clone());
-    HttpResponse::Ok().body(format!("Enqueued {}", item))
+    if data.enqueue(item.clone()) {
+        HttpResponse::Ok().body(format!("Enqueued {}", item))
+    } else {
+        HttpResponse::BadRequest().body(format!("Not a valid CID: {}", item))
+    }
 }
 
 #[get("/search/{query}")]
@@ -126,7 +130,8 @@ async fn main() -> std::io::Result<()> {
             .service(search)
             .service(keywords)
     })
-    .bind("0.0.0.0:9090")?
+    // localhost by default; set BIND_ADDR=0.0.0.0:9090 to accept remote connections
+    .bind(std::env::var("BIND_ADDR").unwrap_or("127.0.0.1:9090".to_string()))?
     .run()
     .await
 }
@@ -153,16 +158,25 @@ mod tests {
     #[actix_web::test]
     async fn test_enqueue_get() {
         let index_queue = web::Data::new(IndexQueue::new());
-
-        let req = test::TestRequest::get()
-            .uri("/enqueue/enqueueItem")
-            .to_request();
-
         let app =
             test::init_service(App::new().app_data(index_queue.clone()).service(enqueue)).await;
 
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_success());
+        let cid = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
+        for uri in [
+            format!("/enqueue/{}", cid),
+            format!("/enqueue/{}/wiki", cid),
+        ] {
+            let req = test::TestRequest::get().uri(&uri).to_request();
+            assert!(test::call_service(&app, req).await.status().is_success());
+        }
+        assert_eq!(index_queue.queue_length(), 2);
+
+        for uri in ["/enqueue/enqueueItem", "/enqueue/notacid/wiki"] {
+            let req = test::TestRequest::get().uri(uri).to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(index_queue.queue_length(), 2);
     }
 
     #[actix_web::test]
