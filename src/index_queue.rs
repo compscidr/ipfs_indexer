@@ -67,8 +67,9 @@ pub struct IndexQueue {
     // number of cids in the dashmap above
     pub keyword_rank: DashMap<String, u32>,
 
-    // checked before every fetch, see set_denylist
+    // badbits and the hand-maintained local list, checked before every enqueue and fetch
     denylist: RwLock<Denylist>,
+    local_denylist: RwLock<Denylist>,
 }
 
 impl IndexQueue {
@@ -80,6 +81,7 @@ impl IndexQueue {
             keywords: DashMap::new(),
             keyword_rank: DashMap::new(),
             denylist: RwLock::new(Denylist::empty()),
+            local_denylist: RwLock::new(Denylist::empty()),
         }
     }
 
@@ -88,13 +90,24 @@ impl IndexQueue {
      * returns cids still in the map, so purged pages disappear from results.
      */
     pub fn set_denylist(&self, denylist: Denylist) {
-        self.map
-            .retain(|item, result| !denylist.is_blocked(item) && !denylist.is_blocked(&result.cid));
+        self.purge(&denylist);
         *self.denylist.write().unwrap() = denylist;
     }
 
+    /// Same as set_denylist, for the local takedown list
+    pub fn set_local_denylist(&self, denylist: Denylist) {
+        self.purge(&denylist);
+        *self.local_denylist.write().unwrap() = denylist;
+    }
+
+    fn purge(&self, denylist: &Denylist) {
+        self.map
+            .retain(|item, result| !denylist.is_blocked(item) && !denylist.is_blocked(&result.cid));
+    }
+
     fn is_blocked(&self, item: &str) -> bool {
-        let blocked = self.denylist.read().unwrap().is_blocked(item);
+        let blocked = self.denylist.read().unwrap().is_blocked(item)
+            || self.local_denylist.read().unwrap().is_blocked(item);
         if blocked {
             warn!("Denylisted, skipping {}", item);
         }
@@ -445,6 +458,34 @@ mod tests {
         assert!(queue.map.contains_key(&format!("{}/page", good)));
         assert!(queue.is_blocked(bad));
         assert!(!queue.is_blocked(good));
+    }
+
+    #[test]
+    fn local_denylist_purges_and_blocks_alongside_badbits() {
+        let bad = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let good = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
+        let queue = IndexQueue::new();
+        for cid in [bad, good] {
+            let item = format!("{}/page", cid);
+            let result = IndexResult::new(item.clone(), "".into(), "".into(), HashMap::new());
+            queue.map.insert(item, result);
+        }
+
+        queue.set_denylist(Denylist::parse(&format!("{}/badbits-page\n", good)));
+        queue.set_local_denylist(Denylist::parse(&format!("{}/page\n", bad)));
+
+        assert_eq!(queue.index_length(), 1);
+        assert_eq!(queue.enqueue(format!("{}/page", bad)), Enqueued::Blocked);
+        // setting the local list left badbits in place
+        assert_eq!(
+            queue.enqueue(format!("{}/badbits-page", good)),
+            Enqueued::Blocked
+        );
+        assert_eq!(queue.enqueue(good.to_string()), Enqueued::Queued);
+
+        // and reloading badbits leaves the local list in place
+        queue.set_denylist(Denylist::empty());
+        assert_eq!(queue.enqueue(format!("{}/page", bad)), Enqueued::Blocked);
     }
 
     #[test]

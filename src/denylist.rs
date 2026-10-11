@@ -21,14 +21,26 @@ impl Denylist {
         }
     }
 
-    // ponytail: only legacy hex entries are parsed, badbits ships nothing else today
+    /**
+     * Parses badbits-style "//<hex sha256>" entries. Plain "cid", "cid/path" or "/ipfs/cid/path"
+     * lines (for a hand-maintained local list) block that CID or path. Other lines are ignored.
+     */
+    // ponytail: only legacy hex entries and plain CIDs, badbits ships nothing else today
     pub fn parse(text: &str) -> Denylist {
         let hashes = text
             .lines()
-            .filter_map(|line| line.strip_prefix("//"))
-            .filter_map(parse_hex32)
+            .map(str::trim)
+            .filter_map(|line| match line.strip_prefix("//") {
+                Some(hex) => parse_hex32(hex),
+                None => prefix_keys(line.trim_start_matches("/ipfs/"))
+                    .and_then(|keys| keys.last().map(|key| sha256(key))),
+            })
             .collect();
         Denylist { hashes }
+    }
+
+    pub fn load_file(path: &str) -> std::io::Result<Denylist> {
+        Ok(Denylist::parse(&std::fs::read_to_string(path)?))
     }
 
     pub fn fetch() -> Result<Denylist, reqwest::Error> {
@@ -48,36 +60,34 @@ impl Denylist {
      * start with a parseable CID counts as blocked.
      */
     pub fn is_blocked(&self, item: &str) -> bool {
-        let mut segments = item.split('/').filter(|s| !s.is_empty());
-        let cid = match segments
-            .next()
-            .and_then(|c| Cid::try_from(c).ok())
-            .and_then(|c| c.into_v1().ok())
-        {
-            Some(cid) => cid,
-            None => return true,
-        };
-        // "cid/" blocks the whole tree, then "cid/a", "cid/a/b", ...
-        let mut key = format!("{}/", cid);
-        if self.contains(&key) {
-            return true;
+        match prefix_keys(item) {
+            Some(keys) => keys.iter().any(|key| self.hashes.contains(&sha256(key))),
+            None => true,
         }
-        for (i, segment) in segments.enumerate() {
-            if i > 0 {
-                key.push('/');
-            }
-            key.push_str(segment);
-            if self.contains(&key) {
-                return true;
-            }
-        }
-        false
     }
+}
 
-    fn contains(&self, key: &str) -> bool {
-        self.hashes
-            .contains(&<[u8; 32]>::from(Sha256::digest(key.as_bytes())))
+/**
+ * The denylist keys for a "cid/path" item: "<cidv1>/" (the whole tree), then "<cidv1>/a",
+ * "<cidv1>/a/b", ... Empty segments are ignored. None if it doesn't start with a valid CID.
+ */
+fn prefix_keys(item: &str) -> Option<Vec<String>> {
+    let mut segments = item.split('/').filter(|s| !s.is_empty());
+    let cid = Cid::try_from(segments.next()?).ok()?.into_v1().ok()?;
+    let mut key = format!("{}/", cid);
+    let mut keys = vec![key.clone()];
+    for (i, segment) in segments.enumerate() {
+        if i > 0 {
+            key.push('/');
+        }
+        key.push_str(segment);
+        keys.push(key.clone());
     }
+    Some(keys)
+}
+
+fn sha256(key: &str) -> [u8; 32] {
+    Sha256::digest(key.as_bytes()).into()
 }
 
 fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
@@ -134,6 +144,17 @@ mod tests {
         assert!(list.is_blocked(&format!("{}//bad/deeper/", V1)));
         assert!(!list.is_blocked(V1));
         assert!(!list.is_blocked(&format!("{}/good", V1)));
+    }
+
+    #[test]
+    fn plain_cid_lines_block_like_hashed_entries() {
+        let list = Denylist::parse(&format!("# takedowns\n{}\n/ipfs/{}/bad/page/\n", V0, OTHER));
+        assert_eq!(list.len(), 2);
+        assert!(list.is_blocked(V1));
+        assert!(list.is_blocked(&format!("{}/anything", V1)));
+        assert!(list.is_blocked(&format!("{}/bad/page/deeper", OTHER)));
+        assert!(!list.is_blocked(&format!("{}/bad", OTHER)));
+        assert!(!list.is_blocked(OTHER));
     }
 
     #[test]
