@@ -112,6 +112,19 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    // optional hand-maintained takedown list (plain CIDs / cid/path lines), re-read every 5 min
+    // so additions are purged from the index and search without a restart
+    if let Ok(path) = std::env::var("LOCAL_DENYLIST") {
+        let local_queue = Arc::clone(&index_queue);
+        std::thread::spawn(move || loop {
+            match Denylist::load_file(&path) {
+                Ok(denylist) => local_queue.set_local_denylist(denylist),
+                Err(err) => warn!("Couldn't read local denylist {}: {}", path, err),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5 * 60));
+        });
+    }
+
     // if we don't have multiple workers, we can get the case where we run out of room in the
     // queue if a doc has many links
     let n_workers = 10;
