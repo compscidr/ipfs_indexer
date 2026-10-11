@@ -18,7 +18,8 @@ const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
  */
 fn fetch_html(url: &str) -> Result<Option<String>, reqwest::Error> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
+        // public gateways can take ~50s on a cache miss
+        .timeout(Duration::from_secs(90))
         .build()?;
     let response = client.get(url).send()?.error_for_status()?;
     let content_type = response

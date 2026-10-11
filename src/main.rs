@@ -56,10 +56,14 @@ async fn main() -> std::io::Result<()> {
     //otherwise run with log level set via RUST_LOG=info ./ipfs_indexer
     SimpleLogger::new().env().init().unwrap();
 
-    let mut gateway: String = "ipfs.io".to_string();
+    // ipfs.io no longer serves non-browser clients, see #197
+    let mut gateway: String = "ipfs.filebase.io".to_string();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        warn!("Running with ipfs.io gateway. Usage: ipfs_indexer <ipfs_node_address>");
+        warn!(
+            "Running with {} gateway. Usage: ipfs_indexer <ipfs_node_address>",
+            gateway
+        );
     } else {
         info!("Running with ifps gateway {}", args[1]);
         gateway = args[1].clone();
