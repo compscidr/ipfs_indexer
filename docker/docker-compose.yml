@@ -18,9 +18,9 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     container_name: ipfs-indexer
+    command: ["ipfs:8080"]
     restart: always
     environment:
       RUST_LOG: "info"
-      BIND_ADDR: "0.0.0.0:9090"
     depends_on:
       - ipfs

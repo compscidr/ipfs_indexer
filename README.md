@@ -37,7 +37,7 @@ By default runs an endpoint on `127.0.0.1:9090` (set `BIND_ADDR=0.0.0.0:9090` to
 - http://localhost:9090/search/somequery
 
 ## Running with docker
-From the docker directory, run `docker-compose up`. Currently image is only ~26MB.
+From the docker directory, run `docker compose up` (indexer + a local IPFS node). To run just the indexer against the default public gateway: `docker build -f docker/Dockerfile -t ipfs-indexer . && docker run -p 9090:9090 ipfs-indexer`.
 
 ## CI
 I setup a workflow that should run a build at least on push, but doesnt run any tests because I have no idea how test
