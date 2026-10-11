@@ -29,7 +29,7 @@ Run `xcode-select --install` if you do not have xcode installed, need to update 
 ## Running with logging output
 - Run `cargo build` to build
 - Run `RUST_LOG=info ./target/debug/ipfs_indexer` to see logging output (adjust level accordingly)
-- Run `RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080` to use your own ipfs gateway instead of ipfs.io
+- Run `RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080` to use your own ipfs gateway instead of the default public gateway (`ipfs.filebase.io`, rate limited to 200 requests/min)
 
 By default runs an endpoing on `0.0.0.0:9090` so you can go to 
 - http://localhost:9090/status

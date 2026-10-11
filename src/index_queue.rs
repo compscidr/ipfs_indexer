@@ -1,3 +1,4 @@
+use crate::denylist::Denylist;
 use crate::index_result::IndexResult;
 use actix_web::body::MessageBody;
 use crossbeam_queue::ArrayQueue;
@@ -5,7 +6,44 @@ use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
 use std::collections::HashMap;
+use std::io::Read;
 use std::ops::Not;
+use std::sync::RwLock;
+use std::time::Duration;
+
+// skip anything bigger than this rather than pulling it all into memory
+const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
+
+/**
+ * Fetch a url and return its body, but only if the gateway says it's html and it fits in
+ * MAX_BODY_BYTES. Ok(None) means it was skipped: images, video, etc are never downloaded.
+ */
+fn fetch_html(url: &str) -> Result<Option<String>, reqwest::Error> {
+    let client = reqwest::blocking::Client::builder()
+        // public gateways can take ~50s on a cache miss
+        .timeout(Duration::from_secs(90))
+        .build()?;
+    let response = client.get(url).send()?.error_for_status()?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !content_type.starts_with("text/html") {
+        warn!("Skipping {}: content type {:?}", url, content_type);
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    if let Err(err) = response.take(MAX_BODY_BYTES + 1).read_to_end(&mut body) {
+        warn!("Skipping {}: error reading body: {}", url, err);
+        return Ok(None);
+    }
+    if body.len() as u64 > MAX_BODY_BYTES {
+        warn!("Skipping {}: larger than {} bytes", url, MAX_BODY_BYTES);
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&body).into_owned()))
+}
 
 pub struct IndexQueue {
     // queue of items to index
@@ -20,6 +58,9 @@ pub struct IndexQueue {
     // used to rank the keywords. Everytime keywords is updated, rank should be updated with the
     // number of cids in the dashmap above
     pub keyword_rank: DashMap<String, u32>,
+
+    // checked before every fetch, see set_denylist
+    denylist: RwLock<Denylist>,
 }
 
 impl IndexQueue {
@@ -30,7 +71,26 @@ impl IndexQueue {
             map: DashMap::new(),
             keywords: DashMap::new(),
             keyword_rank: DashMap::new(),
+            denylist: RwLock::new(Denylist::empty()),
         }
+    }
+
+    /**
+     * Replace the denylist and drop anything already indexed that is now on it. Search only
+     * returns cids still in the map, so purged pages disappear from results.
+     */
+    pub fn set_denylist(&self, denylist: Denylist) {
+        self.map
+            .retain(|item, result| !denylist.is_blocked(item) && !denylist.is_blocked(&result.cid));
+        *self.denylist.write().unwrap() = denylist;
+    }
+
+    fn is_blocked(&self, item: &str) -> bool {
+        let blocked = self.denylist.read().unwrap().is_blocked(item);
+        if blocked {
+            warn!("Denylisted, not fetching {}", item);
+        }
+        blocked
     }
 
     pub fn enqueue(&self, item: String) {
@@ -97,6 +157,9 @@ impl IndexQueue {
                 if try_item.is_some() {
                     let item = try_item.unwrap();
                     self.queue_set.remove(&*item);
+                    if self.is_blocked(&item) {
+                        continue;
+                    }
                     warn!("Indexing {}", item);
 
                     let result = self.retrieve_content(gateway.clone(), item.clone());
@@ -119,20 +182,15 @@ impl IndexQueue {
     fn retrieve_content(&self, gateway: String, cid: String) -> Option<IndexResult> {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
         warn!("Retreiving {}", url);
-        let client = reqwest::blocking::Client::new();
-        let result = client.get(&url).send();
-        let response = match result {
-            Ok(result) => result,
+        let html = match fetch_html(&url) {
+            Ok(Some(html)) => html,
+            Ok(None) => return None,
             Err(err) => {
                 warn!("Error: {}, not re-enqueue-ing cid", err);
                 // self.enqueue(cid.clone()); // for now give up on error
                 return None;
             }
         };
-
-        // todo: check the file type header and only proceed this way if it is actually html, otherwise index as some other file type
-        // plus some meta data
-        let html = response.text().unwrap();
         let mut document = Html::parse_document(html.as_str());
         let result = self.detect_redirect(url, cid.clone(), document.clone());
         let mut fullcid = cid.clone();
@@ -172,21 +230,20 @@ impl IndexQueue {
                 let newurl = format!("{}/{}", url, redirect_url);
 
                 let fullcid = cid.clone() + "/" + redirect_url;
-                let client = reqwest::blocking::Client::new();
-                let result = client.get(&newurl).send();
-                let result = match result {
-                    Ok(r) => r,
+                if self.is_blocked(&fullcid) {
+                    return None;
+                }
+                return match fetch_html(&newurl) {
+                    Ok(Some(html)) => Some((fullcid, Html::parse_document(html.as_str()))),
+                    Ok(None) => None,
                     Err(e) => {
                         warn!("error retrieving content from {}: {}", url, e);
                         if e.is_timeout() {
                             self.enqueue(fullcid.clone());
                         }
-                        return None;
+                        None
                     }
                 };
-                let response = result;
-                let html = response.text().unwrap();
-                return Some((fullcid, Html::parse_document(html.as_str())));
             }
         }
         None
@@ -308,5 +365,105 @@ impl IndexQueue {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::Digest;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    // serves a single http response with the given content type and body, returns its url
+    fn serve_once(content_type: &'static str, body: Vec<u8>) -> String {
+        serve_status_once("200 OK", content_type, body)
+    }
+
+    fn serve_status_once(
+        status: &'static str,
+        content_type: &'static str,
+        body: Vec<u8>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                status,
+                content_type,
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        url
+    }
+
+    #[test]
+    fn set_denylist_purges_indexed_and_blocks_fetches() {
+        let bad = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let good = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
+        let queue = IndexQueue::new();
+        for cid in [bad, good] {
+            let item = format!("{}/page", cid);
+            let result = IndexResult::new(item.clone(), "".into(), "".into(), HashMap::new());
+            queue.map.insert(item, result);
+        }
+
+        let hash: String = sha2::Sha256::digest(format!("{}/", bad).as_bytes())
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        queue.set_denylist(Denylist::parse(&format!("//{}\n", hash)));
+
+        assert_eq!(queue.index_length(), 1);
+        assert!(queue.map.contains_key(&format!("{}/page", good)));
+        assert!(queue.is_blocked(bad));
+        assert!(!queue.is_blocked(good));
+    }
+
+    #[test]
+    fn fetch_html_returns_html() {
+        let url = serve_once("text/html; charset=utf-8", b"<title>hi</title>".to_vec());
+        assert_eq!(
+            fetch_html(&url).unwrap().as_deref(),
+            Some("<title>hi</title>")
+        );
+    }
+
+    #[test]
+    fn fetch_html_skips_non_html() {
+        let url = serve_once("image/png", vec![0x89, b'P', b'N', b'G']);
+        assert_eq!(fetch_html(&url).unwrap(), None);
+    }
+
+    #[test]
+    fn fetch_html_skips_oversized_body() {
+        let url = serve_once("text/html", vec![b'a'; MAX_BODY_BYTES as usize + 1]);
+        assert_eq!(fetch_html(&url).unwrap(), None);
+    }
+
+    #[test]
+    fn fetch_html_rejects_error_status() {
+        let url = serve_status_once(
+            "429 Too Many Requests",
+            "text/html",
+            b"<p>slow down</p>".to_vec(),
+        );
+        assert!(fetch_html(&url).is_err());
+    }
+
+    #[test]
+    fn fetch_html_reports_connection_errors() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(fetch_html(&format!("http://127.0.0.1:{}/", port)).is_err());
     }
 }

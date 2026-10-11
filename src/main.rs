@@ -5,11 +5,13 @@ use threadpool::ThreadPool;
 
 use actix_web::{get, web, App, HttpResponse, HttpServer};
 use cid::Cid;
-use log::{info, warn};
+use log::{error, info, warn};
 use simple_logger::SimpleLogger;
 
+use crate::denylist::Denylist;
 use crate::index_queue::IndexQueue;
 
+mod denylist;
 mod index_queue;
 mod index_result;
 
@@ -56,10 +58,14 @@ async fn main() -> std::io::Result<()> {
     //otherwise run with log level set via RUST_LOG=info ./ipfs_indexer
     SimpleLogger::new().env().init().unwrap();
 
-    let mut gateway: String = "ipfs.io".to_string();
+    // ipfs.io no longer serves non-browser clients, see #197
+    let mut gateway: String = "ipfs.filebase.io".to_string();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        warn!("Running with ipfs.io gateway. Usage: ipfs_indexer <ipfs_node_address>");
+        warn!(
+            "Running with {} gateway. Usage: ipfs_indexer <ipfs_node_address>",
+            gateway
+        );
     } else {
         info!("Running with ifps gateway {}", args[1]);
         gateway = args[1].clone();
@@ -69,6 +75,34 @@ async fn main() -> std::io::Result<()> {
     let wikipedia_cid =
         Cid::try_from("bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze").unwrap();
     index_queue.enqueue(wikipedia_cid.to_string());
+
+    // fail closed: don't crawl anything until the badbits denylist is loaded. Fetched on a plain
+    // thread since the blocking client can't run inside the actix runtime.
+    match std::thread::spawn(Denylist::fetch).join().unwrap() {
+        Ok(denylist) => {
+            info!("Loaded {} denylist entries", denylist.len());
+            index_queue.set_denylist(denylist);
+        }
+        Err(err) => {
+            error!(
+                "Couldn't load denylist from {}: {}",
+                denylist::BADBITS_URL,
+                err
+            );
+            std::process::exit(1);
+        }
+    }
+    let refresh_queue = Arc::clone(&index_queue);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(24 * 60 * 60));
+        match Denylist::fetch() {
+            Ok(denylist) => {
+                info!("Refreshed denylist: {} entries", denylist.len());
+                refresh_queue.set_denylist(denylist);
+            }
+            Err(err) => warn!("Couldn't refresh denylist, keeping the old one: {}", err),
+        }
+    });
 
     // if we don't have multiple workers, we can get the case where we run out of room in the
     // queue if a doc has many links
