@@ -37,7 +37,7 @@ By default runs an endpoint on `127.0.0.1:9090` (set `BIND_ADDR=0.0.0.0:9090` to
 - http://localhost:9090/search/somequery
 
 ## Running with docker
-- Indexer + a local IPFS node: from the `docker` directory, run `docker compose up`.
+- Indexer + a local IPFS node: from the `docker` directory, run `docker compose up`. The node (Kubo) is locked down so it never re-serves what the crawler fetched: no providing, DHT client only, Bitswap server off, GC at 2GB, no inbound swarm port, and the badbits denylist (re-downloaded on every `up`).
 - Just the indexer, against the default public gateway: from the repository root (the build context needs `Cargo.toml` and `src`), run `docker build -f docker/Dockerfile -t ipfs-indexer . && docker run -p 9090:9090 ipfs-indexer`.
 
 ## CI

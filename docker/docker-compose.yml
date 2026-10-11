@@ -1,18 +1,36 @@
-version: '2.3'
 services:
+  # Kubo only reads denylist files that exist when the daemon starts, so fetch badbits
+  # first (re-fetched on every `up`). The kubo image's wget doesn't verify TLS, hence curl.
+  # If the download fails, the previous copy is kept; with no copy at all, ipfs won't start.
+  badbits:
+    image: curlimages/curl:8.16.0
+    user: root
+    volumes:
+      - denylists:/denylists
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        curl -fsSL -o /denylists/badbits.deny.tmp https://badbits.dwebops.pub/badbits.deny
+        && mv /denylists/badbits.deny.tmp /denylists/badbits.deny
+        || test -f /denylists/badbits.deny
   ipfs:
     container_name: ipfs
-    image: ipfs/go-ipfs
+    image: ipfs/kubo:v0.43.1
     restart: always
-    # volumes:
-    #   - ./ipfs:/go-ipfs
+    # --enable-gc: drop cached blocks once Datastore.StorageMax is reached
+    command: ["daemon", "--migrate=true", "--agent-version-suffix=docker", "--enable-gc"]
+    volumes:
+      - ./kubo-init.sh:/container-init.d/indexer.sh:ro
+      - denylists:/etc/ipfs/denylists:ro
+    # no 4001: the node only dials out, nothing needs to reach it
     ports:
       - "127.0.0.1:5001:5001"
-      - "4001:4001/udp"
-      - "4001:4001"
       - "127.0.0.1:8080:8080"
     environment:
       - IPFS_PROFILE=server
+    depends_on:
+      badbits:
+        condition: service_completed_successfully
   ipfs-indexer:
     build:
       context: ..
@@ -23,4 +41,8 @@ services:
     environment:
       RUST_LOG: "info"
     depends_on:
-      - ipfs
+      ipfs:
+        condition: service_healthy
+
+volumes:
+  denylists:
