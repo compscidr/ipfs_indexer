@@ -9,7 +9,7 @@ use log::{error, info, warn};
 use simple_logger::SimpleLogger;
 
 use crate::denylist::Denylist;
-use crate::index_queue::IndexQueue;
+use crate::index_queue::{Enqueued, IndexQueue};
 
 mod denylist;
 mod index_queue;
@@ -35,10 +35,14 @@ async fn keywords(queue: web::Data<IndexQueue>) -> HttpResponse {
 #[get("/enqueue/{item:.*}")]
 async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpResponse {
     let item = item.into_inner();
-    if data.enqueue(item.clone()) {
-        HttpResponse::Ok().body(format!("Enqueued {}", item))
-    } else {
-        HttpResponse::BadRequest().body(format!("Not a valid CID: {}", item))
+    match data.enqueue(item.clone()) {
+        Enqueued::Queued => HttpResponse::Ok().body(format!("Enqueued {}", item)),
+        Enqueued::InvalidCid => {
+            HttpResponse::BadRequest().body(format!("Not a valid CID: {}", item))
+        }
+        Enqueued::Blocked => {
+            HttpResponse::Forbidden().body(format!("Blocked by denylist: {}", item))
+        }
     }
 }
 
@@ -177,6 +181,27 @@ mod tests {
             assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
         }
         assert_eq!(index_queue.queue_length(), 2);
+    }
+
+    #[actix_web::test]
+    async fn test_enqueue_denylisted_is_forbidden() {
+        use sha2::Digest;
+        let blocked = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let hash: String = sha2::Sha256::digest(format!("{}/", blocked).as_bytes())
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let index_queue = web::Data::new(IndexQueue::new());
+        index_queue.set_denylist(Denylist::parse(&format!("//{}\n", hash)));
+        let app =
+            test::init_service(App::new().app_data(index_queue.clone()).service(enqueue)).await;
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/enqueue/{}/page", blocked))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+        assert_eq!(index_queue.queue_length(), 0);
     }
 
     #[actix_web::test]

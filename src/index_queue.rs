@@ -46,6 +46,13 @@ fn fetch_html(url: &str) -> Result<Option<String>, reqwest::Error> {
     Ok(Some(String::from_utf8_lossy(&body).into_owned()))
 }
 
+#[derive(Debug, PartialEq)]
+pub enum Enqueued {
+    Queued,
+    InvalidCid,
+    Blocked,
+}
+
 pub struct IndexQueue {
     // queue of items to index
     pub queue: ArrayQueue<String>,
@@ -89,25 +96,27 @@ impl IndexQueue {
     fn is_blocked(&self, item: &str) -> bool {
         let blocked = self.denylist.read().unwrap().is_blocked(item);
         if blocked {
-            warn!("Denylisted, not fetching {}", item);
+            warn!("Denylisted, skipping {}", item);
         }
         blocked
     }
 
     /**
-     * Queue a "cid" or "cid/path" for indexing. Returns false (and queues nothing) if the item
-     * doesn't start with a valid CID.
+     * Queue a "cid" or "cid/path" for indexing. Nothing is queued unless it returns Queued.
      */
-    pub fn enqueue(&self, item: String) -> bool {
+    pub fn enqueue(&self, item: String) -> Enqueued {
         let root = item.split('/').next().unwrap_or("");
         if Cid::try_from(root).is_err() {
             warn!("Not a CID, ignoring {}", item);
-            return false;
+            return Enqueued::InvalidCid;
+        }
+        if self.is_blocked(&item) {
+            return Enqueued::Blocked;
         }
 
         if self.map.contains_key(&item) {
             trace!("Already indexed {}", item);
-            return true;
+            return Enqueued::Queued;
         }
 
         if self.queue_set.contains_key(&*item) {
@@ -117,7 +126,7 @@ impl IndexQueue {
             let _ = self.queue.push(item.clone());
             self.queue_set.insert(item.clone(), ());
         }
-        true
+        Enqueued::Queued
     }
 
     pub fn queue_length(&self) -> usize {
