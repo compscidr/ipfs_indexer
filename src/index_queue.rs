@@ -598,15 +598,18 @@ impl IndexQueue {
             });
         }
         // purged pages can linger in the keyword index; only what's in the map is served
-        let mut ranked: Vec<(f64, IndexResult)> = scores
+        let mut ranked: Vec<(f64, String)> = scores
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|(page, score)| self.map.get(&page).map(|r| (score, r.clone())))
+            .filter(|(page, _)| self.map.contains_key(page))
+            .map(|(page, score)| (score, page))
             .collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cid.cmp(&b.1.cid)));
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let total = ranked.len();
-        let page = ranked.into_iter().skip(offset).take(limit).map(|(_, r)| r);
-        (total, page.collect())
+        // clone only the requested page of results, not every match
+        let page = ranked.into_iter().skip(offset).take(limit);
+        let results = page.filter_map(|(_, item)| self.map.get(&item).map(|r| r.clone()));
+        (total, results.collect())
     }
 
     pub fn start(&self, gateway: String) {
