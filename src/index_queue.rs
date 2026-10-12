@@ -14,6 +14,10 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use std::time::Instant;
 
+// where crawling starts: the IPFS wikipedia mirror. Queued at startup and again after the daily
+// expiry, so the crawl walks back to pages that expired.
+pub const SEED_CIDS: &[&str] = &["bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze"];
+
 // skip anything bigger than this rather than pulling it all into memory
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -78,6 +82,11 @@ pub struct IndexQueue {
 
     // the persisted index (#106); unset when DATA_DIR isn't configured
     store: OnceLock<Store>,
+
+    // persist() holds this shared across its check + insert + upsert; denylist swaps and
+    // expire() hold it exclusively, so a page checked against an old list can't be written
+    // after the purge that should have removed it
+    writes: RwLock<()>,
 }
 
 impl IndexQueue {
@@ -92,6 +101,7 @@ impl IndexQueue {
             local_denylist: RwLock::new(Denylist::empty()),
             last_fetch: Mutex::new(None),
             store: OnceLock::new(),
+            writes: RwLock::new(()),
         }
     }
 
@@ -109,12 +119,14 @@ impl IndexQueue {
      * returns cids still in the map, so purged pages disappear from results.
      */
     pub fn set_denylist(&self, denylist: Denylist) {
+        let _writes = self.writes.write().unwrap();
         self.purge(&denylist);
         *self.denylist.write().unwrap() = denylist;
     }
 
     /// Same as set_denylist, for the local takedown list
     pub fn set_local_denylist(&self, denylist: Denylist) {
+        let _writes = self.writes.write().unwrap();
         self.purge(&denylist);
         *self.local_denylist.write().unwrap() = denylist;
     }
@@ -152,8 +164,18 @@ impl IndexQueue {
         Ok((keep.len(), blocked, expired))
     }
 
+    /// Queue each seed that isn't indexed or queued already; returns how many were queued
+    pub fn reseed(&self) -> usize {
+        SEED_CIDS
+            .iter()
+            .filter(|seed| !self.map.contains_key(**seed) && !self.queue_set.contains_key(**seed))
+            .filter(|seed| self.enqueue(seed.to_string()) == Enqueued::Queued)
+            .count()
+    }
+
     /// Drop pages indexed more than max_age_secs ago, from the store and the map
     pub fn expire(&self, max_age_secs: i64) -> usize {
+        let _writes = self.writes.write().unwrap();
         let Some(store) = self.store.get() else {
             return 0;
         };
@@ -179,6 +201,7 @@ impl IndexQueue {
      * that landed while this page was being fetched must not be written back to disk.
      */
     pub fn persist(&self, item: &str, result: &IndexResult) {
+        let _writes = self.writes.read().unwrap();
         if self.blocked_quietly(item) || self.blocked_quietly(&result.cid) {
             return;
         }
@@ -774,6 +797,52 @@ mod tests {
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
         queue.persist(BAD, &page(BAD, "racetitle", &[]));
         assert!(!file_has(&dir, "racetitle"));
+    }
+
+    #[test]
+    fn persist_cannot_interleave_with_a_denylist_swap_and_purge() {
+        // review #1: a worker that checked against the OLD list must not write after the purge
+        let dir = temp_dir("race");
+        let queue = std::sync::Arc::new(IndexQueue::new());
+        queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+
+        let swap = queue.writes.write().unwrap(); // a setter is mid swap+purge
+        let worker = {
+            let queue = std::sync::Arc::clone(&queue);
+            std::thread::spawn(move || queue.persist(BAD, &page(BAD, "racetitle2", &[])))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        *queue.local_denylist.write().unwrap() = Denylist::parse(&format!("{}\n", BAD));
+        drop(swap);
+        worker.join().unwrap();
+
+        assert_eq!(queue.index_length(), 0);
+        assert!(!file_has(&dir, "racetitle2"));
+    }
+
+    #[test]
+    fn reseed_requeues_the_seed_after_its_page_expires() {
+        // review #3: without a re-seed, a long-running instance empties itself 30 days on
+        let dir = temp_dir("reseed");
+        let seed = SEED_CIDS[0];
+        seed_rows(&dir, seed, now_secs() - 40 * DAY);
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir).unwrap(), 50 * DAY)
+            .unwrap();
+        assert_eq!(queue.reseed(), 0, "seed already indexed: nothing queued");
+        assert_eq!(queue.expire(30 * DAY), 1);
+        assert_eq!(queue.reseed(), 1, "seed queued again so the crawl restarts");
+        assert_eq!(queue.queue_length(), 1);
+    }
+
+    fn seed_rows(dir: &std::path::Path, item: &str, at: i64) {
+        Store::open(dir)
+            .unwrap()
+            .upsert(item, &page(item, "seedpage", &[]), at)
+            .unwrap();
     }
 
     #[test]

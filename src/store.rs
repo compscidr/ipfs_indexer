@@ -6,8 +6,10 @@ use std::sync::Mutex;
 
 /**
  * The persisted index (#106): one SQLite file, `index.sqlite`, under DATA_DIR. secure_delete
- * zeroes deleted rows in the file and the rollback journal (not WAL) keeps no stale copies,
- * so a takedown removes the text from disk, not just from memory.
+ * zeroes deleted rows in the file. The rollback journal is kept in memory: an on-disk journal
+ * (DELETE or WAL mode) would write plaintext copies of pages and later only unlink them. The
+ * trade-off is that a crash mid-write can corrupt the file; the index is rebuildable, so
+ * recovery is the documented wipe.
  */
 pub struct Store {
     conn: Mutex<Connection>,
@@ -26,7 +28,7 @@ impl Store {
         let path = dir.join("index.sqlite");
         let conn = Connection::open(&path)?;
         conn.pragma_update(None, "secure_delete", true)?;
-        conn.pragma_update(None, "journal_mode", "DELETE")?;
+        conn.pragma_update(None, "journal_mode", "MEMORY")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS pages (
                 item       TEXT PRIMARY KEY,
@@ -245,6 +247,24 @@ pub(crate) mod tests {
             &std::fs::read(store.path()).unwrap(),
             "ZZQX-control-title-88"
         ));
+    }
+
+    #[test]
+    fn rollback_journal_never_touches_disk() {
+        // review #2: an on-disk journal holds plaintext copies of pages, then is merely unlinked
+        let dir = temp_dir("journal");
+        let store = Store::open(&dir).unwrap();
+        let mode: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "memory");
+        store.upsert("bafyJ", &page("bafyJ", "j", &[]), 1).unwrap();
+        store.delete(&["bafyJ".to_string()]).unwrap();
+        assert!(!dir.join("index.sqlite-journal").exists());
+        assert!(!dir.join("index.sqlite-wal").exists());
     }
 
     #[test]

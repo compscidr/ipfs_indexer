@@ -21,7 +21,7 @@ The acceptance criteria in #106 are binding:
 
 SQLite through `rusqlite` (bundled build), one file at `$DATA_DIR/index.sqlite`, with:
 - `PRAGMA secure_delete = ON`: deleted rows are overwritten with zeros in the database file, so a purge erases the text, not just the index entry.
-- `PRAGMA journal_mode = DELETE` (the default rollback journal, not WAL), so old page images don't linger in a `-wal` file between checkpoints.
+- `PRAGMA journal_mode = MEMORY`: no journal file on disk at all. An on-disk rollback journal (DELETE mode) or WAL would write plaintext copies of pages and later only unlink them (changed after review). The trade-off: a crash mid-write can corrupt the file, which is recovered with the wipe; the index is rebuildable.
 
 Rejected:
 - **`redb`:** freed pages can keep deleted data until they're reused, so criterion 1 can't be shown.
@@ -61,7 +61,7 @@ Nothing is crawled or searchable before step 3 finishes (criterion 2).
 ### While running
 - **Insert:** when a worker indexes a page (`start()` → `map.insert`), it also **upserts** the row with `indexed_at = now`.
 - **Purge:** `set_denylist` and `set_local_denylist` already remove blocked entries from `map`. The removed `item`s are now collected and **deleted from the store in one transaction** (criterion 1).
-- **Expiry:** the 24 h refresh thread also calls `expire()`. It selects rows older than the max age, deletes them, and removes those `item`s from `map` (criterion 4). Expired pages aren't re-fetched explicitly; the crawler re-adds them if it reaches them again.
+- **Expiry:** the 24 h refresh thread also calls `expire()`. It selects rows older than the max age, deletes them, and removes those `item`s from `map` (criterion 4). It then re-queues the seed (`reseed()`), so the crawl walks back to expired pages instead of leaving a long-running instance empty (changed after review).
 
 ### Keyword rebuild
 - The per-word insertion in `process_content` moves into one helper, `index_keywords(key, counts)`, used by both crawling and reload, so the in-memory index is built the same way either way.

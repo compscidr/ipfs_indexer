@@ -1,10 +1,8 @@
-use std::convert::TryFrom;
 use std::sync::Arc;
 
 use threadpool::ThreadPool;
 
 use actix_web::{get, web, App, HttpResponse, HttpServer};
-use cid::Cid;
 use log::{error, info, warn};
 use simple_logger::SimpleLogger;
 
@@ -104,9 +102,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let index_queue = web::Data::new(IndexQueue::new());
-    let wikipedia_cid =
-        Cid::try_from("bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze").unwrap();
-    index_queue.enqueue(wikipedia_cid.to_string());
+    index_queue.reseed();
 
     // fail closed: don't crawl anything until the badbits denylist is loaded. Fetched on a plain
     // thread since the blocking client can't run inside the actix runtime.
@@ -127,10 +123,15 @@ async fn main() -> std::io::Result<()> {
     // optional hand-maintained takedown list (plain CIDs / cid/path lines). Loaded once now, so
     // the store's startup check below sees it, then re-read every 5 min.
     let local_denylist = std::env::var("LOCAL_DENYLIST").ok();
+    // fail closed like badbits: starting without the takedown list would load and serve
+    // stored pages that are on it
     if let Some(path) = &local_denylist {
         match Denylist::load_file(path) {
             Ok(denylist) => index_queue.set_local_denylist(denylist),
-            Err(err) => warn!("Couldn't read local denylist {}: {}", path, err),
+            Err(err) => {
+                error!("Couldn't read local denylist {}: {}", path, err);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -172,6 +173,8 @@ async fn main() -> std::io::Result<()> {
         if expired > 0 {
             info!("Expired {} pages older than the max age", expired);
         }
+        // expired pages aren't in the map any more, so the crawl from the seed reaches them again
+        refresh_queue.reseed();
     });
 
     if let Some(path) = local_denylist {

@@ -47,10 +47,11 @@ Set `DATA_DIR` to keep the index across restarts in `$DATA_DIR/index.sqlite` (SQ
 
 - **Stored per page:** the CID/path, title, 128-character excerpt and keyword counts. Nothing else.
 - **Startup:** both denylists (badbits and `LOCAL_DENYLIST`) are loaded first. Stored pages that are now denylisted, or older than `INDEX_MAX_AGE_DAYS` (default 30), are deleted. Only then are the remaining pages loaded, and crawling and serving start.
-- **Takedowns:** whenever a denylist refresh removes pages, their rows are deleted from the file. `secure_delete` overwrites deleted rows with zeros, and the rollback journal (not WAL) keeps no old copies.
+- **Takedowns:** whenever a denylist refresh removes pages, their rows are deleted from the file, and `secure_delete` overwrites them with zeros inside `index.sqlite`. The rollback journal is kept in memory, so plaintext copies of pages are never written to a separate journal file. Erasure at the filesystem or SSD level (old blocks, wear levelling) is outside what the indexer can guarantee; use full-disk encryption on the data volume for that.
 - **Expiry:** pages older than the max age are dropped daily. The crawler re-adds them if it reaches them again.
 - **No backups:** the index is deliberately not backed up. It can be rebuilt by crawling, and a backup is a copy takedowns can't reach.
 - **Wipe:** stop the indexer, `rm $DATA_DIR/index.sqlite*`, and start it again.
+- **After a crash:** with the journal in memory, a crash mid-write can corrupt `index.sqlite`. The indexer then refuses to start ("Couldn't use DATA_DIR"); wipe the file as above and it rebuilds by crawling.
 - If `DATA_DIR` is set but can't be opened, the indexer exits rather than silently running without persistence.
 
 ## Running with docker
