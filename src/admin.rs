@@ -72,6 +72,7 @@ fn edit_local(
     queue: &IndexQueue,
     admin: &Admin,
     edit: impl FnOnce(&str, &str) -> String,
+    describe: impl FnOnce(&str, &str, usize) -> String,
 ) -> HttpResponse {
     if !authorized(req, admin) {
         return HttpResponse::Unauthorized().body("Unauthorized");
@@ -84,11 +85,13 @@ fn edit_local(
     };
     // ponytail: file IO and the purge run on the actix worker; fine for occasional admin calls
     let _file = file_lock();
-    let result = std::fs::read_to_string(path)
-        .and_then(|text| write_replacing(path, &edit(&text, &item)))
-        .and_then(|_| apply(queue, path));
+    let result = std::fs::read_to_string(path).and_then(|old| {
+        let new = edit(&old, &item);
+        write_replacing(path, &new)?;
+        Ok(describe(&old, &new, apply(queue, path)?))
+    });
     match result {
-        Ok(removed) => HttpResponse::Ok().body(format!("{} pages removed", removed)),
+        Ok(message) => HttpResponse::Ok().body(message),
         Err(err) => {
             warn!("Couldn't update {}: {}", path.display(), err);
             HttpResponse::InternalServerError().body("Couldn't update the local denylist")
@@ -110,14 +113,26 @@ async fn deny(
     queue: web::Data<IndexQueue>,
     admin: web::Data<Admin>,
 ) -> HttpResponse {
-    edit_local(&req, &body, &queue, &admin, |text, item| {
-        let sep = if text.is_empty() || text.ends_with('\n') {
-            ""
-        } else {
-            "\n"
-        };
-        format!("{}{}{}\n", text, sep, item)
-    })
+    edit_local(
+        &req,
+        &body,
+        &queue,
+        &admin,
+        |text, item| {
+            let sep = if text.is_empty() || text.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            format!("{}{}{}\n", text, sep, item)
+        },
+        |_, _, pages| {
+            format!(
+                "Blocked; {}",
+                plural(pages, "page removed", "pages removed")
+            )
+        },
+    )
 }
 
 #[post("/admin/undeny")]
@@ -127,12 +142,30 @@ async fn undeny(
     queue: web::Data<IndexQueue>,
     admin: web::Data<Admin>,
 ) -> HttpResponse {
-    edit_local(&req, &body, &queue, &admin, |text, item| {
-        text.lines()
-            .filter(|line| entry_item(line).as_deref() != Some(item))
-            .map(|line| format!("{}\n", line))
-            .collect()
-    })
+    edit_local(
+        &req,
+        &body,
+        &queue,
+        &admin,
+        |text, item| {
+            text.lines()
+                .filter(|line| entry_item(line).as_deref() != Some(item))
+                .map(|line| format!("{}\n", line))
+                .collect()
+        },
+        |old, new, _| {
+            // shrinking the list never purges pages, so report the lines that were taken out
+            let lines = old.lines().count() - new.lines().count();
+            format!(
+                "Unblocked; {}",
+                plural(lines, "line removed", "lines removed")
+            )
+        },
+    )
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
 }
 
 #[cfg(test)]
@@ -149,7 +182,10 @@ mod tests {
     const BAD: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
     fn admin_with(list: &str) -> (web::Data<Admin>, PathBuf) {
-        let path = crate::store::tests::temp_dir("admin").join("local.deny");
+        // temp_dir names by pid + nanos, which tests running in parallel can share
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = crate::store::tests::temp_dir(&format!("admin{}", n)).join("local.deny");
         std::fs::write(&path, list).unwrap();
         let admin = Admin {
             token: "s3cret".to_string(),
@@ -247,7 +283,7 @@ mod tests {
             &format!("/ipfs/{}/x\n", BAD),
         )
         .await;
-        assert_eq!((status, body.as_str()), (200, "1 pages removed"));
+        assert_eq!((status, body.as_str()), (200, "Blocked; 1 page removed"));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             format!("# takedowns\n{}\n", item)
@@ -268,7 +304,7 @@ mod tests {
         );
         let (admin, path) = admin_with(&list);
         let queue = web::Data::new(IndexQueue::new());
-        let (status, _) = call(
+        let (status, body) = call(
             Some(admin),
             queue.clone(),
             "/admin/undeny",
@@ -276,7 +312,7 @@ mod tests {
             &format!("{}/x/", BAD),
         )
         .await;
-        assert_eq!(status, 200);
+        assert_eq!((status, body.as_str()), (200, "Unblocked; 1 line removed"));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             format!("# keep\n{g}\n{b}/y\n//abcd\n", g = GOOD, b = BAD)
