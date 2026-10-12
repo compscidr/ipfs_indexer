@@ -247,10 +247,12 @@ impl IndexQueue {
     }
 
     /// Same as set_denylist, for the local takedown list
-    pub fn set_local_denylist(&self, denylist: Denylist) {
+    /// returns how many pages it purged
+    pub fn set_local_denylist(&self, denylist: Denylist) -> usize {
         let _writes = self.writes.write().unwrap();
-        self.purge(&denylist);
+        let removed = self.purge(&denylist);
         *self.local_denylist.write().unwrap() = denylist;
+        removed
     }
 
     /**
@@ -389,7 +391,7 @@ impl IndexQueue {
         }
     }
 
-    fn purge(&self, denylist: &Denylist) {
+    fn purge(&self, denylist: &Denylist) -> usize {
         let mut removed = Vec::new();
         self.map.retain(|item, result| {
             let keep = !denylist.is_blocked(item) && !denylist.is_blocked(&result.cid);
@@ -407,6 +409,7 @@ impl IndexQueue {
                 );
             }
         }
+        removed.len()
     }
 
     // is_blocked without the per-item warn!, for bulk checks

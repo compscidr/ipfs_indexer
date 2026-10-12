@@ -9,6 +9,7 @@ use simple_logger::SimpleLogger;
 use crate::denylist::Denylist;
 use crate::index_queue::{Enqueued, IndexQueue};
 
+mod admin;
 mod denylist;
 mod index_queue;
 mod index_result;
@@ -147,13 +148,34 @@ async fn main() -> std::io::Result<()> {
     // stored pages that are on it
     if let Some(path) = &local_denylist {
         match Denylist::load_file(path) {
-            Ok(denylist) => index_queue.set_local_denylist(denylist),
+            Ok(denylist) => {
+                index_queue.set_local_denylist(denylist);
+            }
             Err(err) => {
                 error!("Couldn't read local denylist {}: {}", path, err);
                 std::process::exit(1);
             }
         }
     }
+
+    // the darksearch admin area's takedown endpoints; off (404) without a token
+    let admin = std::env::var("ADMIN_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            web::Data::new(admin::Admin {
+                token,
+                local_denylist: local_denylist.clone().map(std::path::PathBuf::from),
+            })
+        });
+    info!(
+        "Admin endpoints: {}",
+        if admin.is_some() {
+            "on"
+        } else {
+            "off (no ADMIN_TOKEN)"
+        }
+    );
 
     // the persisted index (#106): only pages that aren't denylisted or expired are loaded, and
     // nothing is crawled or served until that's done. A configured but unusable DATA_DIR is fatal.
@@ -201,9 +223,8 @@ async fn main() -> std::io::Result<()> {
         let local_queue = Arc::clone(&index_queue);
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(5 * 60));
-            match Denylist::load_file(&path) {
-                Ok(denylist) => local_queue.set_local_denylist(denylist),
-                Err(err) => warn!("Couldn't read local denylist {}: {}", path, err),
+            if let Err(err) = admin::reload_local(&local_queue, std::path::Path::new(&path)) {
+                warn!("Couldn't read local denylist {}: {}", path, err);
             }
         });
     }
@@ -232,6 +253,7 @@ async fn main() -> std::io::Result<()> {
             .service(enqueue)
             .service(search)
             .service(keywords)
+            .configure(|cfg| admin::configure(cfg, admin.clone()))
     })
     // localhost by default; set BIND_ADDR=0.0.0.0:9090 to accept remote connections
     .bind(std::env::var("BIND_ADDR").unwrap_or("127.0.0.1:9090".to_string()))?
