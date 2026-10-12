@@ -8,7 +8,7 @@ A search indexer for web pages published on [IPFS](https://ipfs.tech), written i
 - **Only HTML is indexed.** Responses with any other content type, or bodies over 2 MB, are skipped without being downloaded. No images, video or other media are fetched or stored.
 - **Indexing:** for each page it keeps the CID/path, title, a 128-character excerpt and keyword counts.
 - **Denylists:** the [badbits](https://badbits.dwebops.pub/) list and an optional local takedown list are checked before anything is queued or fetched, and matching pages are removed from the index.
-- **Persistence (optional):** with `DATA_DIR` set, pages are kept in SQLite and reloaded at startup.
+- **Persistence (optional):** with `DATA_DIR` set, pages and the crawl queue are kept in SQLite and reloaded at startup.
 
 ## Running
 ```
@@ -48,7 +48,8 @@ For your own takedowns, set `LOCAL_DENYLIST=/path/to/local.deny`:
 Set `DATA_DIR` to keep the index across restarts in `$DATA_DIR/index.sqlite`.
 
 - **Stored per page:** the CID/path, title, 128-character excerpt, keyword counts and when it was indexed. Nothing else.
-- **Startup:** both denylists are loaded first. Stored pages that are now denylisted, or older than `INDEX_MAX_AGE_DAYS`, are deleted. Only then are the remaining pages loaded, and crawling and serving start.
+- **The crawl queue** (CID/paths waiting to be fetched, no content) is stored too, so a restart resumes the crawl. An item leaves it once it has been fetched.
+- **Startup:** both denylists are loaded first. Stored pages that are now denylisted, or older than `INDEX_MAX_AGE_DAYS`, are deleted. Only then are the remaining pages loaded, and the saved queue (minus anything now denylisted or already indexed); then crawling and serving start.
 - **Takedowns:**
   - Whenever a denylist refresh removes pages, their rows are deleted from the file, and `secure_delete` overwrites them with zeros inside `index.sqlite`.
   - The rollback journal is kept in memory, so plaintext copies of pages are never written to a separate journal file.
