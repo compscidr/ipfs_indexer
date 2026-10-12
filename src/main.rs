@@ -124,6 +124,40 @@ async fn main() -> std::io::Result<()> {
             std::process::exit(1);
         }
     }
+    // optional hand-maintained takedown list (plain CIDs / cid/path lines). Loaded once now, so
+    // the store's startup check below sees it, then re-read every 5 min.
+    let local_denylist = std::env::var("LOCAL_DENYLIST").ok();
+    if let Some(path) = &local_denylist {
+        match Denylist::load_file(path) {
+            Ok(denylist) => index_queue.set_local_denylist(denylist),
+            Err(err) => warn!("Couldn't read local denylist {}: {}", path, err),
+        }
+    }
+
+    // the persisted index (#106): only pages that aren't denylisted or expired are loaded, and
+    // nothing is crawled or served until that's done. A configured but unusable DATA_DIR is fatal.
+    let max_age_secs = std::env::var("INDEX_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|d| d.parse::<i64>().ok())
+        .unwrap_or(30)
+        * 24
+        * 60
+        * 60;
+    if let Ok(dir) = std::env::var("DATA_DIR") {
+        let attached = store::Store::open(std::path::Path::new(&dir))
+            .and_then(|store| index_queue.attach_store(store, max_age_secs));
+        match attached {
+            Ok((loaded, blocked, expired)) => info!(
+                "Loaded {} pages from {}/index.sqlite (dropped {} blocked, {} expired)",
+                loaded, dir, blocked, expired
+            ),
+            Err(err) => {
+                error!("Couldn't use DATA_DIR {}: {}", dir, err);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let refresh_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(24 * 60 * 60));
@@ -134,18 +168,20 @@ async fn main() -> std::io::Result<()> {
             }
             Err(err) => warn!("Couldn't refresh denylist, keeping the old one: {}", err),
         }
+        let expired = refresh_queue.expire(max_age_secs);
+        if expired > 0 {
+            info!("Expired {} pages older than the max age", expired);
+        }
     });
 
-    // optional hand-maintained takedown list (plain CIDs / cid/path lines), re-read every 5 min
-    // so additions are purged from the index and search without a restart
-    if let Ok(path) = std::env::var("LOCAL_DENYLIST") {
+    if let Some(path) = local_denylist {
         let local_queue = Arc::clone(&index_queue);
         std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5 * 60));
             match Denylist::load_file(&path) {
                 Ok(denylist) => local_queue.set_local_denylist(denylist),
                 Err(err) => warn!("Couldn't read local denylist {}: {}", path, err),
             }
-            std::thread::sleep(std::time::Duration::from_secs(5 * 60));
         });
     }
 
