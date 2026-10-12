@@ -18,9 +18,16 @@ pub struct Admin {
 // serializes edits of the local denylist file with each other and with the periodic re-read
 static LOCAL_DENYLIST_FILE: Mutex<()> = Mutex::new(());
 
+// the lock guards no data, so a panic while holding it mustn't stop takedowns for good
+fn file_lock() -> std::sync::MutexGuard<'static, ()> {
+    LOCAL_DENYLIST_FILE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Re-read the local denylist and purge what it blocks; returns how many pages were removed
 pub fn reload_local(queue: &IndexQueue, path: &Path) -> std::io::Result<usize> {
-    let _file = LOCAL_DENYLIST_FILE.lock().unwrap();
+    let _file = file_lock();
     apply(queue, path)
 }
 
@@ -76,7 +83,7 @@ fn edit_local(
         return HttpResponse::BadRequest().body("LOCAL_DENYLIST is not set");
     };
     // ponytail: file IO and the purge run on the actix worker; fine for occasional admin calls
-    let _file = LOCAL_DENYLIST_FILE.lock().unwrap();
+    let _file = file_lock();
     let result = std::fs::read_to_string(path)
         .and_then(|text| write_replacing(path, &edit(&text, &item)))
         .and_then(|_| apply(queue, path));
@@ -175,6 +182,19 @@ mod tests {
             status,
             String::from_utf8(test::read_body(resp).await.to_vec()).unwrap(),
         )
+    }
+
+    #[actix_web::test]
+    async fn a_panic_while_holding_the_file_lock_doesnt_stop_reloads() {
+        let (_, path) = admin_with(&format!("{}\n", BAD));
+        let _ = std::thread::spawn(|| {
+            let _file = LOCAL_DENYLIST_FILE.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        let queue = IndexQueue::new();
+        reload_local(&queue, &path).unwrap();
+        assert_eq!(queue.enqueue(BAD.to_string()), Enqueued::Blocked);
     }
 
     #[actix_web::test]
