@@ -14,6 +14,7 @@ use crate::index_queue::{Enqueued, IndexQueue};
 mod denylist;
 mod index_queue;
 mod index_result;
+mod store;
 
 // crate version, plus the commit when built with GIT_SHA set (the docker build passes it)
 fn version() -> String {

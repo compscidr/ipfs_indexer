@@ -16,3 +16,4 @@ scraper = "0.27.0"
 threadpool = "1.8"
 dashmap = "6.0.0"
 sha2 = "0.11.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
