@@ -68,10 +68,40 @@ impl Denylist {
 }
 
 /**
+ * Canonical "cid[/path]": resolves "." and ".." the way a URL does (RFC 3986, so in
+ * "wiki//../X" the ".." removes the empty segment), then drops empty segments, a trailing
+ * slash, "?query" and "#fragment". None if there's no root or the path climbs above it,
+ * so ".." can never step into a different CID.
+ */
+pub fn normalize_item(item: &str) -> Option<String> {
+    let item = item.split(['?', '#']).next().unwrap_or("");
+    let mut parts = item.split('/');
+    let root = parts.next().filter(|r| !r.is_empty())?;
+    let mut stack: Vec<&str> = Vec::new();
+    for segment in parts {
+        match segment {
+            "." => {}
+            ".." => {
+                stack.pop()?;
+            }
+            _ => stack.push(segment),
+        }
+    }
+    let path: Vec<&str> = stack.into_iter().filter(|s| !s.is_empty()).collect();
+    Some(if path.is_empty() {
+        root.to_string()
+    } else {
+        format!("{}/{}", root, path.join("/"))
+    })
+}
+
+/**
  * The denylist keys for a "cid/path" item: "<cidv1>/" (the whole tree), then "<cidv1>/a",
  * "<cidv1>/a/b", ... Empty segments are ignored. None if it doesn't start with a valid CID.
  */
 fn prefix_keys(item: &str) -> Option<Vec<String>> {
+    // normalized first, so every spelling of a path (wiki//X, wiki/a/../X) maps to the same keys
+    let item = normalize_item(item)?;
     let mut segments = item.split('/').filter(|s| !s.is_empty());
     let cid = Cid::try_from(segments.next()?).ok()?.into_v1().ok()?;
     let mut key = format!("{}/", cid);
@@ -155,6 +185,47 @@ mod tests {
         assert!(list.is_blocked(&format!("{}/bad/page/deeper", OTHER)));
         assert!(!list.is_blocked(&format!("{}/bad", OTHER)));
         assert!(!list.is_blocked(OTHER));
+    }
+
+    #[test]
+    fn normalizes_paths_like_a_url() {
+        let n = |s: &str| normalize_item(s);
+        assert_eq!(n("bafyA/wiki//X").as_deref(), Some("bafyA/wiki/X"));
+        assert_eq!(n("bafyA/wiki/./X").as_deref(), Some("bafyA/wiki/X"));
+        assert_eq!(n("bafyA/wiki/a/../X").as_deref(), Some("bafyA/wiki/X"));
+        // RFC 3986: ".." removes the empty segment, as the gateway resolves it
+        assert_eq!(
+            n("bafyA/wiki//../Technetium").as_deref(),
+            Some("bafyA/wiki/Technetium")
+        );
+        assert_eq!(n("bafyA/wiki/X/").as_deref(), Some("bafyA/wiki/X"));
+        assert_eq!(n("bafyA/wiki/X#section").as_deref(), Some("bafyA/wiki/X"));
+        assert_eq!(n("bafyA/wiki/X?q=1").as_deref(), Some("bafyA/wiki/X"));
+        assert_eq!(n("bafyA").as_deref(), Some("bafyA"));
+        assert_eq!(n("bafyA/").as_deref(), Some("bafyA"));
+    }
+
+    #[test]
+    fn rejects_paths_that_climb_out_of_their_cid() {
+        assert_eq!(normalize_item("bafyA/.."), None);
+        assert_eq!(normalize_item("bafyA/wiki/../../bafyB"), None);
+        assert_eq!(normalize_item("/bafyA"), None, "no root CID");
+        assert_eq!(normalize_item(""), None);
+    }
+
+    #[test]
+    fn takedowns_match_every_spelling_of_a_path() {
+        // a takedown of cid/wiki/X must also block the non-canonical forms the crawler produces
+        let list = Denylist::parse(&format!("{}/wiki/X\n", V1));
+        assert!(list.is_blocked(&format!("{}/wiki//../X", V1)));
+        assert!(list.is_blocked(&format!("{}/wiki/a/../X", V1)));
+        assert!(list.is_blocked(&format!("{}/wiki//X", V1)));
+        assert!(list.is_blocked(&format!("{}/wiki/./X/deeper", V1)));
+        assert!(!list.is_blocked(&format!("{}/wiki/Y", V1)));
+        assert!(
+            list.is_blocked(&format!("{}/..", V1)),
+            "escaping paths fail closed"
+        );
     }
 
     #[test]
