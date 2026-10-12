@@ -1,4 +1,4 @@
-use crate::denylist::Denylist;
+use crate::denylist::{normalize_item, Denylist};
 use crate::index_result::IndexResult;
 use crate::store::{now_secs, Store};
 use actix_web::body::MessageBody;
@@ -199,20 +199,43 @@ impl IndexQueue {
     ) -> rusqlite::Result<(usize, usize, usize)> {
         let cutoff = now_secs() - max_age_secs;
         let (mut to_delete, mut blocked, mut expired) = (Vec::new(), 0, 0);
-        let mut keep = Vec::new();
-        for (item, result, indexed_at) in store.load_all()? {
+        // canonical item -> (result, came from a non-canonical row); rows stored before #218
+        // can have paths like "wiki//../X", re-keyed here (item and cid) or dropped as duplicates
+        let mut keep: HashMap<String, (IndexResult, bool)> = HashMap::new();
+        for (item, mut result, indexed_at) in store.load_all()? {
+            let canonical = normalize_item(&item);
             if self.blocked_quietly(&item) || self.blocked_quietly(&result.cid) {
                 blocked += 1;
                 to_delete.push(item);
-            } else if indexed_at < cutoff {
+                continue;
+            }
+            if indexed_at < cutoff {
                 expired += 1;
                 to_delete.push(item);
-            } else {
-                keep.push((item, result));
+                continue;
+            }
+            let Some(canonical) = canonical else {
+                to_delete.push(item); // climbs out of its CID: can't be served correctly
+                continue;
+            };
+            let rekeyed = canonical != item;
+            if rekeyed {
+                to_delete.push(item);
+                result.cid = normalize_item(&result.cid).unwrap_or_else(|| canonical.clone());
+            }
+            // a row already under the canonical key wins over a re-keyed duplicate
+            match keep.get(&canonical) {
+                Some((_, false)) => {}
+                _ => {
+                    keep.insert(canonical, (result, rekeyed));
+                }
             }
         }
         store.delete(&to_delete)?;
-        for (item, result) in &keep {
+        for (item, (result, rekeyed)) in &keep {
+            if *rekeyed {
+                store.upsert(item, result, now_secs())?;
+            }
             self.index_keywords(&result.cid, &result.keywords);
             self.map.insert(item.clone(), result.clone());
         }
@@ -321,6 +344,11 @@ impl IndexQueue {
      * Queue a "cid" or "cid/path" for indexing. Nothing is queued unless it returns Queued.
      */
     pub fn enqueue(&self, item: String) -> Enqueued {
+        // one canonical spelling per page (#218); a path that climbs out of its CID is invalid
+        let Some(item) = normalize_item(&item) else {
+            warn!("Not a valid cid/path, ignoring {}", item);
+            return Enqueued::InvalidCid;
+        };
         let root = item.split('/').next().unwrap_or("");
         if Cid::try_from(root).is_err() {
             warn!("Not a CID, ignoring {}", item);
@@ -945,6 +973,82 @@ mod tests {
             .unwrap()
             .upsert(item, &page(item, "seedpage", &[]), at)
             .unwrap();
+    }
+
+    #[test]
+    fn enqueue_normalizes_so_each_page_is_queued_once() {
+        let queue = IndexQueue::new();
+        for spelling in [
+            "wiki/X",
+            "wiki//X",
+            "wiki/a/../X",
+            "wiki/./X/",
+            "wiki/X#top",
+        ] {
+            assert_eq!(
+                queue.enqueue(format!("{}/{}", GOOD, spelling)),
+                Enqueued::Queued
+            );
+        }
+        assert_eq!(queue.queue_length(), 1);
+        assert_eq!(queue.queue.pop().unwrap(), format!("{}/wiki/X", GOOD));
+    }
+
+    #[test]
+    fn enqueue_rejects_paths_that_climb_out_of_their_cid() {
+        let queue = IndexQueue::new();
+        assert_eq!(
+            queue.enqueue(format!("{}/../{}", GOOD, BAD)),
+            Enqueued::InvalidCid
+        );
+        assert_eq!(queue.queue_length(), 0);
+    }
+
+    #[test]
+    fn attach_rekeys_non_canonical_rows_and_drops_duplicates() {
+        let dir = temp_dir("rekey");
+        let store = Store::open(&dir).unwrap();
+        for (item, title) in [
+            (format!("{}/wiki//../Tech", GOOD), "techtitle"),
+            (format!("{}/wiki/Tech", GOOD), "techdup"),
+            (format!("{}/wiki//Llull", GOOD), "llulltitle"),
+            (format!("{}/..", GOOD), "escapetitle"),
+        ] {
+            store
+                .upsert(&item, &page(&item, title, &[(title, 1)]), now_secs())
+                .unwrap();
+        }
+        drop(store);
+
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        let mut keys: Vec<String> = queue.map.iter().map(|e| e.key().clone()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                format!("{}/wiki/Llull", GOOD),
+                format!("{}/wiki/Tech", GOOD)
+            ]
+        );
+        // the result's cid is re-keyed too, so search (which looks pages up by it) still finds them
+        assert_eq!(queue.search("llulltitle".to_string()).len(), 1);
+        assert_eq!(
+            queue.search("techtitle".to_string()).len() + queue.search("techdup".to_string()).len(),
+            1
+        );
+
+        let rows: Vec<String> = Store::open(&dir)
+            .unwrap()
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(rows.len(), 2, "disk matches memory: {:?}", rows);
+        assert!(!file_has(&dir, "escapetitle"));
     }
 
     #[test]
