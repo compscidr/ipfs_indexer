@@ -77,12 +77,14 @@ const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
  * Fetch a url and return its body, but only if the gateway says it's html and it fits in
  * MAX_BODY_BYTES. Ok(None) means it was skipped: images, video, etc are never downloaded.
  */
-fn fetch_html(url: &str) -> Result<Option<String>, reqwest::Error> {
+fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, reqwest::Error> {
     let client = reqwest::blocking::Client::builder()
         // public gateways can take ~50s on a cache miss
         .timeout(Duration::from_secs(90))
         .build()?;
     let response = client.get(url).send()?.error_for_status()?;
+    // where the page actually is after redirects (e.g. "wiki" -> "wiki/"); links resolve against it
+    let final_url = response.url().clone();
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -101,7 +103,61 @@ fn fetch_html(url: &str) -> Result<Option<String>, reqwest::Error> {
         warn!("Skipping {}: larger than {} bytes", url, MAX_BODY_BYTES);
         return Ok(None);
     }
-    Ok(Some(String::from_utf8_lossy(&body).into_owned()))
+    Ok(Some((
+        String::from_utf8_lossy(&body).into_owned(),
+        final_url,
+    )))
+}
+
+/**
+ * The "cid/path" an <a href> on a page at `base` points to, or None if it's not an IPFS page on
+ * the same gateway. Resolves like a browser (so "geo:", "mailto:", other hosts and fragments
+ * drop out). The Wikipedia mirror renamed its A/ folder to wiki/ but its index still links
+ * "../A/X", a 404 as written, so <cid>/A/... is mapped to <cid>/wiki/....
+ */
+fn resolve_link(base: &reqwest::Url, href: &str) -> Option<String> {
+    if href.is_empty() || href.starts_with('#') {
+        return None;
+    }
+    let target = base.join(href).ok()?;
+    if !matches!(target.scheme(), "http" | "https") || target.host_str() != base.host_str() {
+        return None;
+    }
+    let item = normalize_item(target.path().strip_prefix("/ipfs/")?)?;
+    // ponytail: heuristic. The mirror writes non-web links as "./geo:..." / "./ftp:/...", which
+    // resolve to 404 paths; a segment starting with a lowercase scheme and ":" is one of those.
+    // Titles containing a colon ("Star_Trek:_...") don't start with a lowercase scheme.
+    if item.split('/').skip(1).any(looks_like_scheme) {
+        return None;
+    }
+    let mut parts = item.splitn(3, '/');
+    let root = parts.next()?;
+    match (parts.next(), parts.next()) {
+        (Some("A"), Some(rest)) => Some(format!("{}/wiki/{}", root, rest)),
+        _ => Some(item),
+    }
+}
+
+// "geo:...", "ftp:...", "mailto:...": a lowercase URI scheme (RFC 3986 characters) then ":"
+fn looks_like_scheme(segment: &str) -> bool {
+    match segment.split_once(':') {
+        Some((scheme, _)) => {
+            scheme.starts_with(|c: char| c.is_ascii_lowercase())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "+.-".contains(c))
+        }
+        None => false,
+    }
+}
+
+// whether a failed fetch says something about the gateway itself, rather than the page:
+// network errors, timeouts, 5xx and 429 do; a 404 or other 4xx just means that page is missing
+fn is_gateway_error(err: &reqwest::Error) -> bool {
+    match err.status() {
+        Some(status) => status.is_server_error() || status.as_u16() == 429,
+        None => true,
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -457,12 +513,13 @@ impl IndexQueue {
         warn!("Retreiving {}", url);
         self.wait_for_gateway();
         let fetched = fetch_html(&url);
-        *self.last_fetch.lock().unwrap() = Some((
-            Instant::now(),
-            fetched.as_ref().map(|_| ()).map_err(|e| e.to_string()),
-        ));
-        let html = match fetched {
-            Ok(Some(html)) => html,
+        let health = match &fetched {
+            Err(err) if is_gateway_error(err) => Err(err.to_string()),
+            _ => Ok(()),
+        };
+        *self.last_fetch.lock().unwrap() = Some((Instant::now(), health));
+        let (html, mut base) = match fetched {
+            Ok(Some(page)) => page,
             Ok(None) => return None,
             Err(err) => {
                 warn!("Error: {}, not re-enqueue-ing cid", err);
@@ -473,19 +530,24 @@ impl IndexQueue {
         let mut document = Html::parse_document(html.as_str());
         let result = self.detect_redirect(url, cid.clone(), document.clone());
         let mut fullcid = cid.clone();
-        if result.is_some() {
-            (fullcid, document) = result.unwrap();
+        if let Some((redirected_cid, redirected_doc, redirected_url)) = result {
+            (fullcid, document, base) = (redirected_cid, redirected_doc, redirected_url);
         }
         trace!("received: {:?}", html.as_str());
 
-        self.process_content(gateway, fullcid.clone(), document.clone())
+        self.process_content(&base, fullcid.clone(), document.clone())
     }
 
     /**
      * Determine if the response we've received requires another request from a redirect.
      * If it requires another request, we will have an updated "full cid" as well.
      */
-    fn detect_redirect(&self, url: String, cid: String, document: Html) -> Option<(String, Html)> {
+    fn detect_redirect(
+        &self,
+        url: String,
+        cid: String,
+        document: Html,
+    ) -> Option<(String, Html, reqwest::Url)> {
         // ipfs.io does not use normal redirects (301, 307, etc) in the status code, so reqwest client
         // can't detect it. We will have to parse the meta http-equiv tag to get the redirect url.
         let selector = Selector::parse("noscript").unwrap();
@@ -514,7 +576,9 @@ impl IndexQueue {
                 }
                 self.wait_for_gateway();
                 return match fetch_html(&newurl) {
-                    Ok(Some(html)) => Some((fullcid, Html::parse_document(html.as_str()))),
+                    Ok(Some((html, final_url))) => {
+                        Some((fullcid, Html::parse_document(html.as_str()), final_url))
+                    }
                     Ok(None) => None,
                     Err(e) => {
                         warn!("error retrieving content from {}: {}", url, e);
@@ -532,7 +596,12 @@ impl IndexQueue {
     /**
      * Process the content of the page, extract keywords, enqueue more cids, return the IndexResult
      */
-    fn process_content(&self, gateway: String, cid: String, document: Html) -> Option<IndexResult> {
+    fn process_content(
+        &self,
+        base: &reqwest::Url,
+        cid: String,
+        document: Html,
+    ) -> Option<IndexResult> {
         let fullcid = cid.clone();
 
         let selector = Selector::parse("title").unwrap();
@@ -545,40 +614,13 @@ impl IndexQueue {
         // todo: get all relative links and add them to the index
         let selector = Selector::parse("a").unwrap();
         for element in document.select(&selector) {
-            let link = element.value().attr("href").unwrap_or("");
-            if link.starts_with(format!("http://{}/ipfs/", gateway).as_str()) {
-                let cid = link[12 + gateway.len()..].to_string();
-                warn!("found link to {}", cid);
-                self.enqueue(cid);
-            } else if link.starts_with(format!("https://{}/ipfs/", gateway).as_str()) {
-                let cid = link[13 + gateway.len()..].to_string();
-                warn!("found link to {}", cid);
-                self.enqueue(cid);
-            } else if link.starts_with("http") || link.starts_with("https") {
-                //info!("found link to external url: {}", link);
-            } else if link.starts_with("#") {
-                // ignore anchors on same page
-            } else {
-                // relative link to current top cid
-                //info!("found relative link to {}", link);
-                //let root_cid = fullcid.clone()[0..fullcid.find("/").unwrap_or(fullcid.len())].to_string();
-                //let full_relative = root_cid + "/" + link;
-
-                let last_slash = fullcid.rfind("/").unwrap_or(fullcid.len());
-
-                if link.is_empty() {
-                    // warn!("link is empty, just a link to the same doc, skipping")
-                } else if link.starts_with("../A") {
-                    // handle weird issue where index pages have a ../A/ relative link when they shouldn't
-                    let full_relative =
-                        fullcid.clone()[0..last_slash].to_string() + "/" + &link[4..];
-                    warn!("relative link with cid: {}, link: {}", full_relative, link);
-                    self.enqueue(full_relative);
-                } else {
-                    let full_relative = fullcid.clone()[0..last_slash].to_string() + "/" + link;
-                    warn!("relative link with cid: {}, link: {}", full_relative, link);
-                    self.enqueue(full_relative);
-                }
+            if let Some(item) = element
+                .value()
+                .attr("href")
+                .and_then(|href| resolve_link(base, href))
+            {
+                trace!("found link to {}", item);
+                self.enqueue(item);
             }
         }
         let selector = Selector::parse("body").unwrap();
@@ -786,7 +828,7 @@ mod tests {
     fn fetch_html_returns_html() {
         let url = serve_once("text/html; charset=utf-8", b"<title>hi</title>".to_vec());
         assert_eq!(
-            fetch_html(&url).unwrap().as_deref(),
+            fetch_html(&url).unwrap().map(|(body, _)| body).as_deref(),
             Some("<title>hi</title>")
         );
     }
@@ -1127,6 +1169,120 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.search("alpha".to_string()).len(), 1);
         assert!(reloaded.map.get(GOOD).unwrap().keywords.is_empty());
+    }
+
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn links_resolve_like_a_browser_against_the_final_url() {
+        let c = GOOD;
+        let index = url(&format!("https://ipfs.filebase.io/ipfs/{}/wiki/", c)); // directory page
+        let article = url(&format!(
+            "https://ipfs.filebase.io/ipfs/{}/wiki/Antarctica",
+            c
+        ));
+        let r = |base: &reqwest::Url, href: &str| resolve_link(base, href);
+        // the trailing slash matters: wiki/ + Antarctic is wiki/Antarctic, not <cid>/Antarctic
+        assert_eq!(
+            r(&index, "Antarctic"),
+            Some(format!("{}/wiki/Antarctic", c))
+        );
+        assert_eq!(r(&article, "Earth"), Some(format!("{}/wiki/Earth", c)));
+        assert_eq!(
+            r(&article, "./Earth#History"),
+            Some(format!("{}/wiki/Earth", c))
+        );
+        // the mirror renamed A/ to wiki/; its index still links ../A/X (a 404 as written)
+        assert_eq!(
+            r(&index, "../A/Wikipedia"),
+            Some(format!("{}/wiki/Wikipedia", c))
+        );
+        // ../Antarctic is NOT mangled into "ntarctic" any more
+        assert_eq!(
+            r(&article, "../Antarctic"),
+            Some(format!("{}/Antarctic", c))
+        );
+        // absolute links on the same gateway, to another CID
+        assert_eq!(
+            r(
+                &article,
+                &format!("https://ipfs.filebase.io/ipfs/{}/page", BAD)
+            ),
+            Some(format!("{}/page", BAD))
+        );
+        // the mirror hides schemes behind "./" (./geo:-69.3,-2.2): still not pages
+        assert_eq!(r(&article, "./geo:-69.35,-2.24"), None);
+        assert_eq!(r(&article, "./ftp:/ftp.example.org/x.txt"), None);
+        // ...but titles that merely contain a colon are pages
+        assert_eq!(
+            r(&article, "Star_Trek:_The_Next_Generation"),
+            Some(format!("{}/wiki/Star_Trek:_The_Next_Generation", c))
+        );
+        // not crawlable: other schemes, other hosts, fragments, climbing out of /ipfs/
+        for href in [
+            "geo:-69.35,-2.24",
+            "mailto:x@y.z",
+            "javascript:void(0)",
+            "#top",
+            "",
+            "https://en.wikipedia.org/wiki/X",
+            "https://ipfs.io/ipfs/bafyOther",
+            "../../../../etc",
+        ] {
+            assert_eq!(r(&article, href), None, "{}", href);
+        }
+    }
+
+    #[test]
+    fn a_missing_page_is_not_a_gateway_error() {
+        // a 404 means the gateway answered; only network errors, 5xx and 429 mean it's unhealthy
+        let queue = IndexQueue::new();
+        let host = |u: String| {
+            u.trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string()
+        };
+        queue.retrieve_content(
+            host(serve_status_once(
+                "404 Not Found",
+                "text/plain",
+                b"no".to_vec(),
+            )),
+            "bafy".into(),
+        );
+        assert!(
+            queue.gateway_health().starts_with("ok "),
+            "{}",
+            queue.gateway_health()
+        );
+        queue.retrieve_content(
+            host(serve_status_once(
+                "500 Internal Server Error",
+                "text/plain",
+                b"x".to_vec(),
+            )),
+            "bafy".into(),
+        );
+        assert!(
+            queue.gateway_health().starts_with("error "),
+            "{}",
+            queue.gateway_health()
+        );
+        queue.retrieve_content(
+            host(serve_status_once(
+                "429 Too Many Requests",
+                "text/plain",
+                b"x".to_vec(),
+            )),
+            "bafy".into(),
+        );
+        assert!(
+            queue.gateway_health().starts_with("error "),
+            "{}",
+            queue.gateway_health()
+        );
     }
 
     #[test]
