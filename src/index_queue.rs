@@ -1,5 +1,6 @@
 use crate::denylist::Denylist;
 use crate::index_result::IndexResult;
+use crate::store::{now_secs, Store};
 use actix_web::body::MessageBody;
 use cid::Cid;
 use crossbeam_queue::ArrayQueue;
@@ -9,7 +10,7 @@ use scraper::{Html, Selector};
 use std::collections::HashMap;
 use std::io::Read;
 use std::ops::Not;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -74,6 +75,9 @@ pub struct IndexQueue {
 
     // when the gateway last answered a fetch, and the error if it didn't
     last_fetch: Mutex<Option<(Instant, Result<(), String>)>>,
+
+    // the persisted index (#106); unset when DATA_DIR isn't configured
+    store: OnceLock<Store>,
 }
 
 impl IndexQueue {
@@ -87,6 +91,7 @@ impl IndexQueue {
             denylist: RwLock::new(Denylist::empty()),
             local_denylist: RwLock::new(Denylist::empty()),
             last_fetch: Mutex::new(None),
+            store: OnceLock::new(),
         }
     }
 
@@ -114,9 +119,114 @@ impl IndexQueue {
         *self.local_denylist.write().unwrap() = denylist;
     }
 
+    /**
+     * Use `store` for this queue: drop rows that are denylisted or older than max_age_secs
+     * (deleting them from disk), then load the rest into the map and keyword index. Call after
+     * both denylists are loaded and before crawling or serving.
+     */
+    pub fn attach_store(
+        &self,
+        store: Store,
+        max_age_secs: i64,
+    ) -> rusqlite::Result<(usize, usize, usize)> {
+        let cutoff = now_secs() - max_age_secs;
+        let (mut drop, mut blocked, mut expired) = (Vec::new(), 0, 0);
+        let mut keep = Vec::new();
+        for (item, result, indexed_at) in store.load_all()? {
+            if self.blocked_quietly(&item) || self.blocked_quietly(&result.cid) {
+                blocked += 1;
+                drop.push(item);
+            } else if indexed_at < cutoff {
+                expired += 1;
+                drop.push(item);
+            } else {
+                keep.push((item, result));
+            }
+        }
+        store.delete(&drop)?;
+        for (item, result) in &keep {
+            self.index_keywords(&result.cid, &result.keywords);
+            self.map.insert(item.clone(), result.clone());
+        }
+        let _ = self.store.set(store);
+        Ok((keep.len(), blocked, expired))
+    }
+
+    /// Drop pages indexed more than max_age_secs ago, from the store and the map
+    pub fn expire(&self, max_age_secs: i64) -> usize {
+        let Some(store) = self.store.get() else {
+            return 0;
+        };
+        let old = match store.items_older_than(now_secs() - max_age_secs) {
+            Ok(old) => old,
+            Err(err) => {
+                warn!("Couldn't check for expired pages: {}", err);
+                return 0;
+            }
+        };
+        if let Err(err) = store.delete(&old) {
+            warn!("Couldn't delete expired pages: {}", err);
+            return 0;
+        }
+        for item in &old {
+            self.map.remove(item);
+        }
+        old.len()
+    }
+
+    /**
+     * Add a crawled page to the index and the store. Re-checks the denylists first: a takedown
+     * that landed while this page was being fetched must not be written back to disk.
+     */
+    pub fn persist(&self, item: &str, result: &IndexResult) {
+        if self.blocked_quietly(item) || self.blocked_quietly(&result.cid) {
+            return;
+        }
+        self.map.insert(item.to_string(), result.clone());
+        if let Some(store) = self.store.get() {
+            if let Err(err) = store.upsert(item, result, now_secs()) {
+                warn!("Couldn't persist {}: {}", item, err);
+            }
+        }
+    }
+
+    // add a page's keyword counts to the search index (shared by crawling and attach_store)
+    fn index_keywords(&self, key: &str, counts: &HashMap<String, u32>) {
+        for word in counts.keys() {
+            let keyword_map = self
+                .keywords
+                .entry(word.clone())
+                .or_insert_with(DashMap::new);
+            keyword_map.insert(key.to_string(), ());
+            self.keyword_rank
+                .insert(word.clone(), keyword_map.len() as u32);
+        }
+    }
+
     fn purge(&self, denylist: &Denylist) {
-        self.map
-            .retain(|item, result| !denylist.is_blocked(item) && !denylist.is_blocked(&result.cid));
+        let mut removed = Vec::new();
+        self.map.retain(|item, result| {
+            let keep = !denylist.is_blocked(item) && !denylist.is_blocked(&result.cid);
+            if !keep {
+                removed.push(item.clone());
+            }
+            keep
+        });
+        if let Some(store) = self.store.get() {
+            if let Err(err) = store.delete(&removed) {
+                warn!(
+                    "Couldn't delete {} purged pages from the store: {}",
+                    removed.len(),
+                    err
+                );
+            }
+        }
+    }
+
+    // is_blocked without the per-item warn!, for bulk checks
+    fn blocked_quietly(&self, item: &str) -> bool {
+        self.denylist.read().unwrap().is_blocked(item)
+            || self.local_denylist.read().unwrap().is_blocked(item)
     }
 
     fn is_blocked(&self, item: &str) -> bool {
@@ -213,7 +323,7 @@ impl IndexQueue {
                     let result = self.retrieve_content(gateway.clone(), item.clone());
 
                     if result.is_some() {
-                        self.map.insert(item.clone(), result.unwrap());
+                        self.persist(&item, &result.unwrap());
                     } else {
                         warn!("Error retrieving CID {}", item);
                         // self.enqueue(item.clone()); // for now give up on error
@@ -372,27 +482,10 @@ impl IndexQueue {
             for word in iter {
                 if word.len() > 3 {
                     let word = word.to_lowercase();
-                    if index_keywords.contains_key(&word) {
-                        let count = index_keywords.get(&word).cloned().unwrap();
-                        index_keywords.insert(word.clone(), count + 1);
-                    } else {
-                        index_keywords.insert(word.clone(), 1);
-                    }
-
-                    if self.keywords.contains_key(word.as_str()) {
-                        let keyword_map = self.keywords.get(word.as_str()).unwrap();
-                        keyword_map.insert(cid.clone(), ());
-                        let size = keyword_map.len();
-                        self.keyword_rank.insert(word.clone(), size as u32);
-                    } else {
-                        let keyword_map: DashMap<String, ()> = DashMap::new();
-                        keyword_map.insert(cid.clone(), ());
-                        let size = keyword_map.len();
-                        self.keywords.insert(word.clone(), keyword_map);
-                        self.keyword_rank.insert(word.clone(), size as u32);
-                    }
+                    *index_keywords.entry(word).or_insert(0) += 1;
                 }
             }
+            self.index_keywords(&cid, &index_keywords);
 
             if content.contains("no link named") {
                 warn!("ipfs error on page {}, likely doesn't exist", fullcid);
@@ -567,5 +660,134 @@ mod tests {
             .unwrap()
             .port();
         assert!(fetch_html(&format!("http://127.0.0.1:{}/", port)).is_err());
+    }
+
+    use crate::store::tests::{page, temp_dir};
+    use crate::store::{now_secs, Store};
+
+    const DAY: i64 = 24 * 60 * 60;
+    const GOOD: &str = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
+    const BAD: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+
+    fn file_has(store_dir: &std::path::Path, needle: &str) -> bool {
+        let bytes = std::fs::read(store_dir.join("index.sqlite")).unwrap();
+        bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    fn seed(dir: &std::path::Path, rows: &[(&str, &str, i64)]) {
+        let store = Store::open(dir).unwrap();
+        for (item, title, at) in rows {
+            store
+                .upsert(item, &page(item, title, &[("shared", 1), (title, 1)]), *at)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn attach_reloads_pages_and_keywords() {
+        let dir = temp_dir("attach");
+        seed(&dir, &[(GOOD, "goodtitle", now_secs())]);
+        let queue = IndexQueue::new();
+        let (loaded, blocked, expired) = queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        assert_eq!((loaded, blocked, expired), (1, 0, 0));
+        assert_eq!(queue.search("goodtitle".to_string()).len(), 1);
+        assert_eq!(queue.search("shared".to_string()).len(), 1);
+    }
+
+    #[test]
+    fn attach_drops_denylisted_and_expired_rows_from_disk() {
+        let dir = temp_dir("recheck");
+        seed(
+            &dir,
+            &[
+                (GOOD, "keeptitle", now_secs()),
+                (&format!("{}/page", BAD), "blockedtitle", now_secs()),
+                (
+                    "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze/old",
+                    "expiredtitle",
+                    now_secs() - 40 * DAY,
+                ),
+            ],
+        );
+        let queue = IndexQueue::new();
+        // local takedown list loaded before attach, as main.rs does
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        let (loaded, blocked, expired) = queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        assert_eq!((loaded, blocked, expired), (1, 1, 1));
+        assert_eq!(queue.index_length(), 1);
+        assert!(!file_has(&dir, "blockedtitle"));
+        assert!(!file_has(&dir, "expiredtitle"));
+        assert!(file_has(&dir, "keeptitle"));
+    }
+
+    #[test]
+    fn purge_deletes_from_disk() {
+        let dir = temp_dir("purge");
+        seed(
+            &dir,
+            &[
+                (&format!("{}/page", BAD), "purgetitle", now_secs()),
+                (GOOD, "stays", now_secs()),
+            ],
+        );
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        assert!(file_has(&dir, "purgetitle"));
+
+        queue.set_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        assert_eq!(queue.index_length(), 1);
+        assert!(!file_has(&dir, "purgetitle"), "takedown reaches the disk");
+        assert!(file_has(&dir, "stays"));
+    }
+
+    #[test]
+    fn expire_removes_old_pages_from_memory_and_disk() {
+        let dir = temp_dir("expire");
+        seed(&dir, &[(GOOD, "agingtitle", now_secs() - 10 * DAY)]);
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        assert_eq!(queue.expire(30 * DAY), 0);
+        assert_eq!(queue.expire(5 * DAY), 1);
+        assert_eq!(queue.index_length(), 0);
+        assert!(!file_has(&dir, "agingtitle"));
+    }
+
+    #[test]
+    fn crawled_pages_are_persisted_but_not_if_blocked_meanwhile() {
+        let dir = temp_dir("crawl");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.persist(GOOD, &page(GOOD, "crawledtitle", &[]));
+        assert!(file_has(&dir, "crawledtitle"));
+
+        // a takedown that lands between fetch and insert must not be re-written by the worker
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue.persist(BAD, &page(BAD, "racetitle", &[]));
+        assert!(!file_has(&dir, "racetitle"));
+    }
+
+    #[test]
+    fn store_write_failure_does_not_panic() {
+        let dir = temp_dir("fail");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.store.get().unwrap().break_for_test(); // e.g. disk full / read-only remount
+        queue.persist(GOOD, &page(GOOD, "t", &[])); // upsert fails: logs, doesn't panic
+        assert_eq!(queue.index_length(), 1, "still indexed in memory");
+        assert_eq!(queue.expire(0), 0, "expire tolerates the broken store too");
+        queue.set_denylist(Denylist::parse(&format!("{}\n", GOOD))); // purge's delete fails: logs only
+        assert_eq!(queue.index_length(), 0);
     }
 }
