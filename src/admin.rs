@@ -38,7 +38,10 @@ fn apply(queue: &IndexQueue, path: &Path) -> std::io::Result<usize> {
 
 pub fn configure(cfg: &mut web::ServiceConfig, admin: Option<web::Data<Admin>>) {
     if let Some(admin) = admin {
-        cfg.app_data(admin).service(deny).service(undeny);
+        cfg.app_data(admin)
+            .service(deny)
+            .service(undeny)
+            .service(recrawl);
     }
 }
 
@@ -97,6 +100,22 @@ fn edit_local(
             HttpResponse::InternalServerError().body("Couldn't update the local denylist")
         }
     }
+}
+
+#[post("/admin/recrawl")]
+async fn recrawl(
+    req: HttpRequest,
+    queue: web::Data<IndexQueue>,
+    admin: web::Data<Admin>,
+) -> HttpResponse {
+    if !authorized(&req, &admin) {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+    let queued = queue.recrawl();
+    HttpResponse::Ok().body(format!(
+        "Queued {} to crawl again",
+        plural(queued, "page", "pages")
+    ))
 }
 
 // whole-file replace through a temp file in the same directory: never half a list on disk
@@ -318,6 +337,44 @@ mod tests {
             format!("# keep\n{g}\n{b}/y\n//abcd\n", g = GOOD, b = BAD)
         );
         assert_eq!(queue.enqueue(format!("{}/x", BAD)), Enqueued::Queued);
+    }
+
+    #[actix_web::test]
+    async fn recrawl_queues_every_indexed_page_once() {
+        let (admin, _) = admin_with("");
+        let queue = web::Data::new(IndexQueue::new());
+        for item in [GOOD.to_string(), format!("{}/wiki/X", GOOD)] {
+            queue.map.insert(
+                item.clone(),
+                IndexResult::new(item, "t".into(), "e".into(), HashMap::new()),
+            );
+        }
+        let post = |token: &'static str| {
+            call(
+                Some(admin.clone()),
+                queue.clone(),
+                "/admin/recrawl",
+                token,
+                "",
+            )
+        };
+        assert_eq!(post("nope").await.0, 401);
+        assert_eq!(queue.queue_length(), 0);
+        assert_eq!(
+            post("s3cret").await,
+            (200, "Queued 2 pages to crawl again".to_string())
+        );
+        assert_eq!(queue.queue_length(), 2);
+        // already queued: not queued twice
+        assert_eq!(
+            post("s3cret").await,
+            (200, "Queued 0 pages to crawl again".to_string())
+        );
+        assert_eq!(
+            queue.index_length(),
+            2,
+            "pages stay searchable while they wait"
+        );
     }
 
     #[actix_web::test]

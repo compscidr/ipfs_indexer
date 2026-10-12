@@ -39,6 +39,7 @@ The indexer **exits at startup** if it can't download the badbits list, read a c
 | `GET /version` | e.g. `0.1.0 (abc1234)`. The commit comes from `GIT_SHA` at build time. |
 | `GET /keywords` | The most common keywords. |
 | `POST /admin/deny`, `POST /admin/undeny` | Only with `ADMIN_TOKEN` set (otherwise 404); needs `Authorization: Bearer <token>`. The body is one `cid`, `cid/path` or `/ipfs/cid/path`: added to or removed from `LOCAL_DENYLIST` and applied at once. Returns `Blocked; <n> pages removed` or `Unblocked; <n> lines removed`. Badbits is never changed. |
+| `POST /admin/recrawl` | Same token. Queues every indexed page to be fetched again, so their links to pages not indexed yet are followed. Pages stay searchable meanwhile; a restart drops what is left of it. Returns `Queued <n> pages to crawl again`. |
 
 ## Denylists
 The badbits denylist is downloaded at startup and refreshed daily.
