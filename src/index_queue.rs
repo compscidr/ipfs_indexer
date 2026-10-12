@@ -7,7 +7,7 @@ use crossbeam_queue::ArrayQueue;
 use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::ops::Not;
 use std::sync::{Mutex, OnceLock, RwLock};
@@ -59,6 +59,17 @@ impl Throttle {
     }
 }
 
+// The in-memory copy of a page: its keyword counts are already in the inverted index (and on
+// disk for reload), so keeping them per page too roughly doubled memory (#220).
+fn without_keywords(result: &IndexResult) -> IndexResult {
+    IndexResult::new(
+        result.cid.clone(),
+        result.title.clone(),
+        result.excerpt.clone(),
+        HashMap::new(),
+    )
+}
+
 // skip anything bigger than this rather than pulling it all into memory
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -108,11 +119,10 @@ pub struct IndexQueue {
     // index results (cid -> result)
     pub map: DashMap<String, IndexResult>,
 
-    // used for searching. Maps keyword to unique set of cids
-    pub keywords: DashMap<String, DashMap<String, ()>>,
-    // used to rank the keywords. Everytime keywords is updated, rank should be updated with the
-    // number of cids in the dashmap above
-    pub keyword_rank: DashMap<String, u32>,
+    // used for searching: keyword -> the pages containing it. A plain HashSet inside the outer
+    // DashMap (its shard lock guards the set): a DashMap per keyword allocated its own shards,
+    // ~10 GB for 580k keywords (#220).
+    pub keywords: DashMap<String, HashSet<String>>,
 
     // badbits and the hand-maintained local list, checked before every enqueue and fetch
     denylist: RwLock<Denylist>,
@@ -140,7 +150,6 @@ impl IndexQueue {
             queue_set: DashMap::new(),
             map: DashMap::new(),
             keywords: DashMap::new(),
-            keyword_rank: DashMap::new(),
             denylist: RwLock::new(Denylist::empty()),
             local_denylist: RwLock::new(Denylist::empty()),
             last_fetch: Mutex::new(None),
@@ -237,7 +246,7 @@ impl IndexQueue {
                 store.upsert(item, result, now_secs())?;
             }
             self.index_keywords(&result.cid, &result.keywords);
-            self.map.insert(item.clone(), result.clone());
+            self.map.insert(item.clone(), without_keywords(result));
         }
         let _ = self.store.set(store);
         Ok((keep.len(), blocked, expired))
@@ -284,7 +293,7 @@ impl IndexQueue {
         if self.blocked_quietly(item) || self.blocked_quietly(&result.cid) {
             return;
         }
-        self.map.insert(item.to_string(), result.clone());
+        self.map.insert(item.to_string(), without_keywords(result));
         if let Some(store) = self.store.get() {
             if let Err(err) = store.upsert(item, result, now_secs()) {
                 warn!("Couldn't persist {}: {}", item, err);
@@ -295,13 +304,10 @@ impl IndexQueue {
     // add a page's keyword counts to the search index (shared by crawling and attach_store)
     fn index_keywords(&self, key: &str, counts: &HashMap<String, u32>) {
         for word in counts.keys() {
-            let keyword_map = self
-                .keywords
+            self.keywords
                 .entry(word.clone())
-                .or_insert_with(DashMap::new);
-            keyword_map.insert(key.to_string(), ());
-            self.keyword_rank
-                .insert(word.clone(), keyword_map.len() as u32);
+                .or_default()
+                .insert(key.to_string());
         }
     }
 
@@ -389,10 +395,14 @@ impl IndexQueue {
      * Returns the top n keywords by the number of CIDs they map to
      */
     pub fn top_keywords(&self, n: usize) -> Vec<(String, u32)> {
-        let all_keywords_iter = self.keyword_rank.clone().into_iter();
-        let mut all_keywords: Vec<(String, u32)> = all_keywords_iter.collect();
-        all_keywords.sort_by(|a, b| b.1.cmp(&a.1));
-        all_keywords.iter().take(n).cloned().collect()
+        let mut all_keywords: Vec<(String, u32)> = self
+            .keywords
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().len() as u32))
+            .collect();
+        all_keywords.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        all_keywords.truncate(n);
+        all_keywords
     }
 
     pub fn search(&self, query: String) -> Vec<IndexResult> {
@@ -402,14 +412,12 @@ impl IndexQueue {
         // each result for a keyword, or instead we could do a keyword lookup in the keyword map
         // which will give us a list of CIDs that contain the keyword.
 
-        if self.keywords.contains_key(&query) {
-            let cid_map: DashMap<String, ()> = self.keywords.get(&query).unwrap().clone();
-            cid_map.into_iter().for_each(|(cid, _)| {
-                if self.map.contains_key(&cid) {
-                    let index_result: IndexResult = self.map.get(&cid).unwrap().clone();
-                    results.push(index_result);
+        if let Some(cids) = self.keywords.get(&query) {
+            for cid in cids.iter() {
+                if let Some(index_result) = self.map.get(cid) {
+                    results.push(index_result.clone());
                 }
-            });
+            }
         }
 
         return results;
@@ -1049,6 +1057,76 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 2, "disk matches memory: {:?}", rows);
         assert!(!file_has(&dir, "escapetitle"));
+    }
+
+    #[test]
+    fn keywords_rank_by_number_of_pages_and_search_finds_each_page() {
+        let queue = IndexQueue::new();
+        let pages = [
+            ("bafyP1", &["common", "rare"][..]),
+            ("bafyP2", &["common"][..]),
+            ("bafyP3", &["common", "middle"][..]),
+            ("bafyP4", &["middle"][..]),
+        ];
+        for (item, words) in pages {
+            let counts: HashMap<String, u32> = words.iter().map(|w| (w.to_string(), 5)).collect();
+            queue.index_keywords(item, &counts);
+            queue.map.insert(
+                item.to_string(),
+                IndexResult::new(item.to_string(), "t".into(), "e".into(), counts),
+            );
+        }
+        assert_eq!(queue.keyword_length(), 3);
+        assert_eq!(
+            queue.top_keywords(2),
+            vec![("common".to_string(), 3), ("middle".to_string(), 2)]
+        );
+        let mut found: Vec<String> = queue
+            .search("common".to_string())
+            .into_iter()
+            .map(|r| r.cid)
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["bafyP1", "bafyP2", "bafyP3"]);
+        // indexing the same page twice doesn't double-count it
+        queue.index_keywords("bafyP1", &HashMap::from([("common".to_string(), 1)]));
+        assert_eq!(queue.top_keywords(1), vec![("common".to_string(), 3)]);
+        assert!(queue.search("absent".to_string()).is_empty());
+    }
+
+    #[test]
+    fn keyword_counts_live_on_disk_not_in_the_in_memory_records() {
+        // #220: per-page counts duplicated the inverted index in RAM and bloated /search output
+        let dir = temp_dir("counts");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.index_keywords(GOOD, &HashMap::from([("alpha".to_string(), 3)]));
+        queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 3)]));
+        assert!(
+            queue.map.get(GOOD).unwrap().keywords.is_empty(),
+            "in-memory record carries no counts"
+        );
+        assert_eq!(
+            queue.search("alpha".to_string()).len(),
+            1,
+            "still searchable"
+        );
+        let stored = Store::open(&dir).unwrap().load_all().unwrap();
+        assert_eq!(
+            stored[0].1.keywords.get("alpha"),
+            Some(&3),
+            "counts kept on disk for reload"
+        );
+
+        // and after a reload: searchable, counts dropped from memory again
+        let reloaded = IndexQueue::new();
+        reloaded
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        assert_eq!(reloaded.search("alpha".to_string()).len(), 1);
+        assert!(reloaded.map.get(GOOD).unwrap().keywords.is_empty());
     }
 
     #[test]
