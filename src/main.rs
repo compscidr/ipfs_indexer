@@ -42,6 +42,43 @@ async fn status(queue: web::Data<IndexQueue>, gateway: web::Data<Gateway>) -> Ht
     ))
 }
 
+/// Process memory, index file size and free space under DATA_DIR, in bytes ("-" if unknown) (#214)
+#[get("/resources")]
+async fn resources(queue: web::Data<IndexQueue>) -> HttpResponse {
+    let path = queue.store_path();
+    let show = |v: Option<u64>| v.map_or("-".to_string(), |v| v.to_string());
+    HttpResponse::Ok().body(format!(
+        "Memory: {} Index file: {} Disk free: {}",
+        show(rss_bytes()),
+        show(
+            path.as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len())
+        ),
+        show(path.as_deref().and_then(disk_free_bytes)),
+    ))
+}
+
+// VmRSS from /proc/self/status (Linux only)
+fn rss_bytes() -> Option<u64> {
+    let proc_status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = proc_status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+// space available to unprivileged users on the filesystem holding `path`
+fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is NUL-terminated and stat is a valid out-pointer
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
 #[get("/version")]
 async fn version_handler() -> HttpResponse {
     HttpResponse::Ok().body(version())
@@ -229,6 +266,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(gateway_data.clone())
             .service(status)
             .service(version_handler)
+            .service(resources)
             .service(enqueue)
             .service(search)
             .service(keywords)
@@ -244,6 +282,61 @@ mod tests {
     use actix_web::{test, web, App};
 
     use super::*;
+
+    async fn get_resources(queue: IndexQueue) -> String {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(queue))
+                .service(resources),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/resources").to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    // "Memory: <bytes> Index file: <bytes|-> Disk free: <bytes|->"
+    fn fields(body: &str) -> Vec<String> {
+        let parts: Vec<&str> = body.split(": ").collect();
+        assert_eq!(parts.len(), 4, "{}", body);
+        parts[1..]
+            .iter()
+            .map(|p| p.split(' ').next().unwrap().to_string())
+            .collect()
+    }
+
+    #[actix_web::test]
+    async fn resources_without_a_store_report_memory_only() {
+        let body = get_resources(IndexQueue::new()).await;
+        assert!(
+            body.starts_with("Memory: ") && body.contains(" Index file: - Disk free: -"),
+            "{}",
+            body
+        );
+        assert!(
+            fields(&body)[0].parse::<u64>().unwrap() > 1_000_000,
+            "{}",
+            body
+        );
+    }
+
+    #[actix_web::test]
+    async fn resources_report_the_index_file_and_free_disk() {
+        let dir = store::tests::temp_dir("resources");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(store::Store::open(&dir).unwrap(), 86400)
+            .unwrap();
+        let body = get_resources(queue).await;
+        let f = fields(&body);
+        assert_eq!(
+            f[1].parse::<u64>().unwrap(),
+            std::fs::metadata(dir.join("index.sqlite")).unwrap().len(),
+            "{}",
+            body
+        );
+        assert!(f[2].parse::<u64>().unwrap() > 0, "{}", body);
+    }
 
     #[actix_web::test]
     async fn test_status_get() {
