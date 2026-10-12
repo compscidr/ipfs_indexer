@@ -5,7 +5,7 @@
 **Goal:** Store indexed pages in SQLite under `DATA_DIR` and reload them at startup. Takedowns, denylists and expiry delete rows from disk, and nothing is served before the startup re-check.
 
 **Architecture:**
-- A new `src/store.rs` wraps one `rusqlite::Connection` behind a `Mutex`, with `secure_delete` on and a rollback journal.
+- A new `src/store.rs` wraps one `rusqlite::Connection` behind a `Mutex`, with `secure_delete` on and the rollback journal kept in memory.
 - `IndexQueue` gets an optional store (`OnceLock<Store>`): it upserts on insert, deletes on purge and expiry, and has an `attach_store` that filters by the denylists and age, then reloads `map` and the keyword maps.
 - `main.rs` loads both denylists synchronously, attaches the store, and only then starts the workers and the HTTP server.
 
@@ -13,10 +13,12 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-12-persist-index-design.md`
 
+> **Superseded where it differs from the spec.** The branch review changed three things after this plan was written: `journal_mode = MEMORY` (an on-disk DELETE journal writes plaintext page copies and only unlinks them), a `writes` lock serializing `persist()` against denylist swaps and `expire()`, and `reseed()` after the daily expiry. The spec and code are authoritative; the snippets below are updated for the journal mode only.
+
 ## Global Constraints
 
 - `DATA_DIR` unset means no store: behavior identical to today. `DATA_DIR` set but unopenable means log an error and `std::process::exit(1)`.
-- File: `$DATA_DIR/index.sqlite`. Pragmas: `secure_delete = ON`, `journal_mode = DELETE`.
+- File: `$DATA_DIR/index.sqlite`. Pragmas: `secure_delete = ON`, `journal_mode = MEMORY` (never an on-disk journal).
 - Schema exactly as in the spec: `pages(item TEXT PRIMARY KEY, cid TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL, keywords TEXT NOT NULL, indexed_at INTEGER NOT NULL)`.
 - Keywords encoding: one `word count` per line, `\n`-separated. Words never contain whitespace.
 - Expiry: `INDEX_MAX_AGE_DAYS`, default 30. Checked at attach and in the existing 24 h refresh thread.
@@ -175,7 +177,7 @@ Expected: compile errors (`cannot find type Store`, `cannot find function decode
 ```rust
 /**
  * The persisted index (#106): one SQLite file, `index.sqlite`, under DATA_DIR. secure_delete
- * zeroes deleted rows in the file and the rollback journal (not WAL) keeps no stale copies,
+ * zeroes deleted rows in the file and the rollback journal is kept in memory (never on disk),
  * so a takedown removes the text from disk, not just from memory.
  */
 pub struct Store {
@@ -195,7 +197,7 @@ impl Store {
         let path = dir.join("index.sqlite");
         let conn = Connection::open(&path)?;
         conn.pragma_update(None, "secure_delete", true)?;
-        conn.pragma_update(None, "journal_mode", "DELETE")?;
+        conn.pragma_update(None, "journal_mode", "MEMORY")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS pages (
                 item       TEXT PRIMARY KEY,
@@ -688,7 +690,7 @@ Set `DATA_DIR` to keep the index across restarts in `$DATA_DIR/index.sqlite` (SQ
 
 - **Stored per page:** the CID/path, title, 128-character excerpt and keyword counts. Nothing else.
 - **Startup:** both denylists (badbits and `LOCAL_DENYLIST`) are loaded first. Stored pages that are now denylisted, or older than `INDEX_MAX_AGE_DAYS` (default 30), are deleted. Only then are the remaining pages loaded, and crawling and serving start.
-- **Takedowns:** whenever a denylist refresh removes pages, their rows are deleted from the file. `secure_delete` overwrites deleted rows with zeros, and the rollback journal (not WAL) keeps no old copies.
+- **Takedowns:** whenever a denylist refresh removes pages, their rows are deleted from the file. `secure_delete` overwrites deleted rows with zeros, and the rollback journal is kept in memory, so no plaintext page copies go to a journal file.
 - **Expiry:** pages older than the max age are dropped daily. The crawler re-adds them if it reaches them again.
 - **No backups:** the index is deliberately not backed up. It can be rebuilt by crawling, and a backup is a copy takedowns can't reach.
 - **Wipe:** stop the indexer, `rm $DATA_DIR/index.sqlite*`, and start it again.

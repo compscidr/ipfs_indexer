@@ -142,20 +142,20 @@ impl IndexQueue {
         max_age_secs: i64,
     ) -> rusqlite::Result<(usize, usize, usize)> {
         let cutoff = now_secs() - max_age_secs;
-        let (mut drop, mut blocked, mut expired) = (Vec::new(), 0, 0);
+        let (mut to_delete, mut blocked, mut expired) = (Vec::new(), 0, 0);
         let mut keep = Vec::new();
         for (item, result, indexed_at) in store.load_all()? {
             if self.blocked_quietly(&item) || self.blocked_quietly(&result.cid) {
                 blocked += 1;
-                drop.push(item);
+                to_delete.push(item);
             } else if indexed_at < cutoff {
                 expired += 1;
-                drop.push(item);
+                to_delete.push(item);
             } else {
                 keep.push((item, result));
             }
         }
-        store.delete(&drop)?;
+        store.delete(&to_delete)?;
         for (item, result) in &keep {
             self.index_keywords(&result.cid, &result.keywords);
             self.map.insert(item.clone(), result.clone());
