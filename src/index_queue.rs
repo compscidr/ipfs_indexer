@@ -346,6 +346,23 @@ impl IndexQueue {
             .count()
     }
 
+    /**
+     * Queue every indexed page to be fetched again, so links to pages not indexed yet are followed
+     * again (the crawl frontier was lost before it was saved, #225). Pages stay searchable while
+     * they wait. A restart drops what's left: the saved queue skips indexed pages on load.
+     */
+    pub fn recrawl(&self) -> usize {
+        let indexed: Vec<String> = self.map.iter().map(|e| e.key().clone()).collect();
+        let items: Vec<String> = indexed
+            .into_iter()
+            .filter(|item| !self.blocked_quietly(item))
+            .filter(|item| self.queue_set.insert(item.clone(), ()).is_none())
+            .collect();
+        let queued = items.len();
+        self.push_queued(items);
+        queued
+    }
+
     /// Drop pages indexed more than max_age_secs ago, from the store and the map
     pub fn expire(&self, max_age_secs: i64) -> usize {
         let _writes = self.writes.write().unwrap();
