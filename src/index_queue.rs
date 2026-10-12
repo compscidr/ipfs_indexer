@@ -18,6 +18,47 @@ use std::time::Instant;
 // expiry, so the crawl walks back to pages that expired.
 pub const SEED_CIDS: &[&str] = &["bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze"];
 
+/**
+ * Spaces out gateway requests across all workers: at most `per_min` a minute, 0 meaning no limit.
+ * Public gateways rate-limit by client (Filebase: 200/min), and ten workers hitting cached pages
+ * burst far past that.
+ */
+pub struct Throttle {
+    interval: Duration,
+    next: Mutex<Instant>,
+}
+
+impl Throttle {
+    pub fn per_minute(per_min: u32) -> Throttle {
+        let interval = if per_min == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(60) / per_min
+        };
+        Throttle {
+            interval,
+            next: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Blocks until this caller's slot; each call reserves the next slot under the lock
+    pub fn wait(&self) {
+        if self.interval.is_zero() {
+            return;
+        }
+        let slot = {
+            let mut next = self.next.lock().unwrap();
+            let slot = (*next).max(Instant::now());
+            *next = slot + self.interval;
+            slot
+        };
+        let now = Instant::now();
+        if slot > now {
+            std::thread::sleep(slot - now);
+        }
+    }
+}
+
 // skip anything bigger than this rather than pulling it all into memory
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -87,6 +128,9 @@ pub struct IndexQueue {
     // expire() hold it exclusively, so a page checked against an old list can't be written
     // after the purge that should have removed it
     writes: RwLock<()>,
+
+    // spaces out gateway requests; unset means no limit
+    throttle: OnceLock<Throttle>,
 }
 
 impl IndexQueue {
@@ -102,6 +146,18 @@ impl IndexQueue {
             last_fetch: Mutex::new(None),
             store: OnceLock::new(),
             writes: RwLock::new(()),
+            throttle: OnceLock::new(),
+        }
+    }
+
+    /// Limit gateway requests to `per_min` a minute across all workers (0 = no limit)
+    pub fn set_gateway_rate(&self, per_min: u32) {
+        let _ = self.throttle.set(Throttle::per_minute(per_min));
+    }
+
+    fn wait_for_gateway(&self) {
+        if let Some(throttle) = self.throttle.get() {
+            throttle.wait();
         }
     }
 
@@ -363,6 +419,7 @@ impl IndexQueue {
     fn retrieve_content(&self, gateway: String, cid: String) -> Option<IndexResult> {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
         warn!("Retreiving {}", url);
+        self.wait_for_gateway();
         let fetched = fetch_html(&url);
         *self.last_fetch.lock().unwrap() = Some((
             Instant::now(),
@@ -419,6 +476,7 @@ impl IndexQueue {
                 if self.is_blocked(&fullcid) {
                     return None;
                 }
+                self.wait_for_gateway();
                 return match fetch_html(&newurl) {
                     Ok(Some(html)) => Some((fullcid, Html::parse_document(html.as_str()))),
                     Ok(None) => None,
@@ -642,6 +700,50 @@ mod tests {
             .port();
         queue.retrieve_content(format!("127.0.0.1:{}", port), "bafy".to_string());
         assert!(queue.gateway_health().starts_with("error 0s ago: "));
+    }
+
+    #[test]
+    fn throttle_spaces_requests_across_threads() {
+        // 600/min = one request per 100ms; four requests from four threads span >= 300ms
+        let throttle = std::sync::Arc::new(Throttle::per_minute(600));
+        let start = Instant::now();
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let throttle = std::sync::Arc::clone(&throttle);
+                std::thread::spawn(move || throttle.wait())
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(290), "{:?}", elapsed);
+        assert!(elapsed < Duration::from_millis(900), "{:?}", elapsed);
+    }
+
+    #[test]
+    fn unlimited_throttle_never_waits() {
+        let throttle = Throttle::per_minute(0);
+        let start = Instant::now();
+        (0..1000).for_each(|_| throttle.wait());
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn page_fetches_go_through_the_throttle() {
+        let queue = IndexQueue::new();
+        queue.set_gateway_rate(300); // one request per 200ms
+        let start = Instant::now();
+        for _ in 0..3 {
+            let gateway = serve_once("text/html", b"<title>t</title>".to_vec())
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string();
+            queue.retrieve_content(gateway, "bafy".to_string());
+        }
+        assert!(
+            start.elapsed() >= Duration::from_millis(390),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

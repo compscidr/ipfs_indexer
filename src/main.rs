@@ -102,6 +102,26 @@ async fn main() -> std::io::Result<()> {
     }
 
     let index_queue = web::Data::new(IndexQueue::new());
+
+    // self-throttle on the public gateway (Filebase allows 200/min; stay well under it, leaving
+    // room for redirect fetches). Your own node (gateway argument): no limit unless configured.
+    let default_rate = if args.len() < 2 { 100 } else { 0 };
+    let gateway_rate = match std::env::var("GATEWAY_REQUESTS_PER_MIN") {
+        Ok(value) => value.parse::<u32>().unwrap_or_else(|_| {
+            error!(
+                "GATEWAY_REQUESTS_PER_MIN must be a whole number, got {:?}",
+                value
+            );
+            std::process::exit(1);
+        }),
+        Err(_) => default_rate,
+    };
+    index_queue.set_gateway_rate(gateway_rate);
+    if gateway_rate == 0 {
+        info!("Gateway requests: no limit");
+    } else {
+        info!("Gateway requests: at most {} per minute", gateway_rate);
+    }
     index_queue.reseed();
 
     // fail closed: don't crawl anything until the badbits denylist is loaded. Fetched on a plain
