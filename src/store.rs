@@ -37,6 +37,10 @@ impl Store {
                 excerpt    TEXT NOT NULL,
                 keywords   TEXT NOT NULL,
                 indexed_at INTEGER NOT NULL
+            );
+            -- the crawl frontier (#224): items waiting to be fetched, in insertion order
+            CREATE TABLE IF NOT EXISTS queue (
+                item TEXT PRIMARY KEY
             )",
         )?;
         Ok(Store {
@@ -97,6 +101,39 @@ impl Store {
                 r.get(5)?,
             ))
         })?;
+        rows.collect()
+    }
+
+    /// Adds items to the frontier in one transaction; ones already there are ignored
+    pub fn queue_add(&self, items: &[String]) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
+            for item in items {
+                stmt.execute([item])?;
+            }
+        }
+        tx.commit()
+    }
+
+    pub fn queue_remove(&self, items: &[String]) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM queue WHERE item = ?1")?;
+            for item in items {
+                stmt.execute([item])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// The frontier in the order it was added
+    pub fn queue_load(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT item FROM queue ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect()
     }
 
@@ -291,6 +328,25 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(Store::open(&dir).is_err(), "corrupt index.sqlite");
+    }
+
+    #[test]
+    fn queue_round_trips_in_order_and_ignores_duplicates() {
+        let dir = temp_dir("queue");
+        let store = Store::open(&dir).unwrap();
+        store
+            .queue_add(&["b/1".to_string(), "a/2".to_string(), "b/1".to_string()])
+            .unwrap();
+        store.queue_add(&["c/3".to_string()]).unwrap();
+        drop(store);
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(
+            store.queue_load().unwrap(),
+            vec!["b/1", "a/2", "c/3"],
+            "FIFO, no duplicates"
+        );
+        store.queue_remove(&["a/2".to_string()]).unwrap();
+        assert_eq!(store.queue_load().unwrap(), vec!["b/1", "c/3"]);
     }
 
     #[test]

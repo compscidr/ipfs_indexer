@@ -3,7 +3,7 @@ use crate::index_result::IndexResult;
 use crate::store::{now_secs, Store};
 use actix_web::body::MessageBody;
 use cid::Cid;
-use crossbeam_queue::ArrayQueue;
+use crossbeam_queue::SegQueue;
 use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
@@ -169,7 +169,8 @@ pub enum Enqueued {
 
 pub struct IndexQueue {
     // queue of items to index
-    pub queue: ArrayQueue<String>,
+    // unbounded: a bounded queue dropped links once full (#224)
+    pub queue: SegQueue<String>,
     pub queue_set: DashMap<String, ()>, // used to quickly determine duplicates in queue
 
     // index results (cid -> result)
@@ -202,7 +203,7 @@ pub struct IndexQueue {
 impl IndexQueue {
     pub fn new() -> Self {
         IndexQueue {
-            queue: ArrayQueue::new(1000),
+            queue: SegQueue::new(),
             queue_set: DashMap::new(),
             map: DashMap::new(),
             keywords: DashMap::new(),
@@ -303,6 +304,27 @@ impl IndexQueue {
             }
             self.index_keywords(&result.cid, &result.keywords);
             self.map.insert(item.clone(), without_keywords(result));
+        }
+        // resume the crawl (#224): pages blocked or indexed since they were queued are dropped
+        let (mut resumed, mut dropped) = (Vec::new(), Vec::new());
+        for item in store.queue_load()? {
+            match self.admit(item.clone()) {
+                (_, Some(admitted)) if admitted == item => resumed.push(item),
+                (_, admitted) => {
+                    dropped.push(item);
+                    resumed.extend(admitted); // re-spelled canonically
+                }
+            }
+        }
+        store.queue_remove(&dropped)?;
+        store.queue_add(&resumed)?;
+        info!(
+            "Resumed {} queued items ({} dropped)",
+            resumed.len(),
+            dropped.len()
+        );
+        for item in resumed {
+            self.queue.push(item);
         }
         let _ = self.store.set(store);
         Ok((keep.len(), blocked, expired))
@@ -406,33 +428,60 @@ impl IndexQueue {
      * Queue a "cid" or "cid/path" for indexing. Nothing is queued unless it returns Queued.
      */
     pub fn enqueue(&self, item: String) -> Enqueued {
+        let (result, new) = self.admit(item);
+        self.push_queued(new.into_iter().collect());
+        result
+    }
+
+    /// enqueue for many items (a page's links), saved to disk in one transaction
+    pub fn enqueue_many(&self, items: Vec<String>) {
+        let new = items
+            .into_iter()
+            .filter_map(|item| self.admit(item).1)
+            .collect();
+        self.push_queued(new);
+    }
+
+    // newly admitted items: saved first, so a pop can't race ahead of the row it later deletes
+    fn push_queued(&self, items: Vec<String>) {
+        if items.is_empty() {
+            return;
+        }
+        if let Some(store) = self.store.get() {
+            if let Err(err) = store.queue_add(&items) {
+                warn!("Couldn't save {} queued items: {}", items.len(), err);
+            }
+        }
+        for item in items {
+            self.queue.push(item);
+        }
+    }
+
+    /// Validates an item and marks it queued; the item is returned if it's newly queued
+    fn admit(&self, item: String) -> (Enqueued, Option<String>) {
         // one canonical spelling per page (#218); a path that climbs out of its CID is invalid
         let Some(item) = normalize_item(&item) else {
             warn!("Not a valid cid/path, ignoring {}", item);
-            return Enqueued::InvalidCid;
+            return (Enqueued::InvalidCid, None);
         };
         let root = item.split('/').next().unwrap_or("");
         if Cid::try_from(root).is_err() {
             warn!("Not a CID, ignoring {}", item);
-            return Enqueued::InvalidCid;
+            return (Enqueued::InvalidCid, None);
         }
         if self.is_blocked(&item) {
-            return Enqueued::Blocked;
+            return (Enqueued::Blocked, None);
         }
-
         if self.map.contains_key(&item) {
             trace!("Already indexed {}", item);
-            return Enqueued::Queued;
+            return (Enqueued::Queued, None);
         }
-
-        if self.queue_set.contains_key(&*item) {
-            info!("{} already in queue", item.clone());
-        } else {
-            info!("Enqueuing {}", item);
-            let _ = self.queue.push(item.clone());
-            self.queue_set.insert(item.clone(), ());
+        if self.queue_set.insert(item.clone(), ()).is_some() {
+            info!("{} already in queue", item);
+            return (Enqueued::Queued, None);
         }
-        Enqueued::Queued
+        info!("Enqueuing {}", item);
+        (Enqueued::Queued, Some(item))
     }
 
     pub fn queue_length(&self) -> usize {
@@ -481,27 +530,34 @@ impl IndexQueue {
 
     pub fn start(&self, gateway: String) {
         loop {
-            if self.queue.is_empty() == false {
-                let try_item = self.queue.pop();
-                if try_item.is_some() {
-                    let item = try_item.unwrap();
-                    self.queue_set.remove(&*item);
-                    if self.is_blocked(&item) {
-                        continue;
-                    }
-                    warn!("Indexing {}", item);
-
-                    let result = self.retrieve_content(gateway.clone(), item.clone());
-
-                    if result.is_some() {
-                        self.persist(&item, &result.unwrap());
-                    } else {
-                        warn!("Error retrieving CID {}", item);
-                        // self.enqueue(item.clone()); // for now give up on error
-                    }
-                }
+            if !self.process_next(&gateway) {
+                // idle workers spun at 100% CPU each (#224)
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
+    }
+
+    /// Fetch and index the next queued item; false if the queue was empty
+    pub fn process_next(&self, gateway: &str) -> bool {
+        let Some(item) = self.queue.pop() else {
+            return false;
+        };
+        self.queue_set.remove(&item);
+        if !self.is_blocked(&item) {
+            warn!("Indexing {}", item);
+            match self.retrieve_content(gateway.to_string(), item.clone()) {
+                Some(result) => self.persist(&item, &result),
+                // for now give up on error
+                None => warn!("Error retrieving CID {}", item),
+            }
+        }
+        // only now: a crash mid-fetch re-fetches the item after a restart instead of losing it
+        if let Some(store) = self.store.get() {
+            if let Err(err) = store.queue_remove(std::slice::from_ref(&item)) {
+                warn!("Couldn't remove {} from the saved queue: {}", item, err);
+            }
+        }
+        true
     }
 
     /**
@@ -613,16 +669,12 @@ impl IndexQueue {
 
         // todo: get all relative links and add them to the index
         let selector = Selector::parse("a").unwrap();
-        for element in document.select(&selector) {
-            if let Some(item) = element
-                .value()
-                .attr("href")
-                .and_then(|href| resolve_link(base, href))
-            {
-                trace!("found link to {}", item);
-                self.enqueue(item);
-            }
-        }
+        let links = document
+            .select(&selector)
+            .filter_map(|element| element.value().attr("href"))
+            .filter_map(|href| resolve_link(base, href))
+            .collect();
+        self.enqueue_many(links);
         let selector = Selector::parse("body").unwrap();
         let body = document.select(&selector).next();
         let mut index_keywords: HashMap<String, u32> = HashMap::new();
@@ -1283,6 +1335,77 @@ mod tests {
             "{}",
             queue.gateway_health()
         );
+    }
+
+    #[test]
+    fn a_long_queue_loses_no_links() {
+        // #224: the 1000-slot queue dropped pushes but still marked the items as queued
+        let queue = IndexQueue::new();
+        let items: Vec<String> = (0..2500).map(|i| format!("{}/wiki/P{}", GOOD, i)).collect();
+        queue.enqueue_many(items.clone());
+        assert_eq!(queue.queue_length(), 2500);
+        assert_eq!(queue.enqueue(items[0].clone()), Enqueued::Queued);
+        assert_eq!(queue.queue_length(), 2500, "still no duplicates");
+    }
+
+    #[test]
+    fn the_frontier_survives_a_restart() {
+        let dir = temp_dir("frontier");
+        let first = IndexQueue::new();
+        first
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        first.enqueue_many(vec![
+            format!("{}/wiki/A", GOOD),
+            format!("{}/wiki/B", GOOD),
+            format!("{}/x", BAD),
+        ]);
+        // wiki/A got indexed meanwhile
+        Store::open(&dir)
+            .unwrap()
+            .upsert(
+                &format!("{}/wiki/A", GOOD),
+                &page(&format!("{}/wiki/A", GOOD), "a", &[]),
+                now_secs(),
+            )
+            .unwrap();
+        drop(first);
+
+        let second = IndexQueue::new();
+        second.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        second
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        assert_eq!(
+            second.queue_length(),
+            1,
+            "only the still-pending, allowed item resumes"
+        );
+        assert_eq!(second.queue.pop().unwrap(), format!("{}/wiki/B", GOOD));
+        assert_eq!(
+            Store::open(&dir).unwrap().queue_load().unwrap(),
+            vec![format!("{}/wiki/B", GOOD)]
+        );
+    }
+
+    #[test]
+    fn processed_items_leave_the_saved_frontier() {
+        let dir = temp_dir("processed");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.enqueue(GOOD.to_string());
+        let gateway = serve_once(
+            "text/html",
+            b"<title>t</title><body>words here</body>".to_vec(),
+        )
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+        assert!(queue.process_next(&gateway));
+        assert!(Store::open(&dir).unwrap().queue_load().unwrap().is_empty());
+        assert!(!queue.process_next(&gateway), "nothing left");
     }
 
     #[test]
