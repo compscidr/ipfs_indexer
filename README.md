@@ -34,6 +34,7 @@ The indexer **exits at startup** if it can't download the badbits list, read a c
 | `GET /search/{word}` | Indexed pages containing the keyword (one lowercase word for now; see [#209](https://github.com/compscidr/ipfs_indexer/issues/209)). |
 | `GET /enqueue/{cid}` or `/enqueue/{cid}/{path}` | Queues a page: `200` queued, `400` not a valid CID, `403` blocked by a denylist. |
 | `GET /status` | Queue length, index size, keyword count, gateway health and version on one line. |
+| `GET /resources` | `Memory: <bytes> Index file: <bytes> Disk free: <bytes>`: process RSS, the size of `index.sqlite` and free space on its filesystem (`-` without `DATA_DIR`). |
 | `GET /version` | e.g. `0.1.0 (abc1234)`. The commit comes from `GIT_SHA` at build time. |
 | `GET /keywords` | The most common keywords. |
 

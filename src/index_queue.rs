@@ -330,6 +330,11 @@ impl IndexQueue {
         Ok((keep.len(), blocked, expired))
     }
 
+    /// the index file, if a store is attached
+    pub fn store_path(&self) -> Option<std::path::PathBuf> {
+        self.store.get().map(|store| store.path().to_path_buf())
+    }
+
     /// Queue each seed that isn't indexed or queued already; returns how many were queued
     pub fn reseed(&self) -> usize {
         SEED_CIDS
