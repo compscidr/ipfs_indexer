@@ -21,6 +21,7 @@ RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080   # your own gateway (h
 |---|---|---|
 | `BIND_ADDR` | `127.0.0.1:9090` | Where the HTTP API listens. Set `0.0.0.0:9090` to accept remote connections. |
 | `LOCAL_DENYLIST` | unset | Path to your takedown list (see [Denylists](#denylists)). |
+| `ADMIN_TOKEN` | unset | Enables the admin endpoints (used by darksearch.xyz's admin area). Mount `LOCAL_DENYLIST`'s directory read-write. |
 | `DATA_DIR` | unset | Directory for the persisted index (see [Persistence](#persistence)). Unset: in memory only. |
 | `INDEX_MAX_AGE_DAYS` | `30` | With `DATA_DIR`, pages older than this are dropped. |
 | `GATEWAY_REQUESTS_PER_MIN` | `100` on the default public gateway, no limit with your own gateway | Spaces out gateway requests across all workers (`0` = no limit). Filebase allows 200 a minute. |
@@ -37,6 +38,7 @@ The indexer **exits at startup** if it can't download the badbits list, read a c
 | `GET /resources` | `Memory: <bytes> Index file: <bytes> Disk free: <bytes>`: process RSS, the size of `index.sqlite` and free space on its filesystem (`-` without `DATA_DIR`). |
 | `GET /version` | e.g. `0.1.0 (abc1234)`. The commit comes from `GIT_SHA` at build time. |
 | `GET /keywords` | The most common keywords. |
+| `POST /admin/deny`, `POST /admin/undeny` | Only with `ADMIN_TOKEN` set (otherwise 404); needs `Authorization: Bearer <token>`. The body is one `cid`, `cid/path` or `/ipfs/cid/path`: added to or removed from `LOCAL_DENYLIST` and applied at once. Returns `Blocked; <n> pages removed` or `Unblocked; <n> lines removed`. Badbits is never changed. |
 
 ## Denylists
 The badbits denylist is downloaded at startup and refreshed daily.
