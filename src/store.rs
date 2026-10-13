@@ -86,6 +86,11 @@ impl Store {
     fn init(mut conn: Connection, path: Option<PathBuf>, cache_mb: u32) -> rusqlite::Result<Store> {
         conn.pragma_update(None, "secure_delete", true)?;
         conn.pragma_update(None, "journal_mode", "MEMORY")?;
+        // commits go to the OS page cache instead of waiting on fsync: on spinning disks each
+        // page's scattered postings writes held the lock for seconds, timing out searches. The
+        // memory journal already means a crash can corrupt the file (rebuild); this extends that
+        // to power loss.
+        conn.pragma_update(None, "synchronous", "OFF")?;
         // a commit waits for the reader's queries to finish rather than failing
         conn.busy_timeout(BUSY_TIMEOUT)?;
         if cache_mb > 0 {
@@ -550,6 +555,13 @@ pub(crate) mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode, "memory");
+        let sync: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 0, "OFF");
         store.upsert("bafyJ", &page("bafyJ", "j", &[]), 1).unwrap();
         store.delete(&["bafyJ".to_string()]).unwrap();
         assert!(!dir.join("index.sqlite-journal").exists());

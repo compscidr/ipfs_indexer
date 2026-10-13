@@ -63,7 +63,7 @@ Set `DATA_DIR` to keep the index across restarts in `$DATA_DIR/index.sqlite`.
 - **Expiry:** expired pages are dropped daily, and the seed is queued again so the crawl reaches them again.
 - **No backups:** the index is deliberately not backed up. It can be rebuilt by crawling, and a backup is a copy takedowns can't reach.
 - **Wipe:** stop the indexer, `rm $DATA_DIR/index.sqlite*`, and start it again.
-- **After a crash:** with the journal in memory, a crash mid-write can corrupt `index.sqlite`. The indexer then refuses to start ("Couldn't use DATA_DIR"). Wipe the file as above and it rebuilds by crawling.
+- **After a crash:** with the journal in memory, and `synchronous=OFF` (commits aren't fsynced, so spinning disks keep up), a crash mid-write or a power loss can corrupt `index.sqlite`. The indexer then refuses to start ("Couldn't use DATA_DIR"). Wipe the file as above and it rebuilds by crawling.
 
 ## Docker
 - **Just the indexer,** against the default public gateway. Run from the repository root (the build context needs `Cargo.toml` and `src`):
