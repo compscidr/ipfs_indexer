@@ -26,8 +26,9 @@ pub struct Store {
     reader: Option<Mutex<Connection>>,
     // None for an in-memory store (no DATA_DIR)
     path: Option<PathBuf>,
-    // rows in `terms`, kept here since counting them for every /status is a full scan
+    // rows in `terms` and `queue`, kept here since counting them for every /status is a full scan
     terms: AtomicUsize,
+    queued: AtomicUsize,
 }
 
 pub fn now_secs() -> i64 {
@@ -96,11 +97,13 @@ impl Store {
         // after the bulk load in the migration: deleting a page's postings needs it
         conn.execute_batch("CREATE INDEX IF NOT EXISTS postings_page ON postings (page)")?;
         let terms: i64 = conn.query_row("SELECT count(*) FROM terms", [], |r| r.get(0))?;
+        let queued: i64 = conn.query_row("SELECT count(*) FROM queue", [], |r| r.get(0))?;
         Ok(Store {
             conn: Mutex::new(conn),
             reader: None,
             path,
             terms: AtomicUsize::new(terms as usize),
+            queued: AtomicUsize::new(queued as usize),
         })
     }
 
@@ -253,29 +256,66 @@ impl Store {
         let rows = stmt.query_map([n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     }
-    /// Adds items to the frontier in one transaction; ones already there are ignored
-    pub fn queue_add(&self, items: &[String]) -> rusqlite::Result<()> {
+    /// Adds items to the frontier in one transaction; ones already there are ignored. Returns
+    /// how many were new.
+    pub fn queue_add(&self, items: &[String]) -> rusqlite::Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let mut added = 0;
         {
-            let mut stmt = tx.prepare("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
+            let mut stmt = tx.prepare_cached("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
             for item in items {
-                stmt.execute([item])?;
+                added += stmt.execute([item])?;
             }
         }
-        tx.commit()
+        tx.commit()?;
+        self.queued.fetch_add(added, Ordering::Relaxed);
+        Ok(added)
     }
 
     pub fn queue_remove(&self, items: &[String]) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let mut removed = 0;
         {
-            let mut stmt = tx.prepare("DELETE FROM queue WHERE item = ?1")?;
+            let mut stmt = tx.prepare_cached("DELETE FROM queue WHERE item = ?1")?;
             for item in items {
-                stmt.execute([item])?;
+                removed += stmt.execute([item])?;
             }
         }
-        tx.commit()
+        tx.commit()?;
+        self.queued.fetch_sub(removed, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Takes the oldest item off the frontier, or None if it's empty
+    pub fn queue_pop(&self) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let item = conn
+            .prepare_cached(
+                "DELETE FROM queue WHERE rowid = (SELECT min(rowid) FROM queue) RETURNING item",
+            )?
+            .query_row([], |r| r.get(0))
+            .optional()?;
+        if item.is_some() {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+        Ok(item)
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    /// Queued items per root CID (the first segment of "cid/path")
+    pub fn queue_roots(&self) -> rusqlite::Result<Vec<(String, usize)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT substr(item, 1, instr(item || '/', '/') - 1) AS root, count(*)
+             FROM queue GROUP BY root",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)))?;
+        rows.collect()
     }
 
     /// The frontier in the order it was added
@@ -575,6 +615,11 @@ pub(crate) mod tests {
         );
         store.queue_remove(&["a/2".to_string()]).unwrap();
         assert_eq!(store.queue_load().unwrap(), vec!["b/1", "c/3"]);
+        assert_eq!(store.queue_len(), 2);
+        assert_eq!(store.queue_pop().unwrap().as_deref(), Some("b/1"));
+        assert_eq!(store.queue_pop().unwrap().as_deref(), Some("c/3"));
+        assert_eq!(store.queue_pop().unwrap(), None);
+        assert_eq!(store.queue_len(), 0);
     }
 
     #[test]
