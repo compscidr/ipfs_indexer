@@ -307,9 +307,10 @@ impl Store {
         self.queued.load(Ordering::Relaxed)
     }
 
-    /// Queued items per root CID (the first segment of "cid/path")
+    /// Queued items per root CID (the first segment of "cid/path"). On the reader: a full scan
+    /// that would otherwise hold up the crawl
     pub fn queue_roots(&self) -> rusqlite::Result<Vec<(String, usize)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT substr(item, 1, instr(item || '/', '/') - 1) AS root, count(*)
              FROM queue GROUP BY root",
