@@ -69,6 +69,8 @@ impl Store {
         let path = dir.join("index.sqlite");
         let conn = Connection::open(&path)?;
         let mut store = Store::init(conn, Some(path.clone()), cache_mb)?;
+        // default cache_size, not cache_mb: SQLite drops a connection's cache whenever another
+        // one commits, which the crawl does constantly, so a big one here would rarely be warm
         let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         reader.busy_timeout(BUSY_TIMEOUT)?;
         store.reader = Some(Mutex::new(reader));
