@@ -546,6 +546,36 @@ impl IndexQueue {
         self.map.len()
     }
 
+    /// Indexed and queued counts per root CID (the first segment of "cid/path"), with the root
+    /// page's title if it's indexed, most indexed first (#232)
+    pub fn root_counts(&self) -> Vec<(String, usize, usize, String)> {
+        let root = |item: &str| item.split('/').next().unwrap_or(item).to_string();
+        let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
+        for entry in self.map.iter() {
+            counts.entry(root(entry.key())).or_default().0 += 1;
+        }
+        for entry in self.queue_set.iter() {
+            counts.entry(root(entry.key())).or_default().1 += 1;
+        }
+        let mut roots: Vec<_> = counts
+            .into_iter()
+            .map(|(cid, (indexed, queued))| {
+                let title = self
+                    .map
+                    .get(&cid)
+                    .map(|r| r.title.clone())
+                    .unwrap_or_default();
+                (cid, indexed, queued, title)
+            })
+            .collect();
+        roots.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then(b.2.cmp(&a.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        roots
+    }
+
     pub fn keyword_length(&self) -> usize {
         self.keywords.len()
     }
@@ -838,6 +868,25 @@ mod tests {
             let _ = stream.write_all(&body);
         });
         url
+    }
+
+    #[test]
+    fn root_counts_group_items_by_their_root_cid() {
+        let queue = IndexQueue::new();
+        for item in ["wiki", "wiki/wiki/A", "wiki/wiki/B", "other/x"] {
+            queue.map.insert(item.to_string(), page(item, item, &[]));
+        }
+        for item in ["wiki/wiki/C", "lone/y"] {
+            queue.queue_set.insert(item.to_string(), ());
+        }
+        assert_eq!(
+            queue.root_counts(),
+            vec![
+                ("wiki".to_string(), 3, 1, "wiki".to_string()),
+                ("other".to_string(), 1, 0, String::new()),
+                ("lone".to_string(), 0, 1, String::new()),
+            ]
+        );
     }
 
     #[test]

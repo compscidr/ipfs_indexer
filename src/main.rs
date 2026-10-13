@@ -92,6 +92,25 @@ async fn keywords(queue: web::Data<IndexQueue>) -> HttpResponse {
     HttpResponse::Ok().body(format!("Keywords: {:?}", queue.top_keywords(10)))
 }
 
+// one line per root CID: "cid<TAB>indexed<TAB>queued<TAB>title", most indexed first (#232)
+#[get("/roots")]
+async fn roots(queue: web::Data<IndexQueue>) -> HttpResponse {
+    let lines: Vec<String> = queue
+        .root_counts()
+        .into_iter()
+        .map(|(cid, indexed, queued, title)| {
+            format!(
+                "{}\t{}\t{}\t{}",
+                cid,
+                indexed,
+                queued,
+                title.replace(['\t', '\n'], " ")
+            )
+        })
+        .collect();
+    HttpResponse::Ok().body(lines.join("\n"))
+}
+
 // {item:.*} so "cid/path" submissions match too
 #[get("/enqueue/{item:.*}")]
 async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpResponse {
@@ -310,6 +329,7 @@ async fn main() -> std::io::Result<()> {
             .service(enqueue)
             .service(search)
             .service(keywords)
+            .service(roots)
             .configure(|cfg| admin::configure(cfg, admin.clone()))
     })
     // localhost by default; set BIND_ADDR=0.0.0.0:9090 to accept remote connections
