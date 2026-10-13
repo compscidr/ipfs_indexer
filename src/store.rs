@@ -325,14 +325,15 @@ impl Store {
             )?
             .query_row([], |r| r.get(0))
             .optional()?;
+        // not on empty polls: idle workers poll every 200ms
         if item.is_some() {
             self.queued.fetch_sub(1, Ordering::Relaxed);
+            info!(
+                "Store queue_pop: waited {:?}, took {:?}",
+                waited,
+                start.elapsed() - waited
+            );
         }
-        info!(
-            "Store queue_pop: waited {:?}, took {:?}",
-            waited,
-            start.elapsed() - waited
-        );
         Ok(item)
     }
 
