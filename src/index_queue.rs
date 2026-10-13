@@ -1466,7 +1466,11 @@ mod tests {
         .trim_end_matches('/')
         .to_string();
         assert!(queue.process_next(&gateway));
-        assert!(Store::open(&dir, 0).unwrap().queue_load().unwrap().is_empty());
+        assert!(Store::open(&dir, 0)
+            .unwrap()
+            .queue_load()
+            .unwrap()
+            .is_empty());
         assert!(!queue.process_next(&gateway), "nothing left");
     }
 
@@ -1560,15 +1564,26 @@ mod tests {
         // they used to linger in the in-memory index, only filtered out at search time
         let dir = temp_dir("purge-postings");
         let queue = IndexQueue::new();
-        queue.attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY).unwrap();
-        queue.persist(GOOD, &page(GOOD, "t", &[("takedownword", 1), ("shared", 1)]));
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.persist(
+            GOOD,
+            &page(GOOD, "t", &[("takedownword", 1), ("shared", 1)]),
+        );
         queue.persist(BAD, &page(BAD, "t", &[("shared", 1)]));
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", GOOD)));
         let store = queue.store.get().unwrap();
         assert!(store.postings("takedownword").unwrap().is_empty());
-        assert_eq!(store.postings("shared").unwrap(), vec![(BAD.to_string(), 1)]);
+        assert_eq!(
+            store.postings("shared").unwrap(),
+            vec![(BAD.to_string(), 1)]
+        );
         assert_eq!(queue.keyword_length(), 1);
-        assert!(!file_has(&dir, "takedownword"), "secure_delete covers postings too");
+        assert!(
+            !file_has(&dir, "takedownword"),
+            "secure_delete covers postings too"
+        );
         assert_eq!(queue.expire(-DAY), 1);
         assert_eq!(queue.keyword_length(), 0);
     }

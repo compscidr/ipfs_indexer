@@ -138,8 +138,8 @@ impl Store {
             .prepare_cached("DELETE FROM postings WHERE page = ?1 RETURNING term")?
             .query_map([page], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let mut decrement =
-            tx.prepare_cached("UPDATE terms SET pages = pages - 1 WHERE term = ?1 RETURNING pages")?;
+        let mut decrement = tx
+            .prepare_cached("UPDATE terms SET pages = pages - 1 WHERE term = ?1 RETURNING pages")?;
         let mut drop = tx.prepare_cached("DELETE FROM terms WHERE term = ?1")?;
         let mut change = 0;
         for term in removed {
@@ -155,7 +155,8 @@ impl Store {
         if change >= 0 {
             self.terms.fetch_add(change as usize, Ordering::Relaxed);
         } else {
-            self.terms.fetch_sub(change.unsigned_abs(), Ordering::Relaxed);
+            self.terms
+                .fetch_sub(change.unsigned_abs(), Ordering::Relaxed);
         }
     }
 
@@ -422,8 +423,14 @@ pub(crate) mod tests {
         );
         assert_eq!(result.excerpt, "an excerpt");
         let store = Store::open(&dir, 0).unwrap();
-        assert_eq!(store.postings("alpha").unwrap(), vec![("bafyA/x".to_string(), 3)]);
-        assert!(store.postings("beta").unwrap().is_empty(), "replaced, not merged");
+        assert_eq!(
+            store.postings("alpha").unwrap(),
+            vec![("bafyA/x".to_string(), 3)]
+        );
+        assert!(
+            store.postings("beta").unwrap().is_empty(),
+            "replaced, not merged"
+        );
         assert_eq!(store.term_count(), 1, "counted again on open");
     }
 
@@ -558,10 +565,16 @@ pub(crate) mod tests {
         drop(conn);
 
         let store = Store::open(&dir, 0).unwrap();
-        assert_eq!(store.postings("files").unwrap(), vec![("bafyA".to_string(), 3)]);
+        assert_eq!(
+            store.postings("files").unwrap(),
+            vec![("bafyA".to_string(), 3)]
+        );
         let mut alpha = store.postings("alpha").unwrap();
         alpha.sort();
-        assert_eq!(alpha, vec![("bafyA".to_string(), 1), ("bafyB".to_string(), 4)]);
+        assert_eq!(
+            alpha,
+            vec![("bafyA".to_string(), 1), ("bafyB".to_string(), 4)]
+        );
         assert_eq!(store.term_count(), 2);
         assert_eq!(store.top_terms(1).unwrap(), vec![("alpha".to_string(), 2)]);
         assert_eq!(store.load_all().unwrap().len(), 2);
