@@ -242,8 +242,17 @@ async fn main() -> std::io::Result<()> {
         * 24
         * 60
         * 60;
+    // the most of the index SQLite keeps in memory; the rest stays on disk (#231)
+    let cache_mb = match std::env::var("INDEX_CACHE_MB") {
+        Ok(value) => value.parse::<u32>().unwrap_or_else(|_| {
+            error!("INDEX_CACHE_MB must be a whole number, got {:?}", value);
+            std::process::exit(1);
+        }),
+        Err(_) => 1024,
+    };
     if let Ok(dir) = std::env::var("DATA_DIR") {
-        let attached = store::Store::open(std::path::Path::new(&dir))
+        info!("Index cache: at most {} MB in memory", cache_mb);
+        let attached = store::Store::open(std::path::Path::new(&dir), cache_mb)
             .and_then(|store| index_queue.attach_store(store, max_age_secs));
         match attached {
             Ok((loaded, blocked, expired)) => info!(
@@ -366,7 +375,7 @@ mod tests {
         let dir = store::tests::temp_dir("resources");
         let queue = IndexQueue::new();
         queue
-            .attach_store(store::Store::open(&dir).unwrap(), 86400)
+            .attach_store(store::Store::open(&dir, 0).unwrap(), 86400)
             .unwrap();
         let body = get_resources(queue).await;
         let f = fields(&body);
@@ -472,15 +481,10 @@ mod tests {
         let index_queue = web::Data::new(IndexQueue::new());
         for item in ["bafyA", "bafyB", "bafyC"] {
             let counts = HashMap::from([("word".to_string(), 1)]);
-            index_queue.map.insert(
-                item.to_string(),
-                crate::index_result::IndexResult::new(item.into(), "t".into(), "e".into(), counts),
+            index_queue.index_for_test(
+                item,
+                &crate::index_result::IndexResult::new(item.into(), "t".into(), "e".into(), counts),
             );
-            index_queue
-                .keywords
-                .entry("word".into())
-                .or_default()
-                .insert(item.into(), 1);
         }
         let app =
             test::init_service(App::new().app_data(index_queue.clone()).service(search)).await;

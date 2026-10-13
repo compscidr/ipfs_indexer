@@ -23,6 +23,7 @@ RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080   # your own gateway (h
 | `LOCAL_DENYLIST` | unset | Path to your takedown list (see [Denylists](#denylists)). |
 | `ADMIN_TOKEN` | unset | Enables the admin endpoints (used by darksearch.xyz's admin area). Mount `LOCAL_DENYLIST`'s directory read-write. |
 | `DATA_DIR` | unset | Directory for the persisted index (see [Persistence](#persistence)). Unset: in memory only. |
+| `INDEX_CACHE_MB` | `1024` | With `DATA_DIR`, the most of the index (pages and keyword index) SQLite keeps in memory; the rest is read from disk. Lower it to cap memory, raise it if searches or crawling get slow. |
 | `INDEX_MAX_AGE_DAYS` | `30` | With `DATA_DIR`, pages older than this are dropped. |
 | `GATEWAY_REQUESTS_PER_MIN` | `100` on the default public gateway, no limit with your own gateway | Spaces out gateway requests across all workers (`0` = no limit). Filebase allows 200 a minute. |
 | `RUST_LOG` | unset | Log level, e.g. `info`. |
@@ -52,10 +53,11 @@ For your own takedowns, set `LOCAL_DENYLIST=/path/to/local.deny`:
 Set `DATA_DIR` to keep the index across restarts in `$DATA_DIR/index.sqlite`.
 
 - **Stored per page:** the CID/path, title, 128-character excerpt, keyword counts and when it was indexed. Nothing else.
+- **The keyword index** (which pages each word is on, and how often) lives in the file, not in memory (#231); SQLite caches up to `INDEX_CACHE_MB` of it. An index file from before this is converted on the first start, which can take a few minutes for a large index.
 - **The crawl queue** (CID/paths waiting to be fetched, no content) is stored too, so a restart resumes the crawl. An item leaves it once it has been fetched.
 - **Startup:** both denylists are loaded first. Stored pages that are now denylisted, or older than `INDEX_MAX_AGE_DAYS`, are deleted. Only then are the remaining pages loaded, and the saved queue (minus anything now denylisted or already indexed); then crawling and serving start.
 - **Takedowns:**
-  - Whenever a denylist refresh removes pages, their rows are deleted from the file, and `secure_delete` overwrites them with zeros inside `index.sqlite`.
+  - Whenever a denylist refresh removes pages, their rows and keyword entries are deleted from the file, and `secure_delete` overwrites them with zeros inside `index.sqlite`.
   - The rollback journal is kept in memory, so plaintext copies of pages are never written to a separate journal file.
   - Erasure at the filesystem or SSD level (old blocks, wear levelling) is outside what the indexer can guarantee. Use full-disk encryption on the data volume for that.
 - **Expiry:** expired pages are dropped daily, and the seed is queued again so the crawl reaches them again.
