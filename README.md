@@ -75,5 +75,7 @@ Set `DATA_DIR` to keep the index across restarts in `$DATA_DIR/index.sqlite`.
 
 Production (ubuntu-cube, with the index on its HDD array) is deployed by the `ipfs_indexer` role in [compscidr/iac](https://github.com/compscidr/iac).
 
+To release: bump `version` in `Cargo.toml`, merge, then push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). That publishes `ghcr.io/compscidr/ipfs_indexer:v0.2.0`; set `ipfs_indexer_version` in the iac role to the tag and deploy.
+
 ## Development
 CI runs `cargo fmt --all -- --check && cargo test`, then a release build. Run the same before opening a PR. Ideas and planned work live in the [issues](https://github.com/compscidr/ipfs_indexer/issues).
