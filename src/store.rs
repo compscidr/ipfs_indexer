@@ -1,11 +1,12 @@
 use crate::index_queue::normalize;
 use crate::index_result::IndexResult;
+use log::info;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -127,7 +128,11 @@ impl Store {
         result: &IndexResult,
         indexed_at: i64,
     ) -> rusqlite::Result<()> {
+        // timed (with queue_add and queue_pop) to tell lock contention from slow disk: waited is
+        // for the connection lock, took is the transaction itself
+        let start = Instant::now();
         let mut conn = self.conn.lock().unwrap();
+        let waited = start.elapsed();
         let tx = conn.transaction()?;
         // ON CONFLICT keeps the row's id, so a re-crawl replaces its postings in place
         let id: i64 = tx.query_row(
@@ -155,6 +160,13 @@ impl Store {
         }
         tx.commit()?;
         self.adjust_terms(terms);
+        info!(
+            "Store upsert {}: {} terms, waited {:?}, took {:?}",
+            item,
+            result.keywords.len(),
+            waited,
+            start.elapsed() - waited
+        );
         Ok(())
     }
 
@@ -264,7 +276,9 @@ impl Store {
     /// Adds items to the frontier in one transaction; ones already there are ignored. Returns
     /// how many were new.
     pub fn queue_add(&self, items: &[String]) -> rusqlite::Result<usize> {
+        let start = Instant::now();
         let mut conn = self.conn.lock().unwrap();
+        let waited = start.elapsed();
         let tx = conn.transaction()?;
         let mut added = 0;
         {
@@ -275,6 +289,13 @@ impl Store {
         }
         tx.commit()?;
         self.queued.fetch_add(added, Ordering::Relaxed);
+        info!(
+            "Store queue_add: {} of {} new, waited {:?}, took {:?}",
+            added,
+            items.len(),
+            waited,
+            start.elapsed() - waited
+        );
         Ok(added)
     }
 
@@ -295,7 +316,9 @@ impl Store {
 
     /// Takes the oldest item off the frontier, or None if it's empty
     pub fn queue_pop(&self) -> rusqlite::Result<Option<String>> {
+        let start = Instant::now();
         let conn = self.conn.lock().unwrap();
+        let waited = start.elapsed();
         let item = conn
             .prepare_cached(
                 "DELETE FROM queue WHERE rowid = (SELECT min(rowid) FROM queue) RETURNING item",
@@ -305,6 +328,11 @@ impl Store {
         if item.is_some() {
             self.queued.fetch_sub(1, Ordering::Relaxed);
         }
+        info!(
+            "Store queue_pop: waited {:?}, took {:?}",
+            waited,
+            start.elapsed() - waited
+        );
         Ok(item)
     }
 
