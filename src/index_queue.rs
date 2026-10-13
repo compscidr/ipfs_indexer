@@ -7,7 +7,7 @@ use crossbeam_queue::SegQueue;
 use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Read;
 use std::ops::Not;
 use std::sync::{Mutex, OnceLock, RwLock};
@@ -68,6 +68,35 @@ fn without_keywords(result: &IndexResult) -> IndexResult {
         result.excerpt.clone(),
         HashMap::new(),
     )
+}
+
+// too common to be worth a posting per page; replaces the old "longer than 3 bytes" cutoff (#209)
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "in", "is", "it", "its",
+    "of", "on", "or", "that", "the", "this", "to", "was", "were", "with",
+];
+
+/**
+ * Split text into search terms: lowercase, split on anything not alphanumeric (Unicode-aware),
+ * stopwords dropped. Used for both indexing and queries so "Files." finds "files".
+ */
+pub fn normalize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .filter(|word| !STOPWORDS.contains(&word.as_str()))
+        .collect()
+}
+
+// counts saved before #209 were keyed by raw words ("Files."); merge them under normalized terms
+fn renormalize(counts: &HashMap<String, u32>) -> HashMap<String, u32> {
+    let mut out = HashMap::new();
+    for (word, count) in counts {
+        for term in normalize(word) {
+            *out.entry(term).or_insert(0) += count;
+        }
+    }
+    out
 }
 
 // skip anything bigger than this rather than pulling it all into memory
@@ -176,10 +205,10 @@ pub struct IndexQueue {
     // index results (cid -> result)
     pub map: DashMap<String, IndexResult>,
 
-    // used for searching: keyword -> the pages containing it. A plain HashSet inside the outer
-    // DashMap (its shard lock guards the set): a DashMap per keyword allocated its own shards,
-    // ~10 GB for 580k keywords (#220).
-    pub keywords: DashMap<String, HashSet<String>>,
+    // used for searching: keyword -> the pages containing it, with how often it appears there
+    // (for ranking, #209). A plain HashMap inside the outer DashMap (its shard lock guards it):
+    // a DashMap per keyword allocated its own shards, ~10 GB for 580k keywords (#220).
+    pub keywords: DashMap<String, HashMap<String, u32>>,
 
     // badbits and the hand-maintained local list, checked before every enqueue and fetch
     denylist: RwLock<Denylist>,
@@ -304,7 +333,7 @@ impl IndexQueue {
             if *rekeyed {
                 store.upsert(item, result, now_secs())?;
             }
-            self.index_keywords(&result.cid, &result.keywords);
+            self.index_keywords(&result.cid, &renormalize(&result.keywords));
             self.map.insert(item.clone(), without_keywords(result));
         }
         // resume the crawl (#224): pages blocked or indexed since they were queued are dropped
@@ -405,11 +434,11 @@ impl IndexQueue {
 
     // add a page's keyword counts to the search index (shared by crawling and attach_store)
     fn index_keywords(&self, key: &str, counts: &HashMap<String, u32>) {
-        for word in counts.keys() {
+        for (word, count) in counts {
             self.keywords
                 .entry(word.clone())
                 .or_default()
-                .insert(key.to_string());
+                .insert(key.to_string(), *count);
         }
     }
 
@@ -535,22 +564,52 @@ impl IndexQueue {
         all_keywords
     }
 
-    pub fn search(&self, query: String) -> Vec<IndexResult> {
-        let mut results = Vec::new();
-
-        // for the search, we could iterate through all of the indexed results and then search
-        // each result for a keyword, or instead we could do a keyword lookup in the keyword map
-        // which will give us a list of CIDs that contain the keyword.
-
-        if let Some(cids) = self.keywords.get(&query) {
-            for cid in cids.iter() {
-                if let Some(index_result) = self.map.get(cid) {
-                    results.push(index_result.clone());
-                }
-            }
+    /**
+     * Pages containing every term of the query, best first, as (total matches, the page of them
+     * from offset, at most limit long). Scored by TF-IDF: each term counts
+     * (1 + ln count on the page) * ln(1 + pages / pages with the term).
+     */
+    pub fn search(&self, query: &str, offset: usize, limit: usize) -> (usize, Vec<IndexResult>) {
+        let mut terms = normalize(query);
+        terms.sort();
+        terms.dedup();
+        let pages = self.map.len().max(1) as f64;
+        let mut scores: Option<HashMap<String, f64>> = None;
+        for term in &terms {
+            let Some(postings) = self.keywords.get(term) else {
+                return (0, Vec::new());
+            };
+            let idf = (1.0 + pages / postings.len() as f64).ln();
+            let weight = |count: u32| (1.0 + (count.max(1) as f64).ln()) * idf;
+            scores = Some(match scores {
+                None => postings
+                    .iter()
+                    .map(|(page, count)| (page.clone(), weight(*count)))
+                    .collect(),
+                // AND: keep only pages that also have this term
+                Some(scores) => scores
+                    .into_iter()
+                    .filter_map(|(page, score)| {
+                        postings
+                            .get(&page)
+                            .map(|count| (page, score + weight(*count)))
+                    })
+                    .collect(),
+            });
         }
-
-        return results;
+        // purged pages can linger in the keyword index; only what's in the map is served
+        let mut ranked: Vec<(f64, String)> = scores
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(page, _)| self.map.contains_key(page))
+            .map(|(page, score)| (score, page))
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let total = ranked.len();
+        // clone only the requested page of results, not every match
+        let page = ranked.into_iter().skip(offset).take(limit);
+        let results = page.filter_map(|(_, item)| self.map.get(&item).map(|r| r.clone()));
+        (total, results.collect())
     }
 
     pub fn start(&self, gateway: String) {
@@ -714,12 +773,8 @@ impl IndexQueue {
 
             // get the frequency of words and turn it into a btree
             // https://stackoverflow.com/questions/41220872/how-if-possible-to-sort-a-btreemap-by-value-in-rust
-            let iter = content.split_whitespace();
-            for word in iter {
-                if word.len() > 3 {
-                    let word = word.to_lowercase();
-                    *index_keywords.entry(word).or_insert(0) += 1;
-                }
+            for word in normalize(&content) {
+                *index_keywords.entry(word).or_insert(0) += 1;
             }
             self.index_keywords(&cid, &index_keywords);
 
@@ -972,8 +1027,8 @@ mod tests {
             .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
             .unwrap();
         assert_eq!((loaded, blocked, expired), (1, 0, 0));
-        assert_eq!(queue.search("goodtitle".to_string()).len(), 1);
-        assert_eq!(queue.search("shared".to_string()).len(), 1);
+        assert_eq!(queue.search("goodtitle", 0, usize::MAX).1.len(), 1);
+        assert_eq!(queue.search("shared", 0, usize::MAX).1.len(), 1);
     }
 
     #[test]
@@ -1161,9 +1216,10 @@ mod tests {
             ]
         );
         // the result's cid is re-keyed too, so search (which looks pages up by it) still finds them
-        assert_eq!(queue.search("llulltitle".to_string()).len(), 1);
+        assert_eq!(queue.search("llulltitle", 0, usize::MAX).1.len(), 1);
         assert_eq!(
-            queue.search("techtitle".to_string()).len() + queue.search("techdup".to_string()).len(),
+            queue.search("techtitle", 0, usize::MAX).1.len()
+                + queue.search("techdup", 0, usize::MAX).1.len(),
             1
         );
 
@@ -1201,7 +1257,8 @@ mod tests {
             vec![("common".to_string(), 3), ("middle".to_string(), 2)]
         );
         let mut found: Vec<String> = queue
-            .search("common".to_string())
+            .search("common", 0, usize::MAX)
+            .1
             .into_iter()
             .map(|r| r.cid)
             .collect();
@@ -1210,7 +1267,7 @@ mod tests {
         // indexing the same page twice doesn't double-count it
         queue.index_keywords("bafyP1", &HashMap::from([("common".to_string(), 1)]));
         assert_eq!(queue.top_keywords(1), vec![("common".to_string(), 3)]);
-        assert!(queue.search("absent".to_string()).is_empty());
+        assert!(queue.search("absent", 0, usize::MAX).1.is_empty());
     }
 
     #[test]
@@ -1228,7 +1285,7 @@ mod tests {
             "in-memory record carries no counts"
         );
         assert_eq!(
-            queue.search("alpha".to_string()).len(),
+            queue.search("alpha", 0, usize::MAX).1.len(),
             1,
             "still searchable"
         );
@@ -1244,7 +1301,7 @@ mod tests {
         reloaded
             .attach_store(Store::open(&dir).unwrap(), 30 * DAY)
             .unwrap();
-        assert_eq!(reloaded.search("alpha".to_string()).len(), 1);
+        assert_eq!(reloaded.search("alpha", 0, usize::MAX).1.len(), 1);
         assert!(reloaded.map.get(GOOD).unwrap().keywords.is_empty());
     }
 
@@ -1446,5 +1503,93 @@ mod tests {
         assert_eq!(queue.expire(0), 0, "expire tolerates the broken store too");
         queue.set_denylist(Denylist::parse(&format!("{}\n", GOOD))); // purge's delete fails: logs only
         assert_eq!(queue.index_length(), 0);
+    }
+
+    // index a page's text the way process_content does
+    fn index_text(queue: &IndexQueue, item: &str, text: &str) {
+        let mut counts = HashMap::new();
+        for word in normalize(text) {
+            *counts.entry(word).or_insert(0) += 1;
+        }
+        queue.index_keywords(item, &counts);
+        queue.map.insert(
+            item.to_string(),
+            IndexResult::new(item.into(), "t".into(), "e".into(), counts),
+        );
+    }
+
+    fn found(queue: &IndexQueue, query: &str) -> Vec<String> {
+        queue
+            .search(query, 0, usize::MAX)
+            .1
+            .into_iter()
+            .map(|r| r.cid)
+            .collect()
+    }
+
+    #[test]
+    fn normalize_lowercases_splits_on_punctuation_and_drops_stopwords() {
+        assert_eq!(
+            normalize("The Files. of Ada-Lovelace, NFT art: Ünïcode 3d"),
+            vec!["files", "ada", "lovelace", "nft", "art", "ünïcode", "3d"]
+        );
+        assert!(normalize(" .,- the ").is_empty());
+    }
+
+    #[test]
+    fn search_ands_terms_and_ignores_case_and_punctuation() {
+        let queue = IndexQueue::new();
+        index_text(&queue, "bafyBoth", "Ada Lovelace wrote the notes.");
+        index_text(&queue, "bafyAda", "Ada, the language");
+        index_text(&queue, "bafyNft", "an NFT art DAO");
+        assert_eq!(found(&queue, "ada lovelace"), vec!["bafyBoth"]);
+        assert_eq!(found(&queue, "LOVELACE"), vec!["bafyBoth"]);
+        assert_eq!(found(&queue, "notes"), vec!["bafyBoth"]);
+        assert_eq!(found(&queue, "nft"), vec!["bafyNft"]);
+        assert!(found(&queue, "ada nft").is_empty());
+        assert!(found(&queue, "the").is_empty());
+        assert!(found(&queue, "").is_empty());
+    }
+
+    #[test]
+    fn search_ranks_by_tf_idf_and_pages_with_offset_and_limit() {
+        let queue = IndexQueue::new();
+        index_text(&queue, "bafyOnce", "rust ipfs");
+        index_text(&queue, "bafyThrice", "rust rust rust ipfs");
+        index_text(&queue, "bafyRare", "rust ipfs crawler");
+        index_text(&queue, "bafyOther", "unrelated");
+        // more occurrences rank higher
+        assert_eq!(
+            found(&queue, "rust"),
+            vec!["bafyThrice", "bafyOnce", "bafyRare"]
+        );
+        // a rarer term outweighs extra occurrences of a common one
+        assert_eq!(found(&queue, "rust crawler"), vec!["bafyRare"]);
+        assert_eq!(found(&queue, "rust ipfs crawler")[0], "bafyRare");
+        let (total, page) = queue.search("rust", 1, 1);
+        assert_eq!(total, 3);
+        assert_eq!(
+            page.into_iter().map(|r| r.cid).collect::<Vec<_>>(),
+            vec!["bafyOnce"]
+        );
+        let (total, page) = queue.search("rust", 5, 10);
+        assert_eq!((total, page.len()), (3, 0));
+    }
+
+    #[test]
+    fn reload_renormalizes_keywords_saved_before_normalize() {
+        let dir = temp_dir("renormalize");
+        let store = Store::open(&dir).unwrap();
+        store
+            .upsert(
+                GOOD,
+                &page(GOOD, "t", &[("files.", 2), ("Files", 1)]),
+                now_secs(),
+            )
+            .unwrap();
+        let queue = IndexQueue::new();
+        queue.attach_store(store, 30 * DAY).unwrap();
+        assert_eq!(found(&queue, "Files"), vec![GOOD]);
+        assert_eq!(queue.keywords.get("files").unwrap().get(GOOD), Some(&3));
     }
 }

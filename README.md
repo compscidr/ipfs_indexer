@@ -32,7 +32,7 @@ The indexer **exits at startup** if it can't download the badbits list, read a c
 ## HTTP API
 | Endpoint | Returns |
 |---|---|
-| `GET /search/{word}` | Indexed pages containing the keyword (one lowercase word for now; see [#209](https://github.com/compscidr/ipfs_indexer/issues/209)). |
+| `GET /search/{query}?limit=n&offset=m` | Indexed pages containing every word of the query, best first (TF-IDF). Case and punctuation are ignored, and common words like "the" are skipped. `limit` and `offset` are optional and page through the results (all of them by default). The body starts `Results for {query} ({total} total): `. |
 | `GET /enqueue/{cid}` or `/enqueue/{cid}/{path}` | Queues a page: `200` queued, `400` not a valid CID, `403` blocked by a denylist. |
 | `GET /status` | Queue length, index size, keyword count, gateway health and version on one line. |
 | `GET /resources` | `Memory: <bytes> Index file: <bytes> Disk free: <bytes>`: process RSS, the size of `index.sqlite` and free space on its filesystem (`-` without `DATA_DIR`). |

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use threadpool::ThreadPool;
@@ -106,15 +107,33 @@ async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpRe
     }
 }
 
+// ranked results; ?limit=n&offset=m pages through them (#209), all of them by default
 #[get("/search/{query}")]
-async fn search(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpResponse {
+async fn search(
+    data: web::Data<IndexQueue>,
+    item: web::Path<String>,
+    params: web::Query<HashMap<String, String>>,
+) -> HttpResponse {
     let query = item.into_inner();
-    info!("Searching for {}", query.clone());
-    let results = data.search(query.clone());
-    if results.is_empty() {
+    let number = |name: &str, default: usize| match params.get(name) {
+        None => Ok(default),
+        Some(value) => value.parse::<usize>().map_err(|_| name.to_string()),
+    };
+    let (offset, limit) = match (number("offset", 0), number("limit", usize::MAX)) {
+        (Ok(offset), Ok(limit)) => (offset, limit),
+        (Err(name), _) | (_, Err(name)) => {
+            return HttpResponse::BadRequest().body(format!("{} must be a number", name))
+        }
+    };
+    info!("Searching for {}", query);
+    let (total, results) = data.search(&query, offset, limit);
+    if total == 0 {
         HttpResponse::Ok().body(format!("No results found for {}", query))
     } else {
-        HttpResponse::Ok().body(format!("Results for {}: {:?}", query, results))
+        HttpResponse::Ok().body(format!(
+            "Results for {} ({} total): {:?}",
+            query, total, results
+        ))
     }
 }
 
@@ -446,5 +465,38 @@ mod tests {
 
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_search_limit_and_bad_params() {
+        let index_queue = web::Data::new(IndexQueue::new());
+        for item in ["bafyA", "bafyB", "bafyC"] {
+            let counts = HashMap::from([("word".to_string(), 1)]);
+            index_queue.map.insert(
+                item.to_string(),
+                crate::index_result::IndexResult::new(item.into(), "t".into(), "e".into(), counts),
+            );
+            index_queue
+                .keywords
+                .entry("word".into())
+                .or_default()
+                .insert(item.into(), 1);
+        }
+        let app =
+            test::init_service(App::new().app_data(index_queue.clone()).service(search)).await;
+
+        let req = test::TestRequest::get()
+            .uri("/search/Word?limit=2")
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.starts_with("Results for Word (3 total): "), "{}", body);
+        assert_eq!(body.matches("CID: ").count(), 2);
+
+        let req = test::TestRequest::get()
+            .uri("/search/word?offset=x")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
     }
 }
