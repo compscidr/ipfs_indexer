@@ -3,7 +3,6 @@ use crate::index_result::IndexResult;
 use crate::store::{now_secs, Store};
 use actix_web::body::MessageBody;
 use cid::Cid;
-use crossbeam_queue::SegQueue;
 use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
@@ -185,11 +184,6 @@ pub enum Enqueued {
 }
 
 pub struct IndexQueue {
-    // queue of items to index
-    // unbounded: a bounded queue dropped links once full (#224)
-    pub queue: SegQueue<String>,
-    pub queue_set: DashMap<String, ()>, // used to quickly determine duplicates in queue
-
     // index results (cid -> result)
     pub map: DashMap<String, IndexResult>,
 
@@ -200,8 +194,8 @@ pub struct IndexQueue {
     // when the gateway last answered a fetch, and the error if it didn't
     last_fetch: Mutex<Option<(Instant, Result<(), String>)>>,
 
-    // the persisted index (#106) and the inverted index (#231). Set by attach_store, or an
-    // in-memory one on first use when DATA_DIR isn't configured.
+    // the persisted index (#106), the inverted index and the crawl queue (#231). Set by
+    // attach_store, or an in-memory one on first use when DATA_DIR isn't configured.
     store: OnceLock<Store>,
 
     // persist() holds this shared across its check + insert + upsert; denylist swaps and
@@ -216,8 +210,6 @@ pub struct IndexQueue {
 impl IndexQueue {
     pub fn new() -> Self {
         IndexQueue {
-            queue: SegQueue::new(),
-            queue_set: DashMap::new(),
             map: DashMap::new(),
             denylist: RwLock::new(Denylist::empty()),
             local_denylist: RwLock::new(Denylist::empty()),
@@ -328,26 +320,23 @@ impl IndexQueue {
             self.map.insert(item.clone(), without_keywords(result));
         }
         // resume the crawl (#224): pages blocked or indexed since they were queued are dropped
-        let (mut resumed, mut dropped) = (Vec::new(), Vec::new());
+        let (mut respelled, mut dropped) = (Vec::new(), Vec::new());
         for item in store.queue_load()? {
             match self.admit(item.clone()) {
-                (_, Some(admitted)) if admitted == item => resumed.push(item),
+                (_, Some(admitted)) if admitted == item => {}
                 (_, admitted) => {
                     dropped.push(item);
-                    resumed.extend(admitted); // re-spelled canonically
+                    respelled.extend(admitted); // re-spelled canonically
                 }
             }
         }
         store.queue_remove(&dropped)?;
-        store.queue_add(&resumed)?;
+        store.queue_add(&respelled)?;
         info!(
             "Resumed {} queued items ({} dropped)",
-            resumed.len(),
+            store.queue_len(),
             dropped.len()
         );
-        for item in resumed {
-            self.queue.push(item);
-        }
         if self.store.set(store).is_err() {
             panic!("attach_store must run before the store is first used");
         }
@@ -361,11 +350,11 @@ impl IndexQueue {
 
     /// Queue each seed that isn't indexed or queued already; returns how many were queued
     pub fn reseed(&self) -> usize {
-        SEED_CIDS
+        let seeds = SEED_CIDS
             .iter()
-            .filter(|seed| !self.map.contains_key(**seed) && !self.queue_set.contains_key(**seed))
-            .filter(|seed| self.enqueue(seed.to_string()) == Enqueued::Queued)
-            .count()
+            .filter_map(|seed| self.admit(seed.to_string()).1)
+            .collect();
+        self.push_queued(seeds)
     }
 
     /**
@@ -378,11 +367,8 @@ impl IndexQueue {
         let items: Vec<String> = indexed
             .into_iter()
             .filter(|item| !self.blocked_quietly(item))
-            .filter(|item| self.queue_set.insert(item.clone(), ()).is_none())
             .collect();
-        let queued = items.len();
-        self.push_queued(items);
-        queued
+        self.push_queued(items)
     }
 
     /// Drop pages indexed more than max_age_secs ago, from the store and the map
@@ -477,22 +463,24 @@ impl IndexQueue {
         self.push_queued(new);
     }
 
-    // newly admitted items: saved first, so a pop can't race ahead of the row it later deletes
-    fn push_queued(&self, items: Vec<String>) {
+    // adds admitted items to the queue (ones already queued are skipped); returns how many were new
+    fn push_queued(&self, items: Vec<String>) -> usize {
         if items.is_empty() {
-            return;
+            return 0;
         }
-        if let Some(store) = self.store.get() {
-            if let Err(err) = store.queue_add(&items) {
-                warn!("Couldn't save {} queued items: {}", items.len(), err);
+        match self.store().queue_add(&items) {
+            Ok(added) => {
+                info!("Enqueued {} of {} items", added, items.len());
+                added
             }
-        }
-        for item in items {
-            self.queue.push(item);
+            Err(err) => {
+                warn!("Couldn't queue {} items: {}", items.len(), err);
+                0
+            }
         }
     }
 
-    /// Validates an item and marks it queued; the item is returned if it's newly queued
+    /// Validates an item; it's returned (spelled canonically) if it can be queued
     fn admit(&self, item: String) -> (Enqueued, Option<String>) {
         // one canonical spelling per page (#218); a path that climbs out of its CID is invalid
         let Some(item) = normalize_item(&item) else {
@@ -511,16 +499,11 @@ impl IndexQueue {
             trace!("Already indexed {}", item);
             return (Enqueued::Queued, None);
         }
-        if self.queue_set.insert(item.clone(), ()).is_some() {
-            info!("{} already in queue", item);
-            return (Enqueued::Queued, None);
-        }
-        info!("Enqueuing {}", item);
         (Enqueued::Queued, Some(item))
     }
 
     pub fn queue_length(&self) -> usize {
-        self.queue.len()
+        self.store().queue_len()
     }
 
     pub fn index_length(&self) -> usize {
@@ -535,8 +518,13 @@ impl IndexQueue {
         for entry in self.map.iter() {
             counts.entry(root(entry.key())).or_default().0 += 1;
         }
-        for entry in self.queue_set.iter() {
-            counts.entry(root(entry.key())).or_default().1 += 1;
+        match self.store().queue_roots() {
+            Ok(queued) => {
+                for (cid, n) in queued {
+                    counts.entry(cid).or_default().1 += n;
+                }
+            }
+            Err(err) => warn!("Couldn't count the queue by root: {}", err),
         }
         let mut roots: Vec<_> = counts
             .into_iter()
@@ -635,22 +623,21 @@ impl IndexQueue {
 
     /// Fetch and index the next queued item; false if the queue was empty
     pub fn process_next(&self, gateway: &str) -> bool {
-        let Some(item) = self.queue.pop() else {
-            return false;
+        // taken off disk now: a crash mid-fetch loses at most one item per worker
+        let item = match self.store().queue_pop() {
+            Ok(Some(item)) => item,
+            Ok(None) => return false,
+            Err(err) => {
+                warn!("Couldn't take the next queued item: {}", err);
+                return false;
+            }
         };
-        self.queue_set.remove(&item);
         if !self.is_blocked(&item) {
             warn!("Indexing {}", item);
             match self.retrieve_content(gateway.to_string(), item.clone()) {
                 Some(result) => self.persist(&item, &result),
                 // for now give up on error
                 None => warn!("Error retrieving CID {}", item),
-            }
-        }
-        // only now: a crash mid-fetch re-fetches the item after a restart instead of losing it
-        if let Some(store) = self.store.get() {
-            if let Err(err) = store.queue_remove(std::slice::from_ref(&item)) {
-                warn!("Couldn't remove {} from the saved queue: {}", item, err);
             }
         }
         true
@@ -857,9 +844,7 @@ mod tests {
         for item in ["wiki", "wiki/wiki/A", "wiki/wiki/B", "other/x"] {
             queue.map.insert(item.to_string(), page(item, item, &[]));
         }
-        for item in ["wiki/wiki/C", "lone/y"] {
-            queue.queue_set.insert(item.to_string(), ());
-        }
+        queue.push_queued(vec!["wiki/wiki/C".to_string(), "lone/y".to_string()]);
         assert_eq!(
             queue.root_counts(),
             vec![
@@ -1203,7 +1188,10 @@ mod tests {
             );
         }
         assert_eq!(queue.queue_length(), 1);
-        assert_eq!(queue.queue.pop().unwrap(), format!("{}/wiki/X", GOOD));
+        assert_eq!(
+            queue.store().queue_pop().unwrap().unwrap(),
+            format!("{}/wiki/X", GOOD)
+        );
     }
 
     #[test]
@@ -1492,7 +1480,6 @@ mod tests {
             1,
             "only the still-pending, allowed item resumes"
         );
-        assert_eq!(second.queue.pop().unwrap(), format!("{}/wiki/B", GOOD));
         assert_eq!(
             Store::open(&dir, 0).unwrap().queue_load().unwrap(),
             vec![format!("{}/wiki/B", GOOD)]

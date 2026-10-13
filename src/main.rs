@@ -198,7 +198,6 @@ async fn main() -> std::io::Result<()> {
     } else {
         info!("Gateway requests: at most {} per minute", gateway_rate);
     }
-    index_queue.reseed();
 
     // fail closed: don't crawl anything until the badbits denylist is loaded. Fetched on a plain
     // thread since the blocking client can't run inside the actix runtime.
@@ -284,6 +283,9 @@ async fn main() -> std::io::Result<()> {
             }
         }
     }
+
+    // after the store: the queue lives in it (#231)
+    index_queue.reseed();
 
     let refresh_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {

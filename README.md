@@ -54,7 +54,7 @@ Set `DATA_DIR` to keep the index across restarts in `$DATA_DIR/index.sqlite`.
 
 - **Stored per page:** the CID/path, title, 128-character excerpt, keyword counts and when it was indexed. Nothing else.
 - **The keyword index** (which pages each word is on, and how often) lives in the file, not in memory (#231); SQLite caches up to `INDEX_CACHE_MB` of it. An index file from before this is converted on the first start, which can take a few minutes for a large index.
-- **The crawl queue** (CID/paths waiting to be fetched, no content) is stored too, so a restart resumes the crawl. An item leaves it once it has been fetched.
+- **The crawl queue** (CID/paths waiting to be fetched, no content) is stored too, so a restart resumes the crawl. It lives only on disk, not in memory (#231). An item leaves it when a worker takes it, so a crash loses at most the few items being fetched.
 - **Startup:** both denylists are loaded first. Stored pages that are now denylisted, or older than `INDEX_MAX_AGE_DAYS`, are deleted. Only then are the remaining pages loaded, and the saved queue (minus anything now denylisted or already indexed); then crawling and serving start.
 - **Takedowns:**
   - Whenever a denylist refresh removes pages, their rows and keyword entries are deleted from the file, and `secure_delete` overwrites them with zeros inside `index.sqlite`.
