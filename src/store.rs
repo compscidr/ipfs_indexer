@@ -1,10 +1,13 @@
 use crate::index_queue::normalize;
 use crate::index_result::IndexResult;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /**
  * The persisted index (#106): one SQLite file, `index.sqlite`, under DATA_DIR. secure_delete
@@ -18,6 +21,9 @@ use std::sync::Mutex;
  */
 pub struct Store {
     conn: Mutex<Connection>,
+    // search's own read-only connection, so it doesn't wait behind the crawl's writes for the
+    // connection lock: it only waits out a commit. None in memory, where conn is used instead.
+    reader: Option<Mutex<Connection>>,
     // None for an in-memory store (no DATA_DIR)
     path: Option<PathBuf>,
     // rows in `terms`, kept here since counting them for every /status is a full scan
@@ -62,7 +68,13 @@ impl Store {
     pub fn open(dir: &Path, cache_mb: u32) -> rusqlite::Result<Store> {
         let path = dir.join("index.sqlite");
         let conn = Connection::open(&path)?;
-        Store::init(conn, Some(path), cache_mb)
+        let mut store = Store::init(conn, Some(path.clone()), cache_mb)?;
+        // default cache_size, not cache_mb: SQLite drops a connection's cache whenever another
+        // one commits, which the crawl does constantly, so a big one here would rarely be warm
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        reader.busy_timeout(BUSY_TIMEOUT)?;
+        store.reader = Some(Mutex::new(reader));
+        Ok(store)
     }
 
     /// For running without DATA_DIR: nothing persists, and the cache cap doesn't apply
@@ -73,6 +85,8 @@ impl Store {
     fn init(mut conn: Connection, path: Option<PathBuf>, cache_mb: u32) -> rusqlite::Result<Store> {
         conn.pragma_update(None, "secure_delete", true)?;
         conn.pragma_update(None, "journal_mode", "MEMORY")?;
+        // a commit waits for the reader's queries to finish rather than failing
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         if cache_mb > 0 {
             // negative: in KiB rather than pages
             conn.pragma_update(None, "cache_size", -(cache_mb as i64) * 1024)?;
@@ -84,9 +98,14 @@ impl Store {
         let terms: i64 = conn.query_row("SELECT count(*) FROM terms", [], |r| r.get(0))?;
         Ok(Store {
             conn: Mutex::new(conn),
+            reader: None,
             path,
             terms: AtomicUsize::new(terms as usize),
         })
+    }
+
+    fn read_conn(&self) -> MutexGuard<'_, Connection> {
+        self.reader.as_ref().unwrap_or(&self.conn).lock().unwrap()
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -213,7 +232,7 @@ impl Store {
 
     /// The pages a term is on, as (item, how often it appears there)
     pub fn postings(&self, term: &str) -> rusqlite::Result<Vec<(String, u32)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare_cached(
             "SELECT pages.item, postings.count FROM postings JOIN pages ON pages.id = postings.page
              WHERE postings.term = ?1",
@@ -228,7 +247,7 @@ impl Store {
 
     /// The n terms on the most pages
     pub fn top_terms(&self, n: usize) -> rusqlite::Result<Vec<(String, u32)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt =
             conn.prepare("SELECT term, pages FROM terms ORDER BY pages DESC, term LIMIT ?1")?;
         let rows = stmt.query_map([n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -494,6 +513,23 @@ pub(crate) mod tests {
         store.delete(&["bafyJ".to_string()]).unwrap();
         assert!(!dir.join("index.sqlite-journal").exists());
         assert!(!dir.join("index.sqlite-wal").exists());
+    }
+
+    #[test]
+    fn search_reads_while_a_write_is_in_progress() {
+        let store = Store::open(&temp_dir("reader"), 0).unwrap();
+        store
+            .upsert("bafyR", &page("bafyR", "r", &[("word", 2)]), 1)
+            .unwrap();
+        // a crawl write mid-transaction, holding the write connection
+        let mut writer = store.conn.lock().unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute("DELETE FROM postings", []).unwrap();
+        assert_eq!(
+            store.postings("word").unwrap(),
+            vec![("bafyR".to_string(), 2)],
+            "the last committed state, without waiting"
+        );
     }
 
     #[test]
