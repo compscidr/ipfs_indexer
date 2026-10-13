@@ -623,6 +623,7 @@ impl IndexQueue {
 
     /// Fetch and index the next queued item; false if the queue was empty
     pub fn process_next(&self, gateway: &str) -> bool {
+        let start = Instant::now();
         // taken off disk now: a crash mid-fetch loses at most one item per worker
         let item = match self.store().queue_pop() {
             Ok(Some(item)) => item,
@@ -639,6 +640,7 @@ impl IndexQueue {
                 // for now give up on error
                 None => warn!("Error retrieving CID {}", item),
             }
+            info!("Done {} in {:?}", item, start.elapsed());
         }
         true
     }
@@ -651,7 +653,9 @@ impl IndexQueue {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
         warn!("Retreiving {}", url);
         self.wait_for_gateway();
+        let fetch_start = Instant::now();
         let fetched = fetch_html(&url);
+        info!("Fetched {} in {:?}", cid, fetch_start.elapsed());
         let health = match &fetched {
             Err(err) if is_gateway_error(err) => Err(err.to_string()),
             _ => Ok(()),
