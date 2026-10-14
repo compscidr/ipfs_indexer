@@ -3,7 +3,7 @@ services:
   # first (re-fetched on every `up`). The kubo image's wget doesn't verify TLS, hence curl.
   # If the download fails, the previous copy is kept; with no copy at all, ipfs won't start.
   badbits:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl:8.23.0
     user: root
     volumes:
       - denylists:/denylists
