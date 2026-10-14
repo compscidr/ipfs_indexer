@@ -514,9 +514,14 @@ impl IndexQueue {
                 return 0;
             }
         };
+        // like a purge, they leave memory even if the store fails: it commits in batches, so
+        // some may be gone from disk already, and what's left is still old enough for the next
+        // expiry (or the next start) to retry
         if let Err(err) = store.delete(&old, true) {
-            warn!("Couldn't delete expired pages: {}", err);
-            return 0;
+            warn!(
+                "Couldn't delete every expired page; the next expiry retries: {}",
+                err
+            );
         }
         // old versions of re-crawled pages don't outlive the retention window either
         let cutoff = now_secs() - max_age_secs;
@@ -2093,6 +2098,34 @@ mod tests {
         assert_eq!(queue.expire(0), 0, "expire tolerates the broken store too");
         queue.set_denylist(Denylist::parse(&format!("{}\n", GOOD))); // purge's delete fails: logs only
         assert_eq!(queue.index_length(), 0);
+    }
+
+    #[test]
+    fn expiry_drops_pages_from_memory_even_if_the_store_fails_part_way() {
+        let dir = temp_dir("expire-fails");
+        seed(&dir, &[(GOOD, "agingtitle", now_secs() - 10 * DAY)]);
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        // finding the old pages works, deleting them doesn't
+        queue.store.get().unwrap().drop_table_for_test("mirrors");
+        assert_eq!(queue.expire(5 * DAY), 1);
+        assert_eq!(
+            queue.index_length(),
+            0,
+            "memory doesn't keep what disk may have lost"
+        );
+        assert_eq!(
+            queue
+                .store
+                .get()
+                .unwrap()
+                .items_older_than(now_secs())
+                .unwrap(),
+            vec![GOOD.to_string()],
+            "still on disk, for the next expiry"
+        );
     }
 
     // index a page's text the way process_content does

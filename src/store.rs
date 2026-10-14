@@ -327,10 +327,11 @@ impl Store {
     }
 
     /**
-     * Deletes pages and their mirrors in one transaction (items that are mirrors themselves are
-     * dropped too); returns how many pages went. They leave search at once. With `erase`
-     * (takedowns, expiry), the segment files holding them or any earlier version of them are
-     * rewritten without them promptly (#249).
+     * Deletes pages and their mirrors (items that are mirrors themselves are dropped too);
+     * returns how many pages went. They leave search at once. With `erase` (takedowns, expiry),
+     * the segment files holding them or any earlier version of them are rewritten without them
+     * promptly (#249). Commits every WRITE_BATCH items, so an error part-way leaves the earlier
+     * batches deleted: callers retry the whole list (expiry and startup pick up what's left).
      */
     pub fn delete(&self, items: &[String], erase: bool) -> rusqlite::Result<usize> {
         let mut deleted = 0;
@@ -539,8 +540,8 @@ impl Store {
         self.segments.flush()
     }
 
-    /// Adds items to the frontier in one transaction; ones already there are ignored. Returns
-    /// how many were new.
+    /// Adds items to the frontier, committing every WRITE_BATCH items (an error part-way keeps
+    /// the batches before it); ones already there are ignored. Returns how many were new.
     pub fn queue_add(&self, items: &[String]) -> rusqlite::Result<usize> {
         let start = Instant::now();
         let (mut added, mut waited) = (0, Duration::ZERO);
@@ -660,10 +661,15 @@ impl Store {
 
     // makes every following read/write fail, to exercise callers' error handling
     pub(crate) fn break_for_test(&self) {
+        self.drop_table_for_test("pages");
+    }
+
+    // makes only what touches `table` fail
+    pub(crate) fn drop_table_for_test(&self, table: &str) {
         self.conn
             .lock()
             .unwrap()
-            .execute_batch("DROP TABLE pages")
+            .execute_batch(&format!("DROP TABLE {}", table))
             .unwrap();
     }
 }
