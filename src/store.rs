@@ -170,6 +170,14 @@ impl Store {
              CREATE INDEX IF NOT EXISTS dead_pages_item ON dead_pages (item);",
         )?;
         recover_unflushed(&mut conn, segments.flushed_through())?;
+        // ids in the segments must never be handed out again, even if this file fell behind them
+        // (rolled back by a power loss, or wiped while segments/ was kept)
+        conn.execute(
+            "INSERT OR REPLACE INTO sqlite_sequence (name, seq)
+             VALUES ('pages', max(?1, coalesce(
+               (SELECT seq FROM sqlite_sequence WHERE name = 'pages'), 0)))",
+            [segments.flushed_through() as i64],
+        )?;
         let dead: Vec<u64> = conn
             .prepare("SELECT id FROM dead_pages")?
             .query_map([], |r| r.get::<_, i64>(0))?
@@ -735,6 +743,11 @@ fn recover_unflushed(conn: &mut Connection, flushed_through: u64) -> rusqlite::R
         "{} pages weren't flushed to a segment before the last stop; queueing them again",
         items.len()
     );
+    // their mirrors are crawled again too: the page they point at is going
+    tx.execute(
+        "INSERT OR IGNORE INTO queue (item) SELECT item FROM mirrors WHERE page > ?1",
+        [flushed_through as i64],
+    )?;
     tx.execute(
         "DELETE FROM mirrors WHERE page IN (SELECT id FROM pages WHERE id > ?1)",
         [flushed_through as i64],
@@ -825,7 +838,9 @@ fn migrate_postings_to_segments(
     )?;
     tx.commit()?;
     // secure_delete zeroed the dropped tables' pages; this gives the space back
-    conn.execute_batch("VACUUM")?;
+    if let Err(err) = conn.execute_batch("VACUUM") {
+        log::warn!("Couldn't vacuum after moving the postings: {}", err);
+    }
     Ok(())
 }
 
@@ -1358,6 +1373,7 @@ pub(crate) mod tests {
             store.postings("zzqxsegmentterm91").unwrap().is_empty(),
             "hidden at once"
         );
+        store.flush().unwrap(); // a buffered dead page must not be written by this
         store.maintain();
         assert!(
             !dir_has(&dir, "zzqxsegmentterm91"),
@@ -1429,7 +1445,9 @@ pub(crate) mod tests {
                     .unwrap();
                 store.flush().unwrap();
             }
+            assert_eq!(store.segments.segment_count(), 10);
             store.maintain(); // ten segments merge into one
+            assert_eq!(store.segments.segment_count(), 1, "merged");
         });
     }
 
@@ -1513,9 +1531,66 @@ pub(crate) mod tests {
             &fs::read(dir.join("index.sqlite")).unwrap(),
             "zzqxmigratedterm"
         ));
-        // ids kept, never reused
+        // ids kept, never reused: not even the highest one's, once its page is gone
+        store.delete(&["b".to_string()], false).unwrap();
         store.upsert("c", &page("c", "c", &[]), 1).unwrap();
         let c = store.items(&[10]).unwrap();
         assert_eq!(c.get(&10).map(String::as_str), Some("c"));
+    }
+
+    #[test]
+    fn ids_never_repeat_when_sqlite_falls_behind_the_segments() {
+        let dir = temp_dir("behind");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("old", &page("old", "o", &[("oldterm", 1)]), 1)
+            .unwrap();
+        let old = store.postings("oldterm").unwrap()[0].0;
+        store.flush().unwrap();
+        drop(store);
+        // index.sqlite lost, segments/ kept
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("index.sqlite")
+            {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("new", &page("new", "n", &[("newterm", 1)]), 1)
+            .unwrap();
+        let new = store.postings("newterm").unwrap()[0].0;
+        assert!(new > old, "{} should be above {}", new, old);
+        assert_eq!(
+            postings_by_item(&store, "newterm"),
+            vec![("new".into(), 1, 1)]
+        );
+        assert!(
+            store.items(&[old]).unwrap().is_empty(),
+            "no item has the old id"
+        );
+    }
+
+    #[test]
+    fn recovery_requeues_the_mirrors_of_unflushed_pages() {
+        let dir = temp_dir("recover-mirrors");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("lost", &hashed("lost", &[("beta", 1)], b"h"), 1)
+            .unwrap();
+        store
+            .upsert("copy", &hashed("copy", &[("beta", 1)], b"h"), 1)
+            .unwrap();
+        std::mem::forget(store);
+        let store = Store::open(&dir, 0).unwrap();
+        assert!(store.mirrors_load().unwrap().is_empty());
+        let mut queued = store.queue_load().unwrap();
+        queued.sort();
+        assert_eq!(queued, vec!["copy".to_string(), "lost".to_string()]);
     }
 }
