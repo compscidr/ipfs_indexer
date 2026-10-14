@@ -6,6 +6,8 @@ pub struct IndexResult {
     pub title: String,
     pub excerpt: String,
     pub keywords: HashMap<String, u32>, // maps keyword to occurrence count
+    // SHA-256 of the page's extracted text, to spot the same page under another root CID (#253)
+    pub text_hash: Option<Vec<u8>>,
 }
 
 impl IndexResult {
@@ -20,7 +22,13 @@ impl IndexResult {
             title: title,
             excerpt: excerpt,
             keywords: keywords,
+            text_hash: None,
         }
+    }
+
+    pub fn with_text_hash(mut self, hash: Vec<u8>) -> IndexResult {
+        self.text_hash = Some(hash);
+        self
     }
 
     /**

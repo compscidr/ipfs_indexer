@@ -1,11 +1,12 @@
 use crate::denylist::{normalize_item, Denylist};
 use crate::index_result::IndexResult;
-use crate::store::{now_secs, Store};
+use crate::store::{now_secs, Store, Upserted};
 use actix_web::body::MessageBody;
 use cid::Cid;
 use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::ops::Not;
@@ -223,6 +224,10 @@ pub struct IndexQueue {
     // index results (cid -> result)
     pub map: DashMap<String, IndexResult>,
 
+    // items not indexed because their text is the same as an indexed page's (#253): item -> that
+    // page's item. Kept so links to them aren't queued again.
+    mirrors: DashMap<String, String>,
+
     // badbits and the hand-maintained local list, checked before every enqueue and fetch
     denylist: RwLock<Denylist>,
     local_denylist: RwLock<Denylist>,
@@ -247,6 +252,7 @@ impl IndexQueue {
     pub fn new() -> Self {
         IndexQueue {
             map: DashMap::new(),
+            mirrors: DashMap::new(),
             denylist: RwLock::new(Denylist::empty()),
             local_denylist: RwLock::new(Denylist::empty()),
             last_fetch: Mutex::new(None),
@@ -355,6 +361,16 @@ impl IndexQueue {
         for (item, result) in keep.iter() {
             self.map.insert(item.clone(), without_keywords(result));
         }
+        // mirrors of the pages just deleted went with them
+        let mut blocked_mirrors = Vec::new();
+        for (item, original) in store.mirrors_load()? {
+            if self.blocked_quietly(&item) {
+                blocked_mirrors.push(item);
+            } else {
+                self.mirrors.insert(item, original);
+            }
+        }
+        store.delete(&blocked_mirrors)?;
         // resume the crawl (#224): pages blocked or indexed since they were queued are dropped
         let (mut respelled, mut dropped) = (Vec::new(), Vec::new());
         for item in store.queue_load()? {
@@ -427,22 +443,41 @@ impl IndexQueue {
         for item in &old {
             self.map.remove(item);
         }
+        let old: HashSet<&String> = old.iter().collect();
+        self.mirrors.retain(|_, original| !old.contains(original));
         old.len()
     }
 
     /**
      * Add a crawled page to the index and the store. Re-checks the denylists first: a takedown
-     * that landed while this page was being fetched must not be written back to disk.
+     * that landed while this page was being fetched must not be written back to disk. A page with
+     * the same text as one indexed already is only recorded as its mirror (#253). Returns whether
+     * the page was indexed.
      */
-    pub fn persist(&self, item: &str, result: &IndexResult) {
+    pub fn persist(&self, item: &str, result: &IndexResult) -> bool {
         let _writes = self.writes.read().unwrap();
         if self.blocked_quietly(item) || self.blocked_quietly(&result.cid) {
-            return;
+            return false;
+        }
+        match self.store().upsert(item, result, now_secs()) {
+            Ok(Upserted::Mirror(original)) => {
+                // it may have been indexed itself, before its text matched another page's
+                self.map.remove(item);
+                for mut mirror in self.mirrors.iter_mut() {
+                    if mirror.value() == item {
+                        *mirror.value_mut() = original.clone();
+                    }
+                }
+                self.mirrors.insert(item.to_string(), original);
+                return false;
+            }
+            Ok(Upserted::Indexed) => {
+                self.mirrors.remove(item);
+            }
+            Err(err) => warn!("Couldn't persist {}: {}", item, err),
         }
         self.map.insert(item.to_string(), without_keywords(result));
-        if let Err(err) = self.store().upsert(item, result, now_secs()) {
-            warn!("Couldn't persist {}: {}", item, err);
-        }
+        true
     }
 
     fn purge(&self, denylist: &Denylist) -> usize {
@@ -454,8 +489,18 @@ impl IndexQueue {
             }
             keep
         });
+        // blocked mirrors, and mirrors of the pages purged (the store drops those with the page)
+        let purged: HashSet<String> = removed.iter().cloned().collect();
+        let mut mirrors = Vec::new();
+        self.mirrors.retain(|item, original| {
+            if denylist.is_blocked(item) {
+                mirrors.push(item.clone());
+                return false;
+            }
+            !purged.contains(original)
+        });
         if let Some(store) = self.store.get() {
-            if let Err(err) = store.delete(&removed) {
+            if let Err(err) = store.delete(&[removed.as_slice(), &mirrors].concat()) {
                 warn!(
                     "Couldn't delete {} purged pages from the store: {}",
                     removed.len(),
@@ -531,7 +576,7 @@ impl IndexQueue {
         if self.is_blocked(&item) {
             return (Enqueued::Blocked, None);
         }
-        if self.map.contains_key(&item) {
+        if self.map.contains_key(&item) || self.mirrors.contains_key(&item) {
             trace!("Already indexed {}", item);
             return (Enqueued::Queued, None);
         }
@@ -579,6 +624,11 @@ impl IndexQueue {
                 .then_with(|| a.0.cmp(&b.0))
         });
         roots
+    }
+
+    /// how many crawled items weren't indexed, being the same text as an indexed page (#253)
+    pub fn mirror_length(&self) -> usize {
+        self.mirrors.len()
     }
 
     pub fn keyword_length(&self) -> usize {
@@ -701,7 +751,12 @@ impl IndexQueue {
         if !self.is_blocked(&item) {
             warn!("Indexing {}", item);
             match self.retrieve_content(gateway.to_string(), item.clone()) {
-                Some(result) => self.persist(&item, &result),
+                // a mirror's links lead to more of the mirror: the original's were followed
+                Some((result, links)) => {
+                    if self.persist(&item, &result) {
+                        self.enqueue_many(links);
+                    }
+                }
                 // for now give up on error
                 None => warn!("Error retrieving CID {}", item),
             }
@@ -714,7 +769,7 @@ impl IndexQueue {
      * Use the http client to obtain the page from the ipfs gateway. If there is a failure to
      * obtain the CID, we give up for now.
      */
-    fn retrieve_content(&self, gateway: String, cid: String) -> Option<IndexResult> {
+    fn retrieve_content(&self, gateway: String, cid: String) -> Option<(IndexResult, Vec<String>)> {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
         warn!("Retreiving {}", url);
         self.wait_for_gateway();
@@ -802,14 +857,15 @@ impl IndexQueue {
     }
 
     /**
-     * Process the content of the page, extract keywords, enqueue more cids, return the IndexResult
+     * Process the content of the page, extract keywords, return the IndexResult and the page's
+     * links
      */
     fn process_content(
         &self,
         base: &reqwest::Url,
         cid: String,
         document: Html,
-    ) -> Option<IndexResult> {
+    ) -> Option<(IndexResult, Vec<String>)> {
         let fullcid = cid.clone();
 
         let selector = Selector::parse("title").unwrap();
@@ -826,7 +882,6 @@ impl IndexQueue {
             .filter_map(|element| element.value().attr("href"))
             .filter_map(|href| resolve_link(base, href))
             .collect();
-        self.enqueue_many(links);
         let selector = Selector::parse("body").unwrap();
         let body = document.select(&selector).next();
         let mut index_keywords: HashMap<String, u32> = HashMap::new();
@@ -855,18 +910,16 @@ impl IndexQueue {
                 128
             };
             let end = content.char_indices().map(|(i, _)| i).nth(excerpt_len);
-            if end.is_some() {
-                let endunwrap = end.unwrap();
-                let excerpt = content[..endunwrap].to_string();
-                return Some(IndexResult::new(fullcid, title, excerpt, index_keywords));
-            } else {
-                return Some(IndexResult::new(
-                    fullcid,
-                    title,
-                    "".to_string(),
-                    index_keywords,
-                ));
+            let excerpt = match end {
+                Some(end) => content[..end].to_string(),
+                None => "".to_string(),
+            };
+            let mut result = IndexResult::new(fullcid, title, excerpt, index_keywords);
+            // pages without text all hash the same, and may still have links worth following
+            if !content.is_empty() {
+                result = result.with_text_hash(sha2::Sha256::digest(content.as_bytes()).to_vec());
             }
+            return Some((result, links));
         }
         None
     }
@@ -1577,6 +1630,121 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(!queue.process_next(&gateway), "nothing left");
+    }
+
+    // crawls item from a one-shot gateway serving body; returns the links it queued
+    fn crawl(queue: &IndexQueue, item: &str, body: &str) -> Vec<String> {
+        assert_eq!(queue.queue_length(), 0);
+        queue.enqueue(item.to_string());
+        let gateway = serve_once("text/html", body.as_bytes().to_vec())
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        assert!(queue.process_next(&gateway));
+        std::iter::from_fn(|| queue.store().queue_pop().unwrap()).collect()
+    }
+
+    #[test]
+    fn a_mirror_of_an_indexed_page_is_neither_indexed_nor_followed() {
+        let dir = temp_dir("mirrors");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        let (original, mirror) = (format!("{}/wiki/A", GOOD), format!("{}/wiki/A", BAD));
+        // the same text; the links (attributes, not text) differ
+        let links = crawl(
+            &queue,
+            &original,
+            "<body>same words <a href='B'></a></body>",
+        );
+        assert_eq!(links, vec![format!("{}/wiki/B", GOOD)]);
+        let links = crawl(
+            &queue,
+            &mirror,
+            "<body> same\n words <a href='C'></a></body>",
+        );
+        assert!(links.is_empty(), "the mirror's links aren't followed");
+        assert_eq!((queue.index_length(), queue.mirror_length()), (1, 1));
+        assert_eq!(found(&queue, "words"), vec![original.clone()]);
+        queue.enqueue(mirror.clone());
+        assert_eq!(queue.queue_length(), 0, "nor is it queued again");
+        // pages without text aren't mirrors of each other
+        assert_eq!(
+            crawl(
+                &queue,
+                &format!("{}/e1", GOOD),
+                "<body><a href='D'></a></body>"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            crawl(
+                &queue,
+                &format!("{}/e2", GOOD),
+                "<body><a href='E'></a></body>"
+            )
+            .len(),
+            1
+        );
+        assert_eq!((queue.index_length(), queue.mirror_length()), (3, 1));
+
+        // remembered across a restart, and expires with the original
+        drop(queue);
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        assert_eq!((queue.index_length(), queue.mirror_length()), (3, 1));
+        // indexed this second: a cutoff just past now
+        assert_eq!(queue.expire(-1), 3);
+        assert_eq!(queue.mirror_length(), 0);
+        queue.enqueue(mirror);
+        assert_eq!(queue.queue_length(), 1, "crawlable again");
+    }
+
+    #[test]
+    fn takedowns_drop_mirrors() {
+        let dir = temp_dir("mirrortakedown");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        let hashed = |item: &str| page(item, "t", &[]).with_text_hash(b"h".to_vec());
+        let (good_b, bad_b) = (format!("{}/b", GOOD), format!("{}/b", BAD));
+        assert!(queue.persist(GOOD, &hashed(GOOD)));
+        assert!(!queue.persist(&bad_b, &hashed(&bad_b)));
+        assert!(!queue.persist(&good_b, &hashed(&good_b)));
+        assert_eq!(queue.mirror_length(), 2);
+
+        // a blocked mirror goes, from disk too
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        assert_eq!(queue.mirror_length(), 1);
+        assert!(!file_has(&dir, &bad_b));
+        // so do the mirrors of a blocked original, which can then be crawled themselves
+        queue.set_denylist(Denylist::parse(&format!("{}\n", GOOD)));
+        assert_eq!((queue.index_length(), queue.mirror_length()), (0, 0));
+        assert!(Store::open(&dir, 0)
+            .unwrap()
+            .mirrors_load()
+            .unwrap()
+            .is_empty());
+
+        // and a blocked mirror is dropped on restart (blocked while the index was down)
+        let dir = temp_dir("mirrorrestart");
+        {
+            let store = Store::open(&dir, 0).unwrap();
+            store.upsert(GOOD, &hashed(GOOD), now_secs()).unwrap();
+            store.upsert(&bad_b, &hashed(&bad_b), now_secs()).unwrap();
+        }
+        let queue = IndexQueue::new();
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        assert_eq!((queue.index_length(), queue.mirror_length()), (1, 0));
+        assert!(!file_has(&dir, &bad_b));
     }
 
     #[test]
