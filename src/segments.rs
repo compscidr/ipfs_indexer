@@ -5,7 +5,8 @@
  * segments, and zeroes and removes retired files once no search still reads them.
  */
 use crate::segment::{Posting, Segment, SegmentWriter};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,13 @@ use std::time::{Duration, Instant};
 
 const FLUSH_POSTINGS: usize = 1_000_000;
 const FLUSH_AGE: Duration = Duration::from_secs(60);
+// merge this many segments of one size tier into one
+const TIER_FANOUT: usize = 10;
+// rewrite a segment on its own once this share of its pages is dead
+const DEAD_PERCENT: u64 = 20;
+// /status and /keywords read a cached top STATS_TOP for up to STATS_TTL
+const STATS_TOP: usize = 100;
+const STATS_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct Buffer {
@@ -55,6 +63,8 @@ pub struct Segments {
     wake: Condvar,
     flush_postings: usize,
     flush_age: Duration,
+    // (when, distinct terms, top STATS_TOP): a full dictionary merge is too slow for every /status
+    stats: Mutex<Option<(Instant, usize, Vec<(String, u32)>)>>,
 }
 
 /// Overwrites a file with zeros, syncs it, then removes it: unlinking alone leaves the text in
@@ -154,6 +164,7 @@ impl Segments {
             wake: Condvar::new(),
             flush_postings: FLUSH_POSTINGS,
             flush_age: FLUSH_AGE,
+            stats: Mutex::new(None),
         }
     }
 
@@ -270,6 +281,7 @@ impl Segments {
             return;
         }
         self.erase.lock().unwrap().extend(ids);
+        *self.stats.lock().unwrap() = None;
         self.wake();
     }
 
@@ -301,13 +313,21 @@ impl Segments {
     }
 
     /**
-     * One round of upkeep: flush the buffer if it's full or old. Returns the dead ids that no
-     * segment (or buffer) holds any more, whose records the caller can drop.
+     * One round of upkeep: flush the buffer if it's full or old, rewrite segments holding pages
+     * to erase (#249), merge, and erase retired files no search holds. Returns the dead ids that
+     * no segment (or buffer) holds any more, whose records the caller can drop.
      */
     pub fn maintain(&self) -> io::Result<Vec<u64>> {
         let _maintenance = self.maintenance.lock().unwrap();
-        if self.flush_due() {
-            self.flush_locked()?;
+        if self.dir.is_some() {
+            if self.flush_due() {
+                self.flush_locked()?;
+            }
+            self.erase_pending()?;
+            while let Some(inputs) = self.pick_merge() {
+                self.rewrite(&inputs)?;
+            }
+            self.retire()?;
         }
         Ok(self.prune_dead())
     }
@@ -427,6 +447,7 @@ impl Segments {
         )?;
         self.flushed_through
             .store(flushed_through, Ordering::SeqCst);
+        *self.stats.lock().unwrap() = None;
         let mut state = self.state.write().unwrap();
         state.segments = Arc::new(live);
         if clear_frozen {
@@ -456,6 +477,206 @@ impl Segments {
             dead.remove(id);
         }
         gone
+    }
+
+    // rewrites every segment holding a page marked for erasure
+    fn erase_pending(&self) -> io::Result<()> {
+        let targets: Vec<u64> = self.erase.lock().unwrap().iter().copied().collect();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let live = self.state.read().unwrap().segments.clone();
+        for segment in live.iter() {
+            if targets.iter().any(|&id| segment.contains(id)) {
+                self.rewrite(std::slice::from_ref(segment))?;
+            }
+        }
+        // done with ids no live segment holds; one marked meanwhile waits for the next round
+        let live = self.state.read().unwrap().segments.clone();
+        self.erase
+            .lock()
+            .unwrap()
+            .retain(|&id| live.iter().any(|s| s.contains(id)));
+        Ok(())
+    }
+
+    // a mostly-dead segment on its own, else TIER_FANOUT segments of one size tier
+    fn pick_merge(&self) -> Option<Vec<Arc<Segment>>> {
+        let live = self.state.read().unwrap().segments.clone();
+        let dead = self.dead.read().unwrap();
+        for segment in live.iter() {
+            let n = dead.iter().filter(|&&id| segment.contains(id)).count() as u64;
+            if n > 0 && n * 100 >= segment.info().docs * DEAD_PERCENT {
+                return Some(vec![segment.clone()]);
+            }
+        }
+        let mut tiers: BTreeMap<u32, Vec<Arc<Segment>>> = BTreeMap::new();
+        for segment in live.iter() {
+            let tier = (segment.info().bytes >> 20).max(1).ilog10();
+            tiers.entry(tier).or_default().push(segment.clone());
+        }
+        tiers.into_values().find_map(|mut tier| {
+            (tier.len() >= TIER_FANOUT).then(|| {
+                tier.truncate(TIER_FANOUT);
+                tier
+            })
+        })
+    }
+
+    // replaces `inputs` with one segment of their live pages; the inputs are retired
+    fn rewrite(&self, inputs: &[Arc<Segment>]) -> io::Result<()> {
+        let dead = self.dead.read().unwrap().clone();
+        let merged_segment = self.write_segment(|writer| {
+            // page ids never repeat across segments, but their ranges can interleave
+            let mut docs: Vec<_> = inputs.iter().map(|s| s.docs().peekable()).collect();
+            loop {
+                let next = docs
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(i, d)| d.peek().map(|&(id, _)| (id, i)))
+                    .min();
+                let Some((_, i)) = next else { break };
+                let (id, length) = docs[i].next().unwrap();
+                if !dead.contains(&id) {
+                    writer.add_doc(id, length)?;
+                }
+            }
+            let mut terms = inputs
+                .iter()
+                .map(|s| s.terms())
+                .collect::<io::Result<Vec<_>>>()?;
+            let mut heads = terms
+                .iter_mut()
+                .map(|t| t.next().transpose())
+                .collect::<io::Result<Vec<_>>>()?;
+            while let Some(term) = heads.iter().flatten().map(|h| h.0.clone()).min() {
+                let mut list = Vec::new();
+                for i in 0..heads.len() {
+                    if heads[i].as_ref().is_some_and(|h| h.0 == term) {
+                        let (_, df, offset) = heads[i].take().unwrap();
+                        let postings = inputs[i].postings_at(df, offset)?;
+                        list.extend(postings.into_iter().filter(|(id, _)| !dead.contains(id)));
+                        heads[i] = terms[i].next().transpose()?;
+                    }
+                }
+                if !list.is_empty() {
+                    list.sort_unstable();
+                    writer.add_term(&term, &list)?;
+                }
+            }
+            Ok(())
+        })?;
+        let mut live: Vec<Arc<Segment>> = self
+            .state
+            .read()
+            .unwrap()
+            .segments
+            .iter()
+            .filter(|s| !inputs.iter().any(|input| Arc::ptr_eq(s, input)))
+            .cloned()
+            .collect();
+        let added = merged_segment.clone();
+        live.extend(merged_segment);
+        if let Err(err) = self.install(live, self.flushed_through(), false) {
+            if let Some(added) = added {
+                discard(added);
+            }
+            return Err(err);
+        }
+        self.retired.lock().unwrap().extend(inputs.iter().cloned());
+        Ok(())
+    }
+
+    // erases retired files no search holds any more (only `retired` has them)
+    fn retire(&self) -> io::Result<()> {
+        let mut retired = self.retired.lock().unwrap();
+        let (ready, held): (Vec<_>, Vec<_>) = retired
+            .drain(..)
+            .partition(|segment| Arc::strong_count(segment) == 1);
+        *retired = held;
+        drop(retired);
+        for segment in ready {
+            let path = segment.path().to_path_buf();
+            drop(segment);
+            // on failure the file stays unnamed by the manifest, so the next open erases it
+            erase_file(&path)?;
+        }
+        Ok(())
+    }
+
+    /**
+     * Distinct terms, and the n on the most pages (df descending, then term), over the segments
+     * and the buffer. Like Lucene's docFreq this counts dead pages not merged away yet, so it's
+     * for /status and /keywords, not ranking. On disk it's cached (see STATS_TTL).
+     */
+    pub fn term_stats(&self, n: usize) -> io::Result<(usize, Vec<(String, u32)>)> {
+        if self.dir.is_none() || n > STATS_TOP {
+            return self.compute_term_stats(n);
+        }
+        let mut cache = self.stats.lock().unwrap();
+        if let Some((at, count, top)) = &*cache {
+            if at.elapsed() < STATS_TTL {
+                return Ok((*count, top.iter().take(n).cloned().collect()));
+            }
+        }
+        let (count, top) = self.compute_term_stats(STATS_TOP)?;
+        *cache = Some((Instant::now(), count, top.clone()));
+        Ok((count, top.into_iter().take(n).collect()))
+    }
+
+    fn compute_term_stats(&self, n: usize) -> io::Result<(usize, Vec<(String, u32)>)> {
+        type Source = Box<dyn Iterator<Item = io::Result<(Vec<u8>, u64)>>>;
+        let in_buffer = |buffer: &Buffer| -> Source {
+            let terms: Vec<_> = buffer
+                .postings
+                .iter()
+                .map(|(t, list)| Ok((t.as_bytes().to_vec(), list.len() as u64)))
+                .collect();
+            Box::new(terms.into_iter())
+        };
+        let (state, mut sources) = {
+            let buffer = self.buffer.read().unwrap();
+            let state = self.state.read().unwrap().clone();
+            (state, vec![in_buffer(&buffer)])
+        };
+        if let Some(frozen) = &state.frozen {
+            sources.push(in_buffer(frozen));
+        }
+        for segment in state.segments.iter() {
+            let terms = segment.terms()?.map(|t| t.map(|(term, df, _)| (term, df)));
+            sources.push(Box::new(terms));
+        }
+        let mut heads = sources
+            .iter_mut()
+            .map(|s| s.next().transpose())
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut count = 0;
+        // the best n so far, smallest first: (df, then the earlier term ranks higher)
+        let mut top: BinaryHeap<Reverse<(u64, Reverse<Vec<u8>>)>> = BinaryHeap::new();
+        while let Some(term) = heads.iter().flatten().map(|h| h.0.clone()).min() {
+            let mut df = 0;
+            for i in 0..heads.len() {
+                if heads[i].as_ref().is_some_and(|h| h.0 == term) {
+                    df += heads[i].take().unwrap().1;
+                    heads[i] = sources[i].next().transpose()?;
+                }
+            }
+            count += 1;
+            if n > 0 {
+                top.push(Reverse((df, Reverse(term))));
+                if top.len() > n {
+                    top.pop();
+                }
+            }
+        }
+        let mut ranked: Vec<(String, u32)> = top
+            .into_iter()
+            .map(|Reverse((df, Reverse(term)))| {
+                (String::from_utf8_lossy(&term).into_owned(), df as u32)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok((count, ranked))
     }
 
     /// Replaces every segment with one written by `fill`, for the #247 migration. What was
@@ -664,5 +885,130 @@ pub(crate) mod tests {
         segments.maintain().unwrap();
         assert_eq!(segments.segment_count(), 0);
         assert_eq!(segments.postings("a").unwrap(), vec![(1, 1, 1)]);
+    }
+
+    // one segment per page, flushed one at a time
+    fn flushed(segments: &Segments, pages: &[(u64, &[(&str, u32)])]) {
+        for &(id, pairs) in pages {
+            segments.add(id, pairs.iter().map(|p| p.1).sum(), &words(pairs));
+            segments.flush().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_takedown_rewrites_the_segment_and_leaves_no_bytes_on_disk() {
+        let dir = temp_dir("segments-erase");
+        let segments = Segments::open(&dir).unwrap();
+        // six pages in one segment: one dead page is under the 20% that triggers a rewrite alone
+        for id in 1..=6 {
+            let term = if id == 3 { "zzqxerasedterm" } else { "alpha" };
+            segments.add(id, 1, &words(&[(term, 1)]));
+        }
+        segments.flush().unwrap();
+        assert!(dir_has(&dir, "zzqxerasedterm"));
+
+        segments.set_dead(&[3]);
+        segments.mark_erase(&[3]);
+        assert_eq!(segments.maintain().unwrap(), vec![3]);
+        assert!(!dir_has(&dir, "zzqxerasedterm"));
+        assert_eq!(segments.postings("alpha").unwrap().len(), 5);
+        assert_eq!(segments.segment_count(), 1);
+    }
+
+    #[test]
+    fn without_an_erase_a_lightly_dead_segment_keeps_its_bytes() {
+        // control: proves the assertion above can fail
+        let dir = temp_dir("segments-erase-control");
+        let segments = Segments::open(&dir).unwrap();
+        for id in 1..=6 {
+            let term = if id == 3 { "zzqxkeptterm" } else { "alpha" };
+            segments.add(id, 1, &words(&[(term, 1)]));
+        }
+        segments.flush().unwrap();
+        segments.set_dead(&[3]);
+        assert!(segments.maintain().unwrap().is_empty());
+        assert!(dir_has(&dir, "zzqxkeptterm"));
+    }
+
+    #[test]
+    fn a_mostly_dead_segment_is_rewritten_alone() {
+        let dir = temp_dir("segments-mostly-dead");
+        let segments = Segments::open(&dir).unwrap();
+        flushed(&segments, &[(1, &[("zzqxsupersededterm", 1)])]);
+        segments.set_dead(&[1]);
+        assert_eq!(segments.maintain().unwrap(), vec![1]);
+        assert_eq!(segments.segment_count(), 0, "nothing left in it");
+        assert!(!dir_has(&dir, "zzqxsupersededterm"));
+    }
+
+    #[test]
+    fn ten_segments_in_a_tier_merge_into_one() {
+        let dir = temp_dir("segments-merge");
+        let segments = Segments::open(&dir).unwrap();
+        for id in 1..=10 {
+            flushed(&segments, &[(id, &[("common", id as u32), ("only", 1)])]);
+        }
+        assert_eq!(segments.segment_count(), 10);
+        let before = segments.postings("common").unwrap();
+        segments.maintain().unwrap();
+        assert_eq!(segments.segment_count(), 1);
+        assert_eq!(segments.postings("common").unwrap(), before);
+        assert_eq!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "seg"))
+                .count(),
+            1,
+            "the inputs were retired and removed"
+        );
+    }
+
+    #[test]
+    fn a_search_in_progress_keeps_retired_files_until_it_finishes() {
+        let dir = temp_dir("segments-retire");
+        let segments = Segments::open(&dir).unwrap();
+        for id in 1..=6 {
+            let term = if id == 3 { "zzqxheldterm" } else { "alpha" };
+            segments.add(id, 1, &words(&[(term, 1)]));
+        }
+        segments.flush().unwrap();
+        let snapshot = segments.snapshot();
+        segments.set_dead(&[3]);
+        segments.mark_erase(&[3]);
+        segments.maintain().unwrap();
+        assert_eq!(
+            snapshot[0].postings(b"alpha").unwrap().len(),
+            5,
+            "still readable, not zeroed under the reader"
+        );
+        drop(snapshot);
+        segments.maintain().unwrap();
+        assert!(!dir_has(&dir, "zzqxheldterm"));
+    }
+
+    #[test]
+    fn term_stats_count_and_rank_across_segments_and_the_buffer() {
+        let segments = Segments::open(&temp_dir("segments-stats")).unwrap();
+        flushed(&segments, &[(1, &[("common", 1), ("rare", 1)])]);
+        flushed(&segments, &[(2, &[("common", 1), ("middle", 1)])]);
+        segments.add(3, 2, &words(&[("common", 1), ("middle", 1)]));
+        assert_eq!(
+            segments.term_stats(2).unwrap(),
+            (
+                3,
+                vec![("common".to_string(), 3), ("middle".to_string(), 2)]
+            )
+        );
+        assert_eq!(segments.term_stats(0).unwrap().0, 3);
+        // cached until the next manifest swap
+        segments.add(4, 1, &words(&[("fresh", 1)]));
+        assert_eq!(segments.term_stats(0).unwrap().0, 3);
+        segments.flush().unwrap();
+        assert_eq!(segments.term_stats(0).unwrap().0, 4);
     }
 }
