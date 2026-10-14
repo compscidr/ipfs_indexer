@@ -44,6 +44,7 @@ A re-crawl gives the page a **new id**. The old id becomes dead, because its pos
 CREATE TABLE dead_pages (
     id      INTEGER PRIMARY KEY,  -- a page id that may still be in a segment
     item    TEXT NOT NULL,        -- so a takedown can find every version of an item
+    cid     TEXT NOT NULL,        -- and versions whose own (redirected) cid gets blocked
     died_at INTEGER NOT NULL,     -- unix seconds
     erase   INTEGER NOT NULL      -- 1: rewrite the segments holding it now
 );
@@ -60,7 +61,7 @@ CREATE TABLE dead_pages (
 ipxman 1
 next_gen <hex>
 flushed_through <id>
-<gen> <min_id> <max_id> <docs> <bytes>
+<file name> <min_id> <max_id> <docs> <bytes>
 ...
 ```
 
@@ -78,7 +79,7 @@ header    "ipxseg" , version u8 (=1)
 docs      count; then (id delta, length) per page, ascending by id
 postings  per term: blocks of up to 128 postings
             block header: n, last id (absolute), byte length of the block body,
-                          max count, min length   -- block-max data for #248, unused for now
+                          max count   -- block-max data for #248, unused for now
             block body:   id deltas, then counts
 dict      per term, sorted bytewise: shared-prefix length, suffix length, suffix bytes,
           df, offset of its first block in the postings section
@@ -127,7 +128,8 @@ footer    offsets of docs/postings/dict/sparse (u64 LE each), FNV-1a 64 of every
    - for `erase`, set `erase = 1` on every older `dead_pages` row for the same items (superseded versions).
 2. **Immediately, before `delete` returns:** add the ids to the in-memory dead set, so search stops returning them at once (as the `map` check does today). Remove their postings from the write buffer outright; it's only in RAM, so nothing needs erasing.
 3. **Wake the compactor** over a channel. It takes priority over flushes and merges, and rewrites every segment whose `[min_id, max_id]` range contains an `erase = 1` id and whose docs section actually holds it. A rewrite drops *all* dead ids in that segment, and the old files are then retired as above.
-4. **At startup,** any `erase = 1` rows left from before a crash are handled before the crawl or HTTP server starts.
+4. **Superseded versions by cid:** a purge also checks each `dead_pages` row's `item` and `cid` against the new list and marks the blocked ones `erase = 1`. This catches an old version whose cid after redirects differs from the current page's.
+5. **At startup,** any `erase = 1` rows left from before a crash are handled before the crawl or HTTP server starts.
 
 - **Expiry:** segments are written in crawl order, so expired pages are mostly whole old segments, which get retired outright instead of rewritten.
 - **Superseded versions:** `expire()` also marks `erase = 1` on `dead_pages` rows whose `died_at` is older than the max age. Old versions of re-crawled pages therefore don't outlive the retention window either.
@@ -150,7 +152,7 @@ Once at startup, when the `postings` table exists:
 - `src/store.rs`: SQLite only, plus calls into `segments` from `upsert`, `delete` and `postings`. The `postings`/`terms` SQL, `remove_postings` and `adjust_terms` go away.
 - `src/index_queue.rs`: `search()` works on ids, and `delete` callers pass `erase`.
 
-No new dependencies.
+No new dependencies. `Store::open` returns a boxed error, since the migration and segment set can fail with I/O errors as well as SQLite ones.
 
 ## Testing
 
