@@ -128,8 +128,14 @@ fn write_manifest(
     let mut file = File::create(&tmp)?;
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
+    // the rename is the commit point: once it succeeds the manifest names the new segments, so
+    // errors past it must not be reported as a failed install (the caller would erase files
+    // the manifest names). A failed directory sync only risks the rename across power loss.
     fs::rename(&tmp, dir.join("MANIFEST"))?;
-    File::open(dir)?.sync_all()
+    if let Err(err) = File::open(dir).and_then(|dir| dir.sync_all()) {
+        log::warn!("Couldn't sync the segments directory: {}", err);
+    }
+    Ok(())
 }
 
 impl Segments {
