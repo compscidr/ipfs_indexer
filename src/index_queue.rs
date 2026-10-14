@@ -275,6 +275,11 @@ impl IndexQueue {
         self.map.insert(item.to_string(), without_keywords(result));
     }
 
+    #[cfg(test)]
+    pub(crate) fn flush_for_test(&self) {
+        self.store().flush().unwrap();
+    }
+
     /// Limit gateway requests to `per_min` a minute across all workers (0 = no limit)
     pub fn set_gateway_rate(&self, per_min: u32) {
         let _ = self.throttle.set(Throttle::per_minute(per_min));
@@ -325,7 +330,8 @@ impl IndexQueue {
         max_age_secs: i64,
     ) -> rusqlite::Result<(usize, usize, usize)> {
         let cutoff = now_secs() - max_age_secs;
-        let (mut to_delete, mut blocked, mut expired) = (Vec::new(), 0, 0);
+        let (mut to_delete, mut to_erase, mut blocked, mut expired) =
+            (Vec::new(), Vec::new(), 0, 0);
         // canonical item -> result; rows stored before #218 can have paths like "wiki//../X",
         // re-keyed here (item and cid, keeping their postings) or dropped as duplicates
         let mut keep: HashMap<String, IndexResult> = HashMap::new();
@@ -333,10 +339,10 @@ impl IndexQueue {
         for (item, result, indexed_at) in store.load_all()? {
             if self.blocked_quietly(&item) || self.blocked_quietly(&result.cid) {
                 blocked += 1;
-                to_delete.push(item);
+                to_erase.push(item);
             } else if indexed_at < cutoff {
                 expired += 1;
-                to_delete.push(item);
+                to_erase.push(item);
             } else {
                 match normalize_item(&item) {
                     // climbs out of its CID: can't be served correctly
@@ -357,7 +363,8 @@ impl IndexQueue {
                 to_delete.push(item);
             }
         }
-        store.delete(&to_delete)?;
+        store.delete(&to_erase, true)?;
+        store.delete(&to_delete, false)?;
         for (item, result) in keep.iter() {
             self.map.insert(item.clone(), without_keywords(result));
         }
@@ -370,7 +377,7 @@ impl IndexQueue {
                 self.mirrors.insert(item, original);
             }
         }
-        store.delete(&blocked_mirrors)?;
+        store.delete(&blocked_mirrors, false)?;
         // resume the crawl (#224): pages blocked or indexed since they were queued are dropped
         let (mut respelled, mut dropped) = (Vec::new(), Vec::new());
         for item in store.queue_load()? {
@@ -436,7 +443,7 @@ impl IndexQueue {
                 return 0;
             }
         };
-        if let Err(err) = store.delete(&old) {
+        if let Err(err) = store.delete(&old, true) {
             warn!("Couldn't delete expired pages: {}", err);
             return 0;
         }
@@ -500,7 +507,7 @@ impl IndexQueue {
             !purged.contains(original)
         });
         if let Some(store) = self.store.get() {
-            if let Err(err) = store.delete(&[removed.as_slice(), &mirrors].concat()) {
+            if let Err(err) = store.delete(&[removed.as_slice(), &mirrors].concat(), true) {
                 warn!(
                     "Couldn't delete {} purged pages from the store: {}",
                     removed.len(),
@@ -657,8 +664,8 @@ impl IndexQueue {
         let groups = parse_query(query);
         let pages = self.map.len() as f64;
         let average = self.store().average_length().max(1.0);
-        // each distinct term's postings, read once: page -> (count, page length)
-        let mut postings: HashMap<&str, HashMap<String, (u32, u32)>> = HashMap::new();
+        // each distinct term's postings, read once: page id -> (count, page length)
+        let mut postings: HashMap<&str, HashMap<u64, (u32, u32)>> = HashMap::new();
         for group in &groups {
             for term in group {
                 if postings.contains_key(term.as_str()) {
@@ -690,7 +697,7 @@ impl IndexQueue {
             let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * length as f64 / average);
             idf * count * (BM25_K1 + 1.0) / (count + norm)
         };
-        let has = |group: &Vec<String>, page: &String| {
+        let has = |group: &Vec<String>, page: &u64| {
             group
                 .iter()
                 .any(|term| postings[term.as_str()].contains_key(page))
@@ -699,31 +706,46 @@ impl IndexQueue {
         let size = |group: &&Vec<String>| -> usize {
             group.iter().map(|term| postings[term.as_str()].len()).sum()
         };
-        let mut matches: HashSet<&String> = match groups.iter().min_by_key(size) {
+        let mut matches: HashSet<u64> = match groups.iter().min_by_key(size) {
             Some(smallest) => smallest
                 .iter()
-                .flat_map(|term| postings[term.as_str()].keys())
+                .flat_map(|term| postings[term.as_str()].keys().copied())
                 .collect(),
             None => HashSet::new(),
         };
         matches.retain(|page| groups.iter().all(|group| has(group, page)));
-        let scores = matches.into_iter().map(|page| {
-            let score: f64 = postings
-                .iter()
-                .filter_map(|(term, found)| found.get(page).map(|posting| weight(term, *posting)))
-                .sum();
-            (page.clone(), score)
-        });
-        // only what's in the map is served (a page whose store write failed isn't in postings)
-        let mut ranked: Vec<(f64, String)> = scores
-            .filter(|(page, _)| self.map.contains_key(page))
-            .map(|(page, score)| (score, page))
+        let mut ranked: Vec<(f64, u64)> = matches
+            .into_iter()
+            .map(|page| {
+                let score: f64 = postings
+                    .iter()
+                    .filter_map(|(term, found)| found.get(&page).map(|p| weight(term, *p)))
+                    .sum();
+                (score, page)
+            })
             .collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        // ties: the page indexed first
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         let total = ranked.len();
-        // clone only the requested page of results, not every match
-        let page = ranked.into_iter().skip(offset).take(limit);
-        let results = page.filter_map(|(_, item)| self.map.get(&item).map(|r| r.clone()));
+        // resolve only the requested page of results to items, not every match
+        let shown: Vec<u64> = ranked
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(_, page)| page)
+            .collect();
+        let items = match self.store().items(&shown) {
+            Ok(items) => items,
+            Err(err) => {
+                warn!("Couldn't look up search results: {}", err);
+                return (0, Vec::new());
+            }
+        };
+        // only what's in the map is served (a page deleted since its postings were read isn't)
+        let results = shown
+            .iter()
+            .filter_map(|page| items.get(page))
+            .filter_map(|item| self.map.get(item).map(|r| r.clone()));
         (total, results.collect())
     }
 
@@ -1429,8 +1451,9 @@ mod tests {
             1,
             "still searchable"
         );
+        queue.flush_for_test(); // a second Store would treat the buffered page as lost
         assert_eq!(
-            Store::open(&dir, 0).unwrap().postings("alpha").unwrap(),
+            crate::store::tests::postings_by_item(&Store::open(&dir, 0).unwrap(), "alpha"),
             vec![(GOOD.to_string(), 3, 3)],
             "counts kept on disk"
         );
@@ -1624,6 +1647,7 @@ mod tests {
         .trim_end_matches('/')
         .to_string();
         assert!(queue.process_next(&gateway));
+        queue.flush_for_test();
         assert!(Store::open(&dir, 0)
             .unwrap()
             .queue_load()
@@ -1911,7 +1935,7 @@ mod tests {
         let store = queue.store.get().unwrap();
         assert!(store.postings("takedownword").unwrap().is_empty());
         assert_eq!(
-            store.postings("shared").unwrap(),
+            crate::store::tests::postings_by_item(&store, "shared"),
             vec![(BAD.to_string(), 1, 1)]
         );
         assert_eq!(queue.keyword_length(), 1);
