@@ -6,7 +6,7 @@ use cid::Cid;
 use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::ops::Not;
 use std::sync::{Mutex, OnceLock, RwLock};
@@ -85,6 +85,42 @@ pub fn normalize(text: &str) -> Vec<String> {
         .filter(|word| !STOPWORDS.contains(&word.as_str()))
         .collect()
 }
+
+/**
+ * A query's terms as AND-ed groups of OR-ed terms (#252): a page matches if it has at least one
+ * term of every group. Words are AND-ed; an uppercase OR between two words puts them in one
+ * group, binding tighter than AND, so "rust ipfs OR filecoin" is rust AND (ipfs OR filecoin).
+ * Lowercase "or" is a stopword. A word that normalizes to several terms ("ada-lovelace") joins
+ * by its first and last term.
+ */
+fn parse_query(query: &str) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut or_next = false;
+    for word in query.split_whitespace() {
+        if word == "OR" {
+            or_next = !groups.is_empty();
+            continue;
+        }
+        let terms = normalize(word);
+        for (i, term) in terms.iter().enumerate() {
+            match groups.last_mut() {
+                Some(group) if i == 0 && or_next => {
+                    if !group.contains(term) {
+                        group.push(term.clone())
+                    }
+                }
+                _ => groups.push(vec![term.clone()]),
+            }
+        }
+        // a skipped word ("ada OR the OR nft") leaves the OR waiting for the next one
+        or_next &= terms.is_empty();
+    }
+    groups
+}
+
+// BM25's term-frequency saturation and length normalization, Lucene's and Tantivy's defaults
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
 
 // skip anything bigger than this rather than pulling it all into memory
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
@@ -560,47 +596,76 @@ impl IndexQueue {
     }
 
     /**
-     * Pages containing every term of the query, best first, as (total matches, the page of them
-     * from offset, at most limit long). Scored by TF-IDF: each term counts
-     * (1 + ln count on the page) * ln(1 + pages / pages with the term).
+     * Pages matching the query (see parse_query: every word, or any of the words joined by OR),
+     * best first, as (total matches, the page of them from offset, at most limit long). Scored by
+     * BM25 (#251), as Lucene and Tantivy do, summed over the query terms on the page: each counts
+     * idf * count * (k1 + 1) / (count + k1 * (1 - b + b * length / average length)), with
+     * idf = ln(1 + (pages - df + 0.5) / (df + 0.5)), df the pages with the term and length the
+     * page's terms. Long pages that mention a term in passing rank below focused ones.
      */
     pub fn search(&self, query: &str, offset: usize, limit: usize) -> (usize, Vec<IndexResult>) {
-        let mut terms = normalize(query);
-        terms.sort();
-        terms.dedup();
-        let pages = self.map.len().max(1) as f64;
-        let mut scores: Option<HashMap<String, f64>> = None;
-        for term in &terms {
-            let postings: HashMap<String, u32> = match self.store().postings(term) {
-                Ok(postings) if !postings.is_empty() => postings.into_iter().collect(),
-                Ok(_) => return (0, Vec::new()),
-                Err(err) => {
-                    warn!("Couldn't search for {:?}: {}", term, err);
-                    return (0, Vec::new());
+        let groups = parse_query(query);
+        let pages = self.map.len() as f64;
+        let average = self.store().average_length().max(1.0);
+        // each distinct term's postings, read once: page -> (count, page length)
+        let mut postings: HashMap<&str, HashMap<String, (u32, u32)>> = HashMap::new();
+        for group in &groups {
+            for term in group {
+                if postings.contains_key(term.as_str()) {
+                    continue;
                 }
-            };
-            let idf = (1.0 + pages / postings.len() as f64).ln();
-            let weight = |count: u32| (1.0 + (count.max(1) as f64).ln()) * idf;
-            scores = Some(match scores {
-                None => postings
-                    .iter()
-                    .map(|(page, count)| (page.clone(), weight(*count)))
-                    .collect(),
-                // AND: keep only pages that also have this term
-                Some(scores) => scores
-                    .into_iter()
-                    .filter_map(|(page, score)| {
-                        postings
-                            .get(&page)
-                            .map(|count| (page, score + weight(*count)))
-                    })
-                    .collect(),
-            });
+                match self.store().postings(term) {
+                    Ok(found) => postings.insert(
+                        term,
+                        found
+                            .into_iter()
+                            .map(|(page, count, length)| (page, (count, length)))
+                            .collect(),
+                    ),
+                    Err(err) => {
+                        warn!("Couldn't search for {:?}: {}", term, err);
+                        return (0, Vec::new());
+                    }
+                };
+            }
+            // a group none of whose terms are indexed matches nothing; skip reading the rest
+            if group.iter().all(|term| postings[term.as_str()].is_empty()) {
+                return (0, Vec::new());
+            }
         }
+        let weight = |term: &str, (count, length): (u32, u32)| {
+            let df = postings[term].len() as f64;
+            let idf = (1.0 + (pages - df + 0.5) / (df + 0.5)).ln();
+            let count = count as f64;
+            let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * length as f64 / average);
+            idf * count * (BM25_K1 + 1.0) / (count + norm)
+        };
+        let has = |group: &Vec<String>, page: &String| {
+            group
+                .iter()
+                .any(|term| postings[term.as_str()].contains_key(page))
+        };
+        // candidates from the group with the fewest postings, kept if they match every group
+        let size = |group: &&Vec<String>| -> usize {
+            group.iter().map(|term| postings[term.as_str()].len()).sum()
+        };
+        let mut matches: HashSet<&String> = match groups.iter().min_by_key(size) {
+            Some(smallest) => smallest
+                .iter()
+                .flat_map(|term| postings[term.as_str()].keys())
+                .collect(),
+            None => HashSet::new(),
+        };
+        matches.retain(|page| groups.iter().all(|group| has(group, page)));
+        let scores = matches.into_iter().map(|page| {
+            let score: f64 = postings
+                .iter()
+                .filter_map(|(term, found)| found.get(page).map(|posting| weight(term, *posting)))
+                .sum();
+            (page.clone(), score)
+        });
         // only what's in the map is served (a page whose store write failed isn't in postings)
         let mut ranked: Vec<(f64, String)> = scores
-            .unwrap_or_default()
-            .into_iter()
             .filter(|(page, _)| self.map.contains_key(page))
             .map(|(page, score)| (score, page))
             .collect();
@@ -1313,7 +1378,7 @@ mod tests {
         );
         assert_eq!(
             Store::open(&dir, 0).unwrap().postings("alpha").unwrap(),
-            vec![(GOOD.to_string(), 3)],
+            vec![(GOOD.to_string(), 3, 3)],
             "counts kept on disk"
         );
 
@@ -1575,7 +1640,55 @@ mod tests {
     }
 
     #[test]
-    fn search_ranks_by_tf_idf_and_pages_with_offset_and_limit() {
+    fn parse_query_groups_terms_joined_by_or() {
+        let groups = |query: &str| parse_query(query);
+        assert_eq!(groups("ada lovelace"), vec![vec!["ada"], vec!["lovelace"]]);
+        assert_eq!(groups("ada OR nft"), vec![vec!["ada", "nft"]]);
+        // OR binds tighter than the implicit AND
+        assert_eq!(
+            groups("rust ipfs OR filecoin"),
+            vec![vec!["rust"], vec!["ipfs", "filecoin"]]
+        );
+        assert_eq!(groups("x OR y OR z"), vec![vec!["x", "y", "z"]]);
+        // lowercase "or" is a stopword, and a stray or doubled OR is ignored
+        assert_eq!(groups("ada or nft"), vec![vec!["ada"], vec!["nft"]]);
+        assert_eq!(groups("OR ada OR OR nft OR"), vec![vec!["ada", "nft"]]);
+        // a skipped word doesn't break the chain; OR joins the words beside it in a token
+        assert_eq!(groups("ada OR the OR nft"), vec![vec!["ada", "nft"]]);
+        assert_eq!(
+            groups("ada-lovelace OR nft"),
+            vec![vec!["ada"], vec!["lovelace", "nft"]]
+        );
+        assert_eq!(groups("Ada OR ada"), vec![vec!["ada"]]);
+        assert!(groups("OR the").is_empty());
+    }
+
+    #[test]
+    fn search_ors_terms_and_scores_by_the_terms_each_page_has() {
+        let queue = IndexQueue::new();
+        index_text(&queue, "bafyBoth", "Ada Lovelace wrote the notes.");
+        index_text(&queue, "bafyAda", "Ada, the language");
+        index_text(&queue, "bafyNft", "an NFT art DAO");
+        index_text(&queue, "bafyOther", "unrelated");
+        // pages with more of the terms rank higher
+        assert_eq!(
+            found(&queue, "ada OR lovelace"),
+            vec!["bafyBoth", "bafyAda"]
+        );
+        let mut any = found(&queue, "ada OR nft");
+        any.sort();
+        assert_eq!(any, vec!["bafyAda", "bafyBoth", "bafyNft"]);
+        // a term that matches nothing doesn't empty the results
+        assert_eq!(found(&queue, "absent OR nft"), vec!["bafyNft"]);
+        assert!(found(&queue, "absent OR missing").is_empty());
+        // each AND group still has to match
+        assert_eq!(found(&queue, "notes ada OR nft"), vec!["bafyBoth"]);
+        assert!(found(&queue, "absent ada OR nft").is_empty());
+        assert_eq!(queue.search("ada OR nft", 1, 1).0, 3);
+    }
+
+    #[test]
+    fn search_ranks_by_bm25_and_pages_with_offset_and_limit() {
         let queue = IndexQueue::new();
         index_text(&queue, "bafyOnce", "rust ipfs");
         index_text(&queue, "bafyThrice", "rust rust rust ipfs");
@@ -1600,6 +1713,20 @@ mod tests {
     }
 
     #[test]
+    fn search_ranks_focused_pages_above_long_ones_mentioning_a_term_in_passing() {
+        let queue = IndexQueue::new();
+        // "bafyALong" would win the tie on item name under TF-IDF
+        index_text(
+            &queue,
+            "bafyALong",
+            "rust mentioned once among many other unrelated words about gardening cooking travel",
+        );
+        index_text(&queue, "bafyBShort", "rust crawler");
+        index_text(&queue, "bafyOther", "unrelated");
+        assert_eq!(found(&queue, "rust"), vec!["bafyBShort", "bafyALong"]);
+    }
+
+    #[test]
     fn purged_and_expired_pages_leave_the_keyword_index() {
         // they used to linger in the in-memory index, only filtered out at search time
         let dir = temp_dir("purge-postings");
@@ -1617,7 +1744,7 @@ mod tests {
         assert!(store.postings("takedownword").unwrap().is_empty());
         assert_eq!(
             store.postings("shared").unwrap(),
-            vec![(BAD.to_string(), 1)]
+            vec![(BAD.to_string(), 1, 1)]
         );
         assert_eq!(queue.keyword_length(), 1);
         assert!(

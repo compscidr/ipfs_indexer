@@ -33,7 +33,7 @@ The indexer **exits at startup** if it can't download the badbits list, read a c
 ## HTTP API
 | Endpoint | Returns |
 |---|---|
-| `GET /search/{query}?limit=n&offset=m` | Indexed pages containing every word of the query, best first (TF-IDF). Case and punctuation are ignored, and common words like "the" are skipped. `limit` and `offset` are optional and page through the results (all of them by default). The body starts `Results for {query} ({total} total): `. |
+| `GET /search/{query}?limit=n&offset=m` | Indexed pages containing every word of the query, best first (BM25, summed over the query words each page has, so a long page that mentions a word in passing ranks below a focused one). `OR` (uppercase) between words matches any of them: `ipfs OR filecoin`. It binds tighter than the implicit AND, so `rust ipfs OR filecoin` is rust and (ipfs or filecoin). Case and punctuation are ignored, and common words like "the" (and lowercase "or") are skipped. `limit` and `offset` are optional and page through the results (all of them by default). The body starts `Results for {query} ({total} total): `. |
 | `GET /enqueue/{cid}` or `/enqueue/{cid}/{path}` | Queues a page: `200` queued, `400` not a valid CID, `403` blocked by a denylist. |
 | `GET /status` | Queue length, index size, keyword count, gateway health and version on one line. |
 | `GET /resources` | `Memory: <bytes> Index file: <bytes> Disk free: <bytes>`: process RSS, the size of `index.sqlite` and free space on its filesystem (`-` without `DATA_DIR`). |
