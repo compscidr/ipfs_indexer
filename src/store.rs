@@ -19,6 +19,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
  *
  * The inverted index lives here too, not in RAM (#231): `postings` (term, page, count) and
  * `terms` (term, how many pages have it). Memory is bounded by SQLite's page cache (cache_mb).
+ *
+ * IPFS has many mirrors of the same content (#253): a page whose text hashes the same as one
+ * already indexed under another item isn't indexed again, only recorded in `mirrors`.
  */
 pub struct Store {
     conn: Mutex<Connection>,
@@ -33,6 +36,14 @@ pub struct Store {
     // rows in `pages` and the sum of their lengths, for BM25's average page length (#251)
     pages: AtomicUsize,
     lengths: AtomicU64,
+}
+
+/// What upsert did with a page
+#[derive(Debug, PartialEq)]
+pub enum Upserted {
+    Indexed,
+    /// not indexed: the item given has the same text
+    Mirror(String),
 }
 
 pub fn now_secs() -> i64 {
@@ -51,7 +62,14 @@ const SCHEMA: &str = "
         excerpt    TEXT NOT NULL,
         indexed_at INTEGER NOT NULL,
         -- how many terms the page has (the sum of its postings' counts), for BM25 (#251)
-        length     INTEGER NOT NULL DEFAULT 0
+        length     INTEGER NOT NULL DEFAULT 0,
+        -- SHA-256 of the extracted text (#253); NULL for pages indexed before it was kept
+        text_hash  BLOB
+    );
+    -- items with the same text as an indexed page (#253), deleted along with that page
+    CREATE TABLE IF NOT EXISTS mirrors (
+        item TEXT PRIMARY KEY,
+        page INTEGER NOT NULL
     );
     -- the inverted index (#231): how often each term appears on each page
     CREATE TABLE IF NOT EXISTS postings (
@@ -105,8 +123,18 @@ impl Store {
         }
         migrate_keywords_column(&mut conn)?;
         conn.execute_batch(SCHEMA)?;
+        let has_text_hash: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('pages') WHERE name = 'text_hash'")?
+            .exists([])?;
+        if !has_text_hash {
+            conn.execute_batch("ALTER TABLE pages ADD COLUMN text_hash BLOB")?;
+        }
         // after the bulk load in the migration: deleting a page's postings needs it
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS postings_page ON postings (page)")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS postings_page ON postings (page);
+             CREATE INDEX IF NOT EXISTS pages_text_hash ON pages (text_hash);
+             CREATE INDEX IF NOT EXISTS mirrors_page ON mirrors (page);",
+        )?;
         migrate_page_lengths(&mut conn)?;
         let terms: i64 = conn.query_row("SELECT count(*) FROM terms", [], |r| r.get(0))?;
         let queued: i64 = conn.query_row("SELECT count(*) FROM queue", [], |r| r.get(0))?;
@@ -134,19 +162,61 @@ impl Store {
         self.path.as_deref()
     }
 
-    /// Adds or replaces a page and its postings (from result.keywords) in one transaction
+    /**
+     * Adds or replaces a page and its postings (from result.keywords) in one transaction. If
+     * another item already has the same text (result.text_hash), the page isn't indexed: it's
+     * recorded as a mirror of that one instead.
+     */
     pub fn upsert(
         &self,
         item: &str,
         result: &IndexResult,
         indexed_at: i64,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<Upserted> {
         // timed (with queue_add and queue_pop) to tell lock contention from slow disk: waited is
         // for the connection lock, took is the transaction itself
         let start = Instant::now();
         let mut conn = self.conn.lock().unwrap();
         let waited = start.elapsed();
         let tx = conn.transaction()?;
+        if let Some(hash) = &result.text_hash {
+            let original: Option<(i64, String)> = tx
+                .prepare_cached("SELECT id, item FROM pages WHERE text_hash = ?1 AND item != ?2")?
+                .query_row(params![hash, item], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if let Some((page, original)) = original {
+                // indexed under this item before its text matched: drop it, and point its own
+                // mirrors at the original instead
+                let (terms, length) = match self.remove_page(&tx, item)? {
+                    Some((old, terms, length)) => {
+                        tx.prepare_cached("UPDATE mirrors SET page = ?2 WHERE page = ?1")?
+                            .execute(params![old, page])?;
+                        (terms, Some(length))
+                    }
+                    None => (0, None),
+                };
+                tx.prepare_cached(
+                    "INSERT INTO mirrors (item, page) VALUES (?1, ?2)
+                     ON CONFLICT (item) DO UPDATE SET page = excluded.page",
+                )?
+                .execute(params![item, page])?;
+                tx.commit()?;
+                self.adjust_terms(terms);
+                if let Some(length) = length {
+                    self.adjust_lengths(1, length);
+                }
+                info!(
+                    "Store upsert {}: mirror of {}, waited {:?}, took {:?}",
+                    item,
+                    original,
+                    waited,
+                    start.elapsed() - waited
+                );
+                return Ok(Upserted::Mirror(original));
+            }
+        }
+        tx.prepare_cached("DELETE FROM mirrors WHERE item = ?1")?
+            .execute([item])?;
         let length: i64 = result.keywords.values().map(|&count| count as i64).sum();
         let old_length: Option<i64> = tx
             .prepare_cached("SELECT length FROM pages WHERE item = ?1")?
@@ -154,11 +224,11 @@ impl Store {
             .optional()?;
         // ON CONFLICT keeps the row's id, so a re-crawl replaces its postings in place
         let id: i64 = tx.query_row(
-            "INSERT INTO pages (item, cid, title, excerpt, indexed_at, length)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO pages (item, cid, title, excerpt, indexed_at, length, text_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (item) DO UPDATE SET cid = excluded.cid, title = excluded.title,
                excerpt = excluded.excerpt, indexed_at = excluded.indexed_at,
-               length = excluded.length
+               length = excluded.length, text_hash = excluded.text_hash
              RETURNING id",
             params![
                 item,
@@ -166,7 +236,8 @@ impl Store {
                 result.title,
                 result.excerpt,
                 indexed_at,
-                length
+                length,
+                result.text_hash
             ],
             |r| r.get(0),
         )?;
@@ -201,7 +272,24 @@ impl Store {
             waited,
             start.elapsed() - waited
         );
-        Ok(())
+        Ok(Upserted::Indexed)
+    }
+
+    // deletes an item's page and postings; returns its id, the change in the number of terms and
+    // its length
+    fn remove_page(
+        &self,
+        tx: &Transaction,
+        item: &str,
+    ) -> rusqlite::Result<Option<(i64, isize, u64)>> {
+        let row: Option<(i64, i64)> = tx
+            .prepare_cached("DELETE FROM pages WHERE item = ?1 RETURNING id, length")?
+            .query_row([item], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        match row {
+            Some((id, length)) => Ok(Some((id, self.remove_postings(tx, id)?, length as u64))),
+            None => Ok(None),
+        }
     }
 
     // deletes a page's postings and decrements their terms (dropping terms no page has any
@@ -239,21 +327,24 @@ impl Store {
         self.lengths.fetch_sub(length, Ordering::Relaxed);
     }
 
-    /// Deletes pages and their postings in one transaction; returns how many pages went
+    /**
+     * Deletes pages, their postings and their mirrors in one transaction (items that are mirrors
+     * themselves are dropped too); returns how many pages went
+     */
     pub fn delete(&self, items: &[String]) -> rusqlite::Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let (mut deleted, mut terms, mut length) = (0, 0, 0);
         {
-            let mut stmt = tx.prepare("DELETE FROM pages WHERE item = ?1 RETURNING id, length")?;
+            let mut mirror = tx.prepare("DELETE FROM mirrors WHERE item = ?1")?;
+            let mut mirrors_of = tx.prepare("DELETE FROM mirrors WHERE page = ?1")?;
             for item in items {
-                let row: Option<(i64, i64)> = stmt
-                    .query_row([item], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .optional()?;
-                if let Some((id, page_length)) = row {
+                mirror.execute([item])?;
+                if let Some((id, change, page_length)) = self.remove_page(&tx, item)? {
                     deleted += 1;
-                    length += page_length as u64;
-                    terms += self.remove_postings(&tx, id)?;
+                    terms += change;
+                    length += page_length;
+                    mirrors_of.execute([id])?;
                 }
             }
         }
@@ -291,6 +382,16 @@ impl Store {
                 r.get(4)?,
             ))
         })?;
+        rows.collect()
+    }
+
+    /// Every mirror, as (item, the item of the page it has the same text as)
+    pub fn mirrors_load(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mirrors.item, pages.item FROM mirrors JOIN pages ON pages.id = mirrors.page",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     }
 
@@ -738,6 +839,130 @@ pub(crate) mod tests {
         assert_eq!(store.queue_pop().unwrap().as_deref(), Some("c/3"));
         assert_eq!(store.queue_pop().unwrap(), None);
         assert_eq!(store.queue_len(), 0);
+    }
+
+    fn hashed(item: &str, words: &[(&str, u32)], hash: &[u8]) -> IndexResult {
+        page(item, item, words).with_text_hash(hash.to_vec())
+    }
+
+    #[test]
+    fn a_page_with_the_same_text_is_recorded_as_a_mirror() {
+        let dir = temp_dir("mirror");
+        let store = Store::open(&dir, 0).unwrap();
+        let up = |item: &str, words: &[(&str, u32)], hash: &[u8]| {
+            store.upsert(item, &hashed(item, words, hash), 1).unwrap()
+        };
+        assert_eq!(up("bafyA/x", &[("alpha", 1)], b"h1"), Upserted::Indexed);
+        assert_eq!(
+            up("bafyB/x", &[("alpha", 1), ("beta", 1)], b"h1"),
+            Upserted::Mirror("bafyA/x".to_string())
+        );
+        assert_eq!(
+            up("bafyA/x", &[("alpha", 2)], b"h1"),
+            Upserted::Indexed,
+            "itself"
+        );
+        assert_eq!(up("bafyC", &[], b"h2"), Upserted::Indexed);
+        // pages without a hash (indexed before #253) never match
+        store.upsert("bafyD", &page("bafyD", "d", &[]), 1).unwrap();
+        assert_eq!(
+            store.upsert("bafyE", &page("bafyE", "e", &[]), 1).unwrap(),
+            Upserted::Indexed
+        );
+
+        assert_eq!(
+            store.load_all().unwrap().len(),
+            4,
+            "the mirror isn't indexed"
+        );
+        assert_eq!(
+            store.postings("alpha").unwrap(),
+            vec![("bafyA/x".to_string(), 2, 2)]
+        );
+        assert_eq!(store.term_count(), 1, "nor are its terms");
+        assert_eq!(
+            store.mirrors_load().unwrap(),
+            vec![("bafyB/x".to_string(), "bafyA/x".to_string())]
+        );
+        drop(store);
+
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(store.mirrors_load().unwrap().len(), 1, "persisted");
+        assert_eq!(store.delete(&["bafyA/x".to_string()]).unwrap(), 1);
+        assert!(
+            store.mirrors_load().unwrap().is_empty(),
+            "deleted with its page"
+        );
+        // with the original gone, the same text is indexed again
+        assert_eq!(
+            store
+                .upsert("bafyB/x", &hashed("bafyB/x", &[], b"h1"), 1)
+                .unwrap(),
+            Upserted::Indexed
+        );
+    }
+
+    #[test]
+    fn a_page_whose_text_comes_to_match_another_becomes_a_mirror() {
+        let store = Store::open(&temp_dir("remirror"), 0).unwrap();
+        let up = |item: &str, words: &[(&str, u32)], hash: &[u8]| {
+            store.upsert(item, &hashed(item, words, hash), 1).unwrap()
+        };
+        up("bafyA", &[("alpha", 1)], b"old");
+        up("bafyM", &[], b"old"); // a mirror of A
+        up("bafyB", &[("beta", 3)], b"new");
+        // A is re-crawled and now has B's text
+        assert_eq!(
+            up("bafyA", &[("beta", 3)], b"new"),
+            Upserted::Mirror("bafyB".to_string())
+        );
+        assert_eq!(store.load_all().unwrap().len(), 1);
+        assert_eq!(store.average_length(), 3.0, "A's length went with it");
+        assert!(store.postings("alpha").unwrap().is_empty());
+        assert_eq!(store.term_count(), 1);
+        let mut mirrors = store.mirrors_load().unwrap();
+        mirrors.sort();
+        assert_eq!(
+            mirrors,
+            vec![
+                ("bafyA".to_string(), "bafyB".to_string()),
+                ("bafyM".to_string(), "bafyB".to_string())
+            ]
+        );
+        // and a mirror whose text changes is indexed, no longer a mirror
+        assert_eq!(up("bafyM", &[], b"other"), Upserted::Indexed);
+        assert_eq!(store.mirrors_load().unwrap().len(), 1);
+        assert_eq!(
+            store.delete(&["bafyA".to_string()]).unwrap(),
+            0,
+            "only a mirror"
+        );
+        assert!(store.mirrors_load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn adds_the_text_hash_column_to_an_existing_index() {
+        // the schema between #231 and #253
+        let dir = temp_dir("texthash");
+        Connection::open(dir.join("index.sqlite"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE pages (id INTEGER PRIMARY KEY, item TEXT NOT NULL UNIQUE,
+                   cid TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
+                   indexed_at INTEGER NOT NULL);
+                 INSERT INTO pages VALUES (1, 'bafyA', 'bafyA', 'A', 'e', 5);",
+            )
+            .unwrap();
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(store.load_all().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .upsert("bafyB", &hashed("bafyB", &[], b"h"), 1)
+                .unwrap(),
+            Upserted::Indexed
+        );
+        drop(store);
+        assert_eq!(Store::open(&dir, 0).unwrap().load_all().unwrap().len(), 2);
     }
 
     #[test]
