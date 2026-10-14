@@ -275,6 +275,41 @@ impl IndexQueue {
         self.map.insert(item.to_string(), without_keywords(result));
     }
 
+    #[cfg(test)]
+    pub(crate) fn flush_for_test(&self) {
+        self.store().flush().unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn maintain_for_test(&self) {
+        self.store().maintain();
+    }
+
+    /// Waits for, then runs, one round of index upkeep (#247): flushes, erasures (#249) and
+    /// retired files. For a dedicated thread.
+    pub fn maintain_store(&self) {
+        let store = self.store();
+        store.wait_for_maintenance();
+        store.upkeep();
+    }
+
+    /// Waits for, then runs, the segment merges due (#247). For a thread of its own: a merge can
+    /// take minutes, and flushes and erasures don't wait for it.
+    pub fn merge_store(&self) {
+        let store = self.store();
+        store.wait_for_merge();
+        store.merge();
+    }
+
+    /// Writes buffered postings to disk, for a clean shutdown
+    pub fn flush_store(&self) {
+        if let Some(store) = self.store.get() {
+            if let Err(err) = store.flush() {
+                warn!("Couldn't flush the index: {}", err);
+            }
+        }
+    }
+
     /// Limit gateway requests to `per_min` a minute across all workers (0 = no limit)
     pub fn set_gateway_rate(&self, per_min: u32) {
         let _ = self.throttle.set(Throttle::per_minute(per_min));
@@ -325,7 +360,8 @@ impl IndexQueue {
         max_age_secs: i64,
     ) -> rusqlite::Result<(usize, usize, usize)> {
         let cutoff = now_secs() - max_age_secs;
-        let (mut to_delete, mut blocked, mut expired) = (Vec::new(), 0, 0);
+        let (mut to_delete, mut to_erase, mut blocked, mut expired) =
+            (Vec::new(), Vec::new(), 0, 0);
         // canonical item -> result; rows stored before #218 can have paths like "wiki//../X",
         // re-keyed here (item and cid, keeping their postings) or dropped as duplicates
         let mut keep: HashMap<String, IndexResult> = HashMap::new();
@@ -333,10 +369,10 @@ impl IndexQueue {
         for (item, result, indexed_at) in store.load_all()? {
             if self.blocked_quietly(&item) || self.blocked_quietly(&result.cid) {
                 blocked += 1;
-                to_delete.push(item);
+                to_erase.push(item);
             } else if indexed_at < cutoff {
                 expired += 1;
-                to_delete.push(item);
+                to_erase.push(item);
             } else {
                 match normalize_item(&item) {
                     // climbs out of its CID: can't be served correctly
@@ -357,7 +393,8 @@ impl IndexQueue {
                 to_delete.push(item);
             }
         }
-        store.delete(&to_delete)?;
+        store.delete(&to_erase, true)?;
+        store.delete(&to_delete, false)?;
         for (item, result) in keep.iter() {
             self.map.insert(item.clone(), without_keywords(result));
         }
@@ -370,7 +407,7 @@ impl IndexQueue {
                 self.mirrors.insert(item, original);
             }
         }
-        store.delete(&blocked_mirrors)?;
+        store.delete(&blocked_mirrors, false)?;
         // resume the crawl (#224): pages blocked or indexed since they were queued are dropped
         let (mut respelled, mut dropped) = (Vec::new(), Vec::new());
         for item in store.queue_load()? {
@@ -389,6 +426,15 @@ impl IndexQueue {
             store.queue_len(),
             dropped.len()
         );
+        // versions blocked while the index was down, then the erasures, before serving (#249)
+        let blocked_versions: Vec<u64> = store
+            .dead_versions()?
+            .into_iter()
+            .filter(|(_, item, cid, _)| self.blocked_quietly(item) || self.blocked_quietly(cid))
+            .map(|(id, ..)| id)
+            .collect();
+        store.erase_ids(&blocked_versions)?;
+        store.maintain();
         if self.store.set(store).is_err() {
             panic!("attach_store must run before the store is first used");
         }
@@ -436,9 +482,24 @@ impl IndexQueue {
                 return 0;
             }
         };
-        if let Err(err) = store.delete(&old) {
+        if let Err(err) = store.delete(&old, true) {
             warn!("Couldn't delete expired pages: {}", err);
             return 0;
+        }
+        // old versions of re-crawled pages don't outlive the retention window either
+        let cutoff = now_secs() - max_age_secs;
+        match store.dead_versions() {
+            Ok(versions) => {
+                let old_versions: Vec<u64> = versions
+                    .into_iter()
+                    .filter(|(.., died_at)| *died_at < cutoff)
+                    .map(|(id, ..)| id)
+                    .collect();
+                if let Err(err) = store.erase_ids(&old_versions) {
+                    warn!("Couldn't mark expired versions to erase: {}", err);
+                }
+            }
+            Err(err) => warn!("Couldn't check old page versions: {}", err),
         }
         for item in &old {
             self.map.remove(item);
@@ -500,12 +561,33 @@ impl IndexQueue {
             !purged.contains(original)
         });
         if let Some(store) = self.store.get() {
-            if let Err(err) = store.delete(&[removed.as_slice(), &mirrors].concat()) {
+            if let Err(err) = store.delete(&[removed.as_slice(), &mirrors].concat(), true) {
                 warn!(
                     "Couldn't delete {} purged pages from the store: {}",
                     removed.len(),
                     err
                 );
+            }
+            // superseded versions whose own item or cid is now blocked, e.g. one that redirected
+            // to a cid since taken down (#249)
+            match store.dead_versions() {
+                Ok(versions) => {
+                    let blocked: Vec<u64> = versions
+                        .into_iter()
+                        .filter(|(_, item, cid, _)| {
+                            denylist.is_blocked(item) || denylist.is_blocked(cid)
+                        })
+                        .map(|(id, ..)| id)
+                        .collect();
+                    if let Err(err) = store.erase_ids(&blocked) {
+                        warn!(
+                            "Couldn't mark {} blocked versions to erase: {}",
+                            blocked.len(),
+                            err
+                        );
+                    }
+                }
+                Err(err) => warn!("Couldn't check old page versions: {}", err),
             }
         }
         removed.len()
@@ -657,8 +739,8 @@ impl IndexQueue {
         let groups = parse_query(query);
         let pages = self.map.len() as f64;
         let average = self.store().average_length().max(1.0);
-        // each distinct term's postings, read once: page -> (count, page length)
-        let mut postings: HashMap<&str, HashMap<String, (u32, u32)>> = HashMap::new();
+        // each distinct term's postings, read once: page id -> (count, page length)
+        let mut postings: HashMap<&str, HashMap<u64, (u32, u32)>> = HashMap::new();
         for group in &groups {
             for term in group {
                 if postings.contains_key(term.as_str()) {
@@ -690,7 +772,7 @@ impl IndexQueue {
             let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * length as f64 / average);
             idf * count * (BM25_K1 + 1.0) / (count + norm)
         };
-        let has = |group: &Vec<String>, page: &String| {
+        let has = |group: &Vec<String>, page: &u64| {
             group
                 .iter()
                 .any(|term| postings[term.as_str()].contains_key(page))
@@ -699,31 +781,46 @@ impl IndexQueue {
         let size = |group: &&Vec<String>| -> usize {
             group.iter().map(|term| postings[term.as_str()].len()).sum()
         };
-        let mut matches: HashSet<&String> = match groups.iter().min_by_key(size) {
+        let mut matches: HashSet<u64> = match groups.iter().min_by_key(size) {
             Some(smallest) => smallest
                 .iter()
-                .flat_map(|term| postings[term.as_str()].keys())
+                .flat_map(|term| postings[term.as_str()].keys().copied())
                 .collect(),
             None => HashSet::new(),
         };
         matches.retain(|page| groups.iter().all(|group| has(group, page)));
-        let scores = matches.into_iter().map(|page| {
-            let score: f64 = postings
-                .iter()
-                .filter_map(|(term, found)| found.get(page).map(|posting| weight(term, *posting)))
-                .sum();
-            (page.clone(), score)
-        });
-        // only what's in the map is served (a page whose store write failed isn't in postings)
-        let mut ranked: Vec<(f64, String)> = scores
-            .filter(|(page, _)| self.map.contains_key(page))
-            .map(|(page, score)| (score, page))
+        let mut ranked: Vec<(f64, u64)> = matches
+            .into_iter()
+            .map(|page| {
+                let score: f64 = postings
+                    .iter()
+                    .filter_map(|(term, found)| found.get(&page).map(|p| weight(term, *p)))
+                    .sum();
+                (score, page)
+            })
             .collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        // ties: the page indexed first
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         let total = ranked.len();
-        // clone only the requested page of results, not every match
-        let page = ranked.into_iter().skip(offset).take(limit);
-        let results = page.filter_map(|(_, item)| self.map.get(&item).map(|r| r.clone()));
+        // resolve only the requested page of results to items, not every match
+        let shown: Vec<u64> = ranked
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(_, page)| page)
+            .collect();
+        let items = match self.store().items(&shown) {
+            Ok(items) => items,
+            Err(err) => {
+                warn!("Couldn't look up search results: {}", err);
+                return (0, Vec::new());
+            }
+        };
+        // only what's in the map is served (a page deleted since its postings were read isn't)
+        let results = shown
+            .iter()
+            .filter_map(|page| items.get(page))
+            .filter_map(|item| self.map.get(item).map(|r| r.clone()));
         (total, results.collect())
     }
 
@@ -1141,6 +1238,98 @@ mod tests {
     const GOOD: &str = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
     const BAD: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
+    use crate::store::tests::dir_has;
+
+    #[test]
+    fn a_takedown_hides_the_page_at_once_and_erases_it_from_every_file() {
+        let dir = temp_dir("takedown-segments");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.persist(BAD, &page(BAD, "t", &[("zzqxsegmentterm91", 2)]));
+        queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
+        queue.flush_for_test();
+        assert!(
+            dir_has(&dir, "zzqxsegmentterm91"),
+            "on disk before the takedown"
+        );
+
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        assert!(
+            queue.search("zzqxsegmentterm91", 0, 10).1.is_empty(),
+            "gone at once"
+        );
+        queue.maintain_for_test(); // what the upkeep thread does next
+        assert!(!dir_has(&dir, "zzqxsegmentterm91"));
+        assert_eq!(queue.search("alpha", 0, 10).1.len(), 1);
+    }
+
+    #[test]
+    fn a_takedown_of_an_old_versions_redirected_cid_erases_it() {
+        let dir = temp_dir("takedown-version");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        // GOOD's item once redirected to BAD's cid; it now resolves elsewhere
+        let old = page(BAD, "t", &[("zzqxredirectterm", 1)]); // its cid is BAD
+        queue.persist(GOOD, &old);
+        for i in 0..5 {
+            let item = format!("{}/other{}", GOOD, i);
+            queue.persist(&item, &page(&item, "o", &[("alpha", 1)]));
+        }
+        queue.flush_for_test();
+        queue.persist(GOOD, &page(GOOD, "t", &[("beta", 1)]));
+        queue.flush_for_test();
+        queue.maintain_for_test();
+        assert!(dir_has(&dir, "zzqxredirectterm"), "only in the old version");
+
+        queue.set_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue.maintain_for_test();
+        assert!(!dir_has(&dir, "zzqxredirectterm"));
+        assert_eq!(
+            queue.search("beta", 0, 10).1.len(),
+            1,
+            "the current page isn't blocked"
+        );
+    }
+
+    #[test]
+    fn expiry_erases_old_versions_of_a_current_page() {
+        let dir = temp_dir("expire-version");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.persist(GOOD, &page(GOOD, "t", &[("zzqxoldversionterm", 1)]));
+        for i in 0..5 {
+            let item = format!("{}/other{}", GOOD, i);
+            queue.persist(&item, &page(&item, "o", &[("alpha", 1)]));
+        }
+        queue.flush_for_test();
+        // re-crawled: the first version is superseded, and was 10 days ago
+        queue.persist(GOOD, &page(GOOD, "t", &[("beta", 1)]));
+        queue.flush_for_test();
+        rusqlite::Connection::open(dir.join("index.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE dead_pages SET died_at = ?1",
+                [now_secs() - 10 * DAY],
+            )
+            .unwrap();
+        queue.maintain_for_test();
+        assert!(
+            dir_has(&dir, "zzqxoldversionterm"),
+            "kept within the window"
+        );
+
+        assert_eq!(queue.expire(5 * DAY), 0, "the current pages are fresh");
+        queue.maintain_for_test();
+        assert!(!dir_has(&dir, "zzqxoldversionterm"));
+        assert_eq!(queue.search("beta", 0, 10).1.len(), 1);
+    }
+
     fn file_has(store_dir: &std::path::Path, needle: &str) -> bool {
         let bytes = std::fs::read(store_dir.join("index.sqlite")).unwrap();
         bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
@@ -1429,8 +1618,9 @@ mod tests {
             1,
             "still searchable"
         );
+        queue.flush_for_test(); // a second Store would treat the buffered page as lost
         assert_eq!(
-            Store::open(&dir, 0).unwrap().postings("alpha").unwrap(),
+            crate::store::tests::postings_by_item(&Store::open(&dir, 0).unwrap(), "alpha"),
             vec![(GOOD.to_string(), 3, 3)],
             "counts kept on disk"
         );
@@ -1624,6 +1814,7 @@ mod tests {
         .trim_end_matches('/')
         .to_string();
         assert!(queue.process_next(&gateway));
+        queue.flush_for_test();
         assert!(Store::open(&dir, 0)
             .unwrap()
             .queue_load()
@@ -1911,7 +2102,7 @@ mod tests {
         let store = queue.store.get().unwrap();
         assert!(store.postings("takedownword").unwrap().is_empty());
         assert_eq!(
-            store.postings("shared").unwrap(),
+            crate::store::tests::postings_by_item(&store, "shared"),
             vec![(BAD.to_string(), 1, 1)]
         );
         assert_eq!(queue.keyword_length(), 1);
@@ -1921,5 +2112,76 @@ mod tests {
         );
         assert_eq!(queue.expire(-DAY), 1);
         assert_eq!(queue.keyword_length(), 0);
+    }
+
+    #[test]
+    fn search_is_the_same_buffered_flushed_merged_and_reopened() {
+        // twelve pages with varied term counts and lengths, so BM25's order isn't trivial
+        let pages: Vec<(String, Vec<(&str, u32)>)> = (0..12u32)
+            .map(|i| {
+                let mut words = vec![("rust", i % 4 + 1), ("filler", 1 + i * 7 % 11)];
+                if i % 3 == 0 {
+                    words.push(("ipfs", 2));
+                }
+                if i % 2 == 1 {
+                    words.push(("crawler", 1 + i % 3));
+                }
+                if i == 7 {
+                    words.push(("zzqxrare", 1));
+                }
+                (format!("{}/p{}", GOOD, i), words)
+            })
+            .collect();
+        let queries = ["rust ipfs", "ipfs OR crawler", "zzqxrare", "rust"];
+        let results = |queue: &IndexQueue| -> Vec<(usize, Vec<String>)> {
+            queries
+                .iter()
+                .map(|query| {
+                    let (total, found) = queue.search(query, 0, 100);
+                    (total, found.into_iter().map(|r| r.cid).collect())
+                })
+                .collect()
+        };
+        let attached = |dir: &std::path::Path| {
+            let queue = IndexQueue::new();
+            queue
+                .attach_store(Store::open(dir, 0).unwrap(), 30 * DAY)
+                .unwrap();
+            queue
+        };
+        let segments = |queue: &IndexQueue| queue.store.get().unwrap().segment_count();
+
+        // all buffered, then flushed into one segment
+        let one = attached(&temp_dir("parity-one"));
+        for (item, words) in &pages {
+            one.index_for_test(item, &page(item, "t", words));
+        }
+        let buffered = results(&one);
+        one.flush_for_test();
+        assert_eq!(segments(&one), 1);
+        let flushed = results(&one);
+
+        // a segment per page, then ten of them merged
+        let dir = temp_dir("parity-merged");
+        let many = attached(&dir);
+        for (item, words) in &pages {
+            many.index_for_test(item, &page(item, "t", words));
+            many.flush_for_test();
+        }
+        assert_eq!(segments(&many), 12);
+        many.maintain_for_test();
+        assert_eq!(segments(&many), 3, "ten merged, two left");
+        let merged = results(&many);
+        drop(many);
+        let reopened = results(&attached(&dir));
+
+        let by_id: Vec<String> = pages.iter().map(|(item, _)| item.clone()).collect();
+        assert_eq!(buffered[3].0, 12);
+        assert_ne!(buffered[3].1, by_id, "ranked, not just in id order");
+        assert_eq!(buffered[1].0, 8, "the OR query");
+        assert_eq!(buffered[2], (1, vec![format!("{}/p7", GOOD)]));
+        assert_eq!(flushed, buffered, "after a flush");
+        assert_eq!(merged, buffered, "after a merge");
+        assert_eq!(reopened, buffered, "after a reopen");
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use threadpool::ThreadPool;
@@ -14,6 +15,8 @@ mod admin;
 mod denylist;
 mod index_queue;
 mod index_result;
+mod segment;
+mod segments;
 mod store;
 
 // crate version, plus the commit when built with GIT_SHA set (the docker build passes it)
@@ -45,7 +48,7 @@ async fn status(queue: web::Data<IndexQueue>, gateway: web::Data<Gateway>) -> Ht
     ))
 }
 
-/// Process memory, index file size and free space under DATA_DIR, in bytes ("-" if unknown) (#214)
+/// Process memory, index size (the SQLite file and segment files) and free space under DATA_DIR, in bytes ("-" if unknown) (#214)
 #[get("/resources")]
 async fn resources(queue: web::Data<IndexQueue>) -> HttpResponse {
     let path = queue.store_path();
@@ -53,13 +56,23 @@ async fn resources(queue: web::Data<IndexQueue>) -> HttpResponse {
     HttpResponse::Ok().body(format!(
         "Memory: {} Index file: {} Disk free: {}",
         show(rss_bytes()),
-        show(
-            path.as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len())
-        ),
+        show(path.as_deref().and_then(index_bytes)),
         show(path.as_deref().and_then(disk_free_bytes)),
     ))
+}
+
+// index.sqlite plus the segment files beside it (#247)
+fn index_bytes(path: &std::path::Path) -> Option<u64> {
+    let file = std::fs::metadata(path).ok()?.len();
+    let segments = path.parent().map(|dir| dir.join("segments"));
+    let segments: u64 = match segments.and_then(|dir| std::fs::read_dir(dir).ok()) {
+        Some(entries) => entries
+            .filter_map(|e| e.ok()?.metadata().ok())
+            .map(|m| m.len())
+            .sum(),
+        None => 0,
+    };
+    Some(file + segments)
 }
 
 // VmRSS from /proc/self/status (Linux only)
@@ -272,7 +285,12 @@ async fn main() -> std::io::Result<()> {
     if let Ok(dir) = std::env::var("DATA_DIR") {
         info!("Index cache: at most {} MB in memory", cache_mb);
         let attached = store::Store::open(std::path::Path::new(&dir), cache_mb)
-            .and_then(|store| index_queue.attach_store(store, max_age_secs));
+            .map_err(|err| err.to_string())
+            .and_then(|store| {
+                index_queue
+                    .attach_store(store, max_age_secs)
+                    .map_err(|err| err.to_string())
+            });
         match attached {
             Ok((loaded, blocked, expired)) => info!(
                 "Loaded {} pages from {}/index.sqlite (dropped {} blocked, {} expired)",
@@ -287,6 +305,24 @@ async fn main() -> std::io::Result<()> {
 
     // after the store: the queue lives in it (#231)
     index_queue.reseed();
+
+    // index upkeep (#247): flushes and erasing taken-down pages from disk (#249) on one thread,
+    // merges on another, so a long merge holds up neither. A panicked round is logged and the
+    // loop goes on: without it the buffer would grow unflushed and takedowns stay on disk.
+    let upkeep_queue = Arc::clone(&index_queue);
+    std::thread::spawn(move || loop {
+        let round = std::panic::catch_unwind(AssertUnwindSafe(|| upkeep_queue.maintain_store()));
+        if round.is_err() {
+            error!("Index upkeep panicked; carrying on");
+        }
+    });
+    let merge_queue = Arc::clone(&index_queue);
+    std::thread::spawn(move || loop {
+        let round = std::panic::catch_unwind(AssertUnwindSafe(|| merge_queue.merge_store()));
+        if round.is_err() {
+            error!("Index merge panicked; carrying on");
+        }
+    });
 
     let refresh_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
@@ -331,7 +367,8 @@ async fn main() -> std::io::Result<()> {
     }
 
     let gateway_data = web::Data::new(Gateway(gateway));
-    HttpServer::new(move || {
+    let flush_queue = Arc::clone(&index_queue);
+    let served = HttpServer::new(move || {
         App::new()
             .app_data(index_queue.clone())
             .app_data(gateway_data.clone())
@@ -347,7 +384,10 @@ async fn main() -> std::io::Result<()> {
     // localhost by default; set BIND_ADDR=0.0.0.0:9090 to accept remote connections
     .bind(std::env::var("BIND_ADDR").unwrap_or("127.0.0.1:9090".to_string()))?
     .run()
-    .await
+    .await;
+    // what's still buffered is written; a crash instead re-queues it on the next start
+    flush_queue.flush_store();
+    served
 }
 
 #[cfg(test)]
@@ -400,11 +440,26 @@ mod tests {
         queue
             .attach_store(store::Store::open(&dir, 0).unwrap(), 86400)
             .unwrap();
+        assert!(queue.persist(
+            "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze",
+            &store::tests::page(
+                "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze",
+                "a",
+                &[("alpha", 1)]
+            )
+        ));
+        queue.flush_for_test();
         let body = get_resources(queue).await;
         let f = fields(&body);
+        // the SQLite file plus the segment files (#247)
+        let segments: u64 = std::fs::read_dir(dir.join("segments"))
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(segments > 0);
         assert_eq!(
             f[1].parse::<u64>().unwrap(),
-            std::fs::metadata(dir.join("index.sqlite")).unwrap().len(),
+            std::fs::metadata(dir.join("index.sqlite")).unwrap().len() + segments,
             "{}",
             body
         );
