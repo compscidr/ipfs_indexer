@@ -4,7 +4,7 @@
 A search indexer for web pages published on [IPFS](https://ipfs.tech), written in Rust. It crawls IPFS content through an HTTP gateway, builds a keyword index of page titles and text, and serves it over a small HTTP API. It's the backend for [darksearch.xyz](https://www.darksearch.xyz).
 
 ## How it works
-- **Crawling:** starts from a seed CID (the IPFS Wikipedia mirror) and follows links to other IPFS pages. Ten worker threads fetch pages through a gateway; the default is the public `ipfs.filebase.io`, which allows about 200 requests a minute, so the indexer limits itself to 100 a minute there (`GATEWAY_REQUESTS_PER_MIN`).
+- **Crawling:** starts from a seed CID (the IPFS Wikipedia mirror) and follows links to other IPFS pages. Worker threads (10 by default, `CRAWL_WORKERS`) fetch pages through a gateway; the default is the public `ipfs.filebase.io`, which allows about 200 requests a minute, so the indexer limits itself to 100 a minute there (`GATEWAY_REQUESTS_PER_MIN`).
 - **Only HTML is indexed.** Responses with any other content type, or bodies over 2 MB, are skipped without being downloaded. No images, video or other media are fetched or stored.
 - **Indexing:** for each page it keeps the CID/path, title, a 128-character excerpt and keyword counts.
 - **Denylists:** the [badbits](https://badbits.dwebops.pub/) list and an optional local takedown list are checked before anything is queued or fetched, and matching pages are removed from the index.
@@ -25,6 +25,7 @@ RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080   # your own gateway (h
 | `DATA_DIR` | unset | Directory for the persisted index (see [Persistence](#persistence)). Unset: in memory only. |
 | `INDEX_CACHE_MB` | `1024` | With `DATA_DIR`, the most of `index.sqlite` (pages, queue) SQLite keeps in memory; the rest is read from disk. Lower it to cap memory, raise it if crawling gets slow. Segment files are cached by the OS instead. |
 | `INDEX_MAX_AGE_DAYS` | `30` | With `DATA_DIR`, pages older than this are dropped. |
+| `CRAWL_WORKERS` | `10` | How many pages are fetched at once. A fetch through Kubo takes about 2 s, so each worker adds roughly 30 pages a minute; raise it (e.g. `30`) with your own gateway. On the public gateway `GATEWAY_REQUESTS_PER_MIN` is the limit, not this. |
 | `GATEWAY_REQUESTS_PER_MIN` | `100` on the default public gateway, no limit with your own gateway | Spaces out gateway requests across all workers (`0` = no limit). Filebase allows 200 a minute. |
 | `RUST_LOG` | unset | Log level, e.g. `info`. |
 

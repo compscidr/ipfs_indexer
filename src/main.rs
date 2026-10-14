@@ -170,6 +170,20 @@ async fn search(
     }
 }
 
+/// How many crawl workers to run: `CRAWL_WORKERS`, or 10 when unset
+fn crawl_workers(value: Option<String>) -> Result<usize, String> {
+    match value {
+        None => Ok(10),
+        Some(value) => match value.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "CRAWL_WORKERS must be a whole number above 0, got {:?}",
+                value
+            )),
+        },
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     //uncomment to enable hardcoded logging
@@ -352,9 +366,12 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
-    // if we don't have multiple workers, we can get the case where we run out of room in the
-    // queue if a doc has many links
-    let n_workers = 10;
+    // fetches through Kubo take ~2 s, so the worker count caps the crawl rate (#246)
+    let n_workers = crawl_workers(std::env::var("CRAWL_WORKERS").ok()).unwrap_or_else(|err| {
+        error!("{}", err);
+        std::process::exit(1);
+    });
+    info!("Crawl workers: {}", n_workers);
     let pool = ThreadPool::new(n_workers);
 
     // todo: find some way to shutdown the pool when the server stops
@@ -416,6 +433,23 @@ mod tests {
             .iter()
             .map(|p| p.split(' ').next().unwrap().to_string())
             .collect()
+    }
+
+    #[actix_web::test]
+    async fn crawl_workers_default_to_ten() {
+        assert_eq!(crawl_workers(None), Ok(10));
+    }
+
+    #[actix_web::test]
+    async fn crawl_workers_take_the_configured_count() {
+        assert_eq!(crawl_workers(Some("30".to_string())), Ok(30));
+    }
+
+    #[actix_web::test]
+    async fn crawl_workers_reject_zero_and_non_numbers() {
+        for bad in ["0", "-1", "ten", ""] {
+            assert!(crawl_workers(Some(bad.to_string())).is_err(), "{:?}", bad);
+        }
     }
 
     #[actix_web::test]
