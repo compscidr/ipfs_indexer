@@ -1592,7 +1592,10 @@ pub(crate) mod tests {
         let (done, flushed_in_time) = channel();
         let installer = segments.clone();
         segments.add(3, 1, &words(&[("later", 1)]));
-        std::thread::spawn(move || done.send(installer.flush().unwrap()).unwrap());
+        std::thread::spawn(move || {
+            installer.flush().unwrap();
+            done.send(()).unwrap();
+        });
         assert!(
             flushed_in_time.recv_timeout(wait).is_ok(),
             "an install doesn't wait for the computation"
