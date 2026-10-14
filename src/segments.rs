@@ -6,10 +6,11 @@
  * A merge can take minutes, so neither waits for the other: each install swaps its inputs for
  * its output in the segment set as it is at that moment.
  *
- * Lock order: merging, writes, install, then dead, buffer, state, retired. erase, the stats
- * cache, computing and the wake signals are only taken on their own. The Store's connection
- * lock comes before buffer (add) and is never held across a call that waits on merging, writes
- * or install.
+ * Lock order: merging, writes, install, retiring, then dead, buffer, state, retired.
+ * term_stats takes computing, then buffer and state (released), then stats. erase is only
+ * taken on its own. The wake signals are leaves: install raises merge_due holding the install
+ * lock. The Store's connection lock comes before buffer (add), and is never held across a call
+ * that waits on merging, writes, install or retiring.
  */
 use crate::segment::{Posting, Segment, SegmentWriter};
 use std::cmp::Reverse;
@@ -186,10 +187,13 @@ pub struct Segments {
     retired: Mutex<Vec<Retired>>,
     // one merge cascade at a time
     merging: Mutex<()>,
-    // flushes, erase rewrites and retiring (and bulk_load), one at a time; never held by a merge
+    // flushes and erase rewrites (and bulk_load), one at a time; never held by a merge
     writes: Mutex<()>,
     // an install's read-modify-write of the segment set and the manifest
     install: Mutex<()>,
+    // erasing retired files, one pass at a time; apart from writes, so zeroing a big file
+    // doesn't hold up flushes or erase rewrites
+    retiring: Mutex<()>,
     // bumped by every install, so a running rewrite can cheaply tell when to check its inputs
     installs: AtomicU64,
     // wakes the upkeep thread (a full buffer, an erase) and the merge thread (an install)
@@ -218,6 +222,10 @@ pub(crate) enum Hook {
     BeforeInstall,
     // in a rewrite, each time it checks whether its inputs were replaced
     Checking,
+    // an unused rewrite output, just before it's erased
+    Discarding,
+    // a retired file, just before it's erased
+    Retiring,
 }
 
 #[cfg(test)]
@@ -368,6 +376,7 @@ impl Segments {
             merging: Mutex::new(()),
             writes: Mutex::new(()),
             install: Mutex::new(()),
+            retiring: Mutex::new(()),
             installs: AtomicU64::new(0),
             upkeep_due: Signal::default(),
             merge_due: Signal::default(),
@@ -571,7 +580,7 @@ impl Segments {
      * ids nothing holds any more. Merging is merge()'s.
      */
     pub fn upkeep(&self) -> Maintained {
-        let error = self.writes_round().err();
+        let error = self.upkeep_round();
         Maintained {
             pruned: self.prune_dead(),
             error,
@@ -580,18 +589,25 @@ impl Segments {
 
     /// upkeep() with merge() in between, in one call: at startup, and in tests
     pub fn maintain(&self) -> Maintained {
-        let mut error = self.writes_round().err();
+        let mut error = self.upkeep_round();
         if let Err(err) = self.merge() {
             error.get_or_insert(err);
         }
         // the merges' inputs, if no search holds them
-        if let Err(err) = self.writes_round() {
+        if let Some(err) = self.upkeep_round() {
             error.get_or_insert(err);
         }
         Maintained {
             pruned: self.prune_dead(),
             error,
         }
+    }
+
+    // writes, then retired files once the writes lock is free; the first error
+    fn upkeep_round(&self) -> Option<io::Error> {
+        let written = self.writes_round();
+        let retired = self.retire();
+        written.and(retired).err()
     }
 
     fn writes_round(&self) -> io::Result<()> {
@@ -602,13 +618,11 @@ impl Segments {
         self.writes_locked()
     }
 
-    // a due flush, erasures, then retired files; each runs even if one before it failed, so
-    // a failed flush can't keep a taken-down file on disk. Under the writes lock.
+    // a due flush, then erasures, which run even if the flush failed. Under the writes lock.
     fn writes_locked(&self) -> io::Result<()> {
         let flushed = self.flush_if_due();
         let erased = self.erase_pending();
-        let retired = self.retire();
-        flushed.and(erased).and(retired)
+        flushed.and(erased)
     }
 
     fn flush_if_due(&self) -> io::Result<()> {
@@ -630,9 +644,9 @@ impl Segments {
     }
 
     /**
-     * Merges segments until none are due; for the merge thread. Between merges, erasures and a
-     * due flush go first (unless the upkeep thread is already on them), so a long cascade
-     * doesn't starve them.
+     * Merges segments until none are due; for the merge thread. Between merges, erasures, a due
+     * flush and retired files go first (unless the upkeep thread is already on them), so a long
+     * cascade doesn't starve them.
      */
     pub fn merge(&self) -> io::Result<()> {
         if self.dir.is_none() {
@@ -650,6 +664,16 @@ impl Segments {
                 if let Some(_writes) = writes {
                     if let Err(err) = self.writes_locked() {
                         log::warn!("Segment upkeep between merges failed: {}", err);
+                    }
+                }
+                let retiring = match self.retiring.try_lock() {
+                    Ok(retiring) => Some(retiring),
+                    Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                    Err(TryLockError::WouldBlock) => None,
+                };
+                if let Some(_retiring) = retiring {
+                    if let Err(err) = self.retire_locked() {
+                        log::warn!("Erasing retired segments between merges failed: {}", err);
                     }
                 }
             }
@@ -763,38 +787,51 @@ impl Segments {
         pin: &Pin,
         flushed: Option<u64>,
     ) -> io::Result<bool> {
+        let installed = {
+            let _install = lock(&self.install);
+            self.install_locked(inputs, &output, pin, flushed)
+        };
+        // an output not installed is zeroed once the install lock is free: it can be big
+        if !matches!(installed, Ok(true)) {
+            if let Some(output) = output {
+                #[cfg(test)]
+                self.hook(Hook::Discarding);
+                discard(output);
+            }
+        }
+        installed
+    }
+
+    fn install_locked(
+        &self,
+        inputs: &[Arc<Segment>],
+        output: &Option<Arc<Segment>>,
+        pin: &Pin,
+        flushed: Option<u64>,
+    ) -> io::Result<bool> {
         let dir = self.dir.as_ref().expect("segment files need a directory");
-        let _install = lock(&self.install);
         // only installs change the list, and they hold the install lock
         let current = self.state.read().unwrap().segments.clone();
         let is_input = |s: &Arc<Segment>| inputs.iter().any(|input| Arc::ptr_eq(s, input));
         if current.iter().filter(|s| is_input(s)).count() != inputs.len() {
-            if let Some(output) = output {
-                discard(output);
-            }
             return Ok(false);
         }
         let mut live: Vec<Arc<Segment>> =
             current.iter().filter(|s| !is_input(s)).cloned().collect();
-        live.extend(output.clone());
+        live.extend(output.iter().cloned());
         live.sort_by_key(|segment| segment.info().min_id);
         let flushed_through = self.flushed_through().max(flushed.unwrap_or(0));
-        if let Err(err) = write_manifest(
+        write_manifest(
             dir,
             self.next_gen.load(Ordering::SeqCst),
             flushed_through,
             &live,
-        ) {
-            if let Some(output) = output {
-                discard(output);
-            }
-            return Err(err);
-        }
+        )?;
         self.flushed_through
             .store(flushed_through, Ordering::SeqCst);
         {
             let mut dead = self.dead.write().unwrap();
-            if let Some(output) = &output {
+            if let Some(output) = output {
                 // its dead ids are the ones that died after the writer read the dead set
                 let from = (pin.at - dead.log_start) as usize;
                 let held: Vec<u64> = dead.log[from..]
@@ -888,7 +925,21 @@ impl Segments {
     // its id is pruned, so a merge output still holding it is caught in a later round
     fn erase_pending(&self) -> io::Result<()> {
         loop {
-            let targets: Vec<u64> = lock(&self.erase).iter().copied().collect();
+            let mut targets: Vec<u64> = lock(&self.erase).iter().copied().collect();
+            // an id pruned already holds nothing, but a purge or expiry can mark it again from
+            // a dead_pages row not yet deleted; such a mark would never be pruned
+            let pruned: HashSet<u64> = {
+                let dead = self.dead.read().unwrap();
+                targets
+                    .iter()
+                    .copied()
+                    .filter(|id| !dead.ids.contains(id))
+                    .collect()
+            };
+            if !pruned.is_empty() {
+                lock(&self.erase).retain(|id| !pruned.contains(id));
+                targets.retain(|id| !pruned.contains(id));
+            }
             if targets.is_empty() {
                 return Ok(());
             }
@@ -935,6 +986,10 @@ impl Segments {
         let pin = self.pin();
         let dead = self.dead.read().unwrap().ids.clone();
         let mut seen = self.installs.load(Ordering::SeqCst);
+        // replaced between the pick and `seen`: no later install would prompt a check
+        if !self.all_live(inputs) {
+            return Ok(false);
+        }
         let mut replaced = || {
             #[cfg(test)]
             self.hook(Hook::Checking);
@@ -1003,12 +1058,18 @@ impl Segments {
     }
 
     /**
-     * Erases retired files no search holds any more, one at a time with a due flush between, so
-     * a big file doesn't hold the buffer up. A file whose erase fails ERASE_TRIES times is given
+     * Erases retired files no search holds any more, under the retiring lock alone, so zeroing a
+     * big file holds up neither flushes nor erase rewrites. A file whose erase fails ERASE_TRIES
+     * times is given
      * up on (logged); what it holds stays dead, and it's retried at the next start, as a file
      * the manifest doesn't name.
      */
     fn retire(&self) -> io::Result<()> {
+        let _retiring = lock(&self.retiring);
+        self.retire_locked()
+    }
+
+    fn retire_locked(&self) -> io::Result<()> {
         let ready: Vec<Arc<Segment>> = lock(&self.retired)
             .iter()
             .filter(|r| Arc::strong_count(&r.segment) == 1)
@@ -1017,6 +1078,8 @@ impl Segments {
         let mut result = Ok(());
         for segment in ready {
             // no search can take it again: it's in no segment set
+            #[cfg(test)]
+            self.hook(Hook::Retiring);
             let erased = erase_file(segment.path());
             {
                 let mut dead = self.dead.write().unwrap();
@@ -1052,11 +1115,6 @@ impl Segments {
                             result = Err(err);
                         }
                     }
-                }
-            }
-            if let Err(err) = self.flush_if_due() {
-                if result.is_ok() {
-                    result = Err(err);
                 }
             }
         }
@@ -1927,5 +1985,93 @@ pub(crate) mod tests {
         );
         assert_eq!(segments.segment_count(), 1);
         assert_eq!(segments.postings("common").unwrap().len(), 4999);
+    }
+
+    #[test]
+    fn a_discarded_merge_output_is_erased_after_the_install_lock_is_released() {
+        let segments = Segments::open(&temp_dir("segments-discard-unlocked")).unwrap();
+        for id in 1..=10 {
+            flushed(&segments, &[(id, &[("common", 1)])]);
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (log, once) = (
+            seen.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        segments.set_hook(move |segments, at| match at {
+            Hook::BeforeInstall if !once.swap(true, Ordering::SeqCst) => {
+                // an erase rewrite replaces an input, so the merge's output is discarded
+                segments.set_dead(&[4]);
+                segments.mark_erase(&[4]);
+                let _writes = lock(&segments.writes);
+                segments.erase_pending().unwrap();
+            }
+            // zeroing it mustn't hold up another install, such as a flush
+            Hook::Discarding => log
+                .lock()
+                .unwrap()
+                .push(segments.install.try_lock().is_ok()),
+            _ => {}
+        });
+        assert_eq!(maintained(&segments), vec![4]);
+        assert_eq!(*seen.lock().unwrap(), vec![true]);
+    }
+
+    #[test]
+    fn a_rewrite_of_an_input_replaced_before_it_started_writes_nothing() {
+        let segments = Segments::open(&temp_dir("segments-stale-pick")).unwrap();
+        for id in 1..=6 {
+            segments.add(id, 1, &words(&[("alpha", 1)]));
+        }
+        segments.flush().unwrap();
+        // picked, then replaced by a takedown's rewrite before the rewrite began
+        let picked = segments.snapshot().to_vec();
+        segments.set_dead(&[3]);
+        segments.mark_erase(&[3]);
+        segments.upkeep();
+        let generation = segments.next_gen.load(Ordering::SeqCst);
+        assert!(!segments.rewrite(&picked).unwrap());
+        assert_eq!(
+            segments.next_gen.load(Ordering::SeqCst),
+            generation,
+            "no file written"
+        );
+    }
+
+    #[test]
+    fn an_erase_mark_for_an_id_already_pruned_is_dropped() {
+        let segments = Segments::open(&temp_dir("segments-stale-mark")).unwrap();
+        segments.add(1, 1, &words(&[("alpha", 1)]));
+        segments.set_dead(&[1]);
+        assert_eq!(maintained(&segments), vec![1]);
+        // a purge or expiry marking it from a dead_pages row not deleted yet
+        segments.mark_erase(&[1]);
+        maintained(&segments);
+        assert!(lock(&segments.erase).is_empty());
+    }
+
+    #[test]
+    fn retiring_doesnt_hold_up_flushes() {
+        let segments = Segments::open(&temp_dir("segments-retire-unlocked")).unwrap();
+        for id in 1..=6 {
+            segments.add(id, 1, &words(&[("alpha", 1)]));
+        }
+        segments.flush().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        segments.set_hook(move |segments, at| {
+            if at == Hook::Retiring {
+                log.lock().unwrap().push(segments.writes.try_lock().is_ok());
+            }
+        });
+        segments.set_dead(&[3]);
+        segments.mark_erase(&[3]);
+        let done = segments.upkeep();
+        assert!(done.error.is_none());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![true],
+            "erasing it, writes is free"
+        );
     }
 }
