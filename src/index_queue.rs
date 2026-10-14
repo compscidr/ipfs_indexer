@@ -285,11 +285,20 @@ impl IndexQueue {
         self.store().maintain();
     }
 
-    /// Waits for, then runs, one round of index upkeep (#247): for a dedicated thread
+    /// Waits for, then runs, one round of index upkeep (#247): flushes, erasures (#249) and
+    /// retired files. For a dedicated thread.
     pub fn maintain_store(&self) {
         let store = self.store();
         store.wait_for_maintenance();
-        store.maintain();
+        store.upkeep();
+    }
+
+    /// Waits for, then runs, the segment merges due (#247). For a thread of its own: a merge can
+    /// take minutes, and flushes and erasures don't wait for it.
+    pub fn merge_store(&self) {
+        let store = self.store();
+        store.wait_for_merge();
+        store.merge();
     }
 
     /// Writes buffered postings to disk, for a clean shutdown

@@ -1,7 +1,7 @@
 use crate::index_queue::normalize;
 use crate::index_result::IndexResult;
 use crate::segment::Posting;
-use crate::segments::Segments;
+use crate::segments::{Maintained, Segments};
 use log::info;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::HashMap;
@@ -487,16 +487,30 @@ impl Store {
         Ok(self.segments.term_stats(n)?.1)
     }
 
-    /// One round of segment upkeep (see Segments::maintain); drops dead_pages rows no segment
-    /// needs any more
+    /// All segment upkeep, merges included, in one call (startup, tests; see Segments::maintain);
+    /// drops dead_pages rows no segment needs any more
     pub fn maintain(&self) {
-        let dropped = match self.segments.maintain() {
-            Ok(dropped) => dropped,
-            Err(err) => {
-                log::warn!("Segment upkeep failed: {}", err);
-                return;
-            }
-        };
+        self.maintained(self.segments.maintain());
+    }
+
+    /// One round for the upkeep thread (see Segments::upkeep): flush, erasures, retired files
+    pub fn upkeep(&self) {
+        self.maintained(self.segments.upkeep());
+    }
+
+    /// Merges segments until none are due; for the merge thread (see Segments::merge)
+    pub fn merge(&self) {
+        if let Err(err) = self.segments.merge() {
+            log::warn!("Segment merge failed: {}", err);
+        }
+    }
+
+    // the dead ids pruned go from dead_pages even if a step failed
+    fn maintained(&self, done: Maintained) {
+        if let Some(err) = &done.error {
+            log::warn!("Segment upkeep failed: {}", err);
+        }
+        let dropped = done.pruned;
         if dropped.is_empty() {
             return;
         }
@@ -518,6 +532,11 @@ impl Store {
     /// Blocks until there's segment upkeep to do, or a second passes
     pub fn wait_for_maintenance(&self) {
         self.segments.wait();
+    }
+
+    /// Blocks until a segment is installed (a merge may be due), or a second passes
+    pub fn wait_for_merge(&self) {
+        self.segments.wait_for_merge();
     }
 
     /// Writes buffered postings to a segment now

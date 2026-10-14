@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use threadpool::ThreadPool;
@@ -305,10 +306,22 @@ async fn main() -> std::io::Result<()> {
     // after the store: the queue lives in it (#231)
     index_queue.reseed();
 
-    // index upkeep (#247): flushes, merges, and erasing taken-down pages from disk (#249)
+    // index upkeep (#247): flushes and erasing taken-down pages from disk (#249) on one thread,
+    // merges on another, so a long merge holds up neither. A panicked round is logged and the
+    // loop goes on: without it the buffer would grow unflushed and takedowns stay on disk.
     let upkeep_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
-        upkeep_queue.maintain_store();
+        let round = std::panic::catch_unwind(AssertUnwindSafe(|| upkeep_queue.maintain_store()));
+        if round.is_err() {
+            error!("Index upkeep panicked; carrying on");
+        }
+    });
+    let merge_queue = Arc::clone(&index_queue);
+    std::thread::spawn(move || loop {
+        let round = std::panic::catch_unwind(AssertUnwindSafe(|| merge_queue.merge_store()));
+        if round.is_err() {
+            error!("Index merge panicked; carrying on");
+        }
     });
 
     let refresh_queue = Arc::clone(&index_queue);
