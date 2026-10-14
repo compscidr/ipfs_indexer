@@ -47,7 +47,7 @@ async fn status(queue: web::Data<IndexQueue>, gateway: web::Data<Gateway>) -> Ht
     ))
 }
 
-/// Process memory, index file size and free space under DATA_DIR, in bytes ("-" if unknown) (#214)
+/// Process memory, index size (the SQLite file and segment files) and free space under DATA_DIR, in bytes ("-" if unknown) (#214)
 #[get("/resources")]
 async fn resources(queue: web::Data<IndexQueue>) -> HttpResponse {
     let path = queue.store_path();
@@ -55,13 +55,23 @@ async fn resources(queue: web::Data<IndexQueue>) -> HttpResponse {
     HttpResponse::Ok().body(format!(
         "Memory: {} Index file: {} Disk free: {}",
         show(rss_bytes()),
-        show(
-            path.as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len())
-        ),
+        show(path.as_deref().and_then(index_bytes)),
         show(path.as_deref().and_then(disk_free_bytes)),
     ))
+}
+
+// index.sqlite plus the segment files beside it (#247)
+fn index_bytes(path: &std::path::Path) -> Option<u64> {
+    let file = std::fs::metadata(path).ok()?.len();
+    let segments = path.parent().map(|dir| dir.join("segments"));
+    let segments: u64 = match segments.and_then(|dir| std::fs::read_dir(dir).ok()) {
+        Some(entries) => entries
+            .filter_map(|e| e.ok()?.metadata().ok())
+            .map(|m| m.len())
+            .sum(),
+        None => 0,
+    };
+    Some(file + segments)
 }
 
 // VmRSS from /proc/self/status (Linux only)
@@ -417,11 +427,26 @@ mod tests {
         queue
             .attach_store(store::Store::open(&dir, 0).unwrap(), 86400)
             .unwrap();
+        assert!(queue.persist(
+            "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze",
+            &store::tests::page(
+                "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze",
+                "a",
+                &[("alpha", 1)]
+            )
+        ));
+        queue.flush_for_test();
         let body = get_resources(queue).await;
         let f = fields(&body);
+        // the SQLite file plus the segment files (#247)
+        let segments: u64 = std::fs::read_dir(dir.join("segments"))
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(segments > 0);
         assert_eq!(
             f[1].parse::<u64>().unwrap(),
-            std::fs::metadata(dir.join("index.sqlite")).unwrap().len(),
+            std::fs::metadata(dir.join("index.sqlite")).unwrap().len() + segments,
             "{}",
             body
         );

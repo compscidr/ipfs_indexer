@@ -1286,6 +1286,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn expiry_erases_old_versions_of_a_current_page() {
+        let dir = temp_dir("expire-version");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.persist(GOOD, &page(GOOD, "t", &[("zzqxoldversionterm", 1)]));
+        for i in 0..5 {
+            let item = format!("{}/other{}", GOOD, i);
+            queue.persist(&item, &page(&item, "o", &[("alpha", 1)]));
+        }
+        queue.flush_for_test();
+        // re-crawled: the first version is superseded, and was 10 days ago
+        queue.persist(GOOD, &page(GOOD, "t", &[("beta", 1)]));
+        queue.flush_for_test();
+        rusqlite::Connection::open(dir.join("index.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE dead_pages SET died_at = ?1",
+                [now_secs() - 10 * DAY],
+            )
+            .unwrap();
+        queue.maintain_for_test();
+        assert!(
+            dir_has(&dir, "zzqxoldversionterm"),
+            "kept within the window"
+        );
+
+        assert_eq!(queue.expire(5 * DAY), 0, "the current pages are fresh");
+        queue.maintain_for_test();
+        assert!(!dir_has(&dir, "zzqxoldversionterm"));
+        assert_eq!(queue.search("beta", 0, 10).1.len(), 1);
+    }
+
     fn file_has(store_dir: &std::path::Path, needle: &str) -> bool {
         let bytes = std::fs::read(store_dir.join("index.sqlite")).unwrap();
         bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
