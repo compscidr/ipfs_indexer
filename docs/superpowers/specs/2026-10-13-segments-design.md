@@ -96,7 +96,7 @@ footer    offsets of docs/postings/dict/sparse (u64 LE each), FNV-1a 64 of every
 - `upsert` still commits the page row in SQLite as today: a new id, the old id moved to `dead_pages`, and the `mirrors` repoint.
 - In the same critical section (the connection lock), `upsert` adds the page's postings to the **write buffer**: `BTreeMap<term, Vec<(id, count)>>` plus `(id, length)`. Ids only increase, so each list is already sorted.
 - Search reads the buffer as one more segment.
-- **Flush** happens when the buffer holds 1,000,000 postings or is 60 s old, whichever comes first, and never while it's empty. A flush writes a new `.seg` file, fsyncs it, and swaps the manifest with `flushed_through` set to the buffer's highest id. It runs on the background **compactor thread**. The buffer is swapped for an empty one under its lock, so `upsert` doesn't wait on disk.
+- **Flush** happens when the buffer holds 1,000,000 postings or is 60 s old, whichever comes first, and never while it's empty. A flush writes a new `.seg` file, fsyncs it, and swaps the manifest with `flushed_through` set to the buffer's highest id. It runs on the background **upkeep thread**, and doesn't wait for a merge in progress. The buffer is swapped for an empty one under its lock, so `upsert` doesn't wait on disk.
 - **In-memory store (no `DATA_DIR`):** the buffer is never flushed and holds everything. That matches today's in-memory mode, where the cache cap doesn't apply.
 - **Crash recovery:** at startup, pages with `id > flushed_through` have no postings on disk. Their rows are deleted and their items re-queued, so they're crawled again.
 
@@ -112,8 +112,10 @@ footer    offsets of docs/postings/dict/sparse (u64 LE each), FNV-1a 64 of every
 
 ## Merging (#247)
 
-- The compactor thread does tiered merging.
+- Merges run on a **merge thread** of their own. Flushes, erase rewrites and retiring run on the **upkeep thread** and never wait for a merge; a merge cascade also runs them between merges.
+- **Installs** are a read-modify-write of the live set at install time: remove the inputs, add the output. A flush installed during a merge survives the merge's install. If an input is no longer live (an erase rewrite replaced it), the merge's output is erased and nothing is retired; a running merge checks for this and stops early, so it can't hold a taken-down file on disk until it finishes.
 - **Tiers:** a segment's tier is `floor(log10(bytes / 1 MiB))`. When a tier has 10 segments, it merges them into one.
+- **Size cap:** segments of tier 3 (1 GiB) or more are never merged, so the largest merge is ten segments under 1 GiB each (output up to ~10 GiB). This bounds the longest merge and what a takedown or expiry rewrite has to copy. The cost is more segments per search at the largest scale, which is accepted.
 - **Dead postings:** a segment that is 20% or more dead (by docs) is rewritten on its own, which reclaims space and erases superseded versions.
 - A merge streams the inputs' dictionaries in sorted order, skips dead ids, writes the new segment, swaps the manifest, and then **retires** the inputs.
 - **Retiring a segment:** wait until no snapshot holds it (`Arc::strong_count == 1`, checked every 100 ms), then overwrite the file with zeros, fsync, and unlink it. Zeroing before readers finish would hand them zeros, which is why the wait comes first. Then delete the `dead_pages` rows for ids that no live segment contains any more.
@@ -127,7 +129,7 @@ footer    offsets of docs/postings/dict/sparse (u64 LE each), FNV-1a 64 of every
    - insert their ids into `dead_pages` with `erase`;
    - for `erase`, set `erase = 1` on every older `dead_pages` row for the same items (superseded versions).
 2. **Immediately, before `delete` returns:** add the ids to the in-memory dead set, so search stops returning them at once (as the `map` check does today). Remove their postings from the write buffer outright; it's only in RAM, so nothing needs erasing.
-3. **Wake the compactor** over a channel. It takes priority over flushes and merges, and rewrites every segment whose `[min_id, max_id]` range contains an `erase = 1` id and whose docs section actually holds it. A rewrite drops *all* dead ids in that segment, and the old files are then retired as above.
+3. **Wake the upkeep thread.** It doesn't wait for merges (see Merging), and rewrites every segment whose `[min_id, max_id]` range contains an `erase = 1` id and whose docs section actually holds it. A rewrite drops *all* dead ids in that segment, and the old files are then retired as above.
 4. **Superseded versions by cid:** a purge also checks each `dead_pages` row's `item` and `cid` against the new list and marks the blocked ones `erase = 1`. This catches an old version whose cid after redirects differs from the current page's.
 5. **At startup,** any `erase = 1` rows left from before a crash are handled before the crawl or HTTP server starts.
 
@@ -148,7 +150,7 @@ Once at startup, when the `postings` table exists:
 ## Code layout
 
 - `src/segment.rs`: the file format. A writer from a sorted stream, a reader (open, lookup, iterate dictionary), and varint/FNV helpers. No knowledge of SQLite.
-- `src/segments.rs`: the segment set. Manifest, write buffer, snapshots, dead set, compactor thread (flush, merge, erase, retire).
+- `src/segments.rs`: the segment set. Manifest, write buffer, snapshots, dead set, and the upkeep (flush, erase, retire) and merge work run by two threads in `main.rs`.
 - `src/store.rs`: SQLite only, plus calls into `segments` from `upsert`, `delete` and `postings`. The `postings`/`terms` SQL, `remove_postings` and `adjust_terms` go away.
 - `src/index_queue.rs`: `search()` works on ids, and `delete` callers pass `erase`.
 
@@ -164,7 +166,7 @@ No new dependencies. `Store::open` returns a boxed error, since the migration an
 - The existing search tests (BM25 order, OR, AND) pass unchanged.
 - One new test runs the same queries before and after a flush and after a merge, and checks the results are equal.
 
-**Erasure (#249 acceptance)** builds on `delete_erases_the_text_from_the_file`. Index a page with a unique term (`ZZQX-segment-term-91`), take it down, wait for the compactor, then assert the bytes are in no file under `DATA_DIR` (recursive). Run it for a page that is:
+**Erasure (#249 acceptance)** builds on `delete_erases_the_text_from_the_file`. Index a page with a unique term (`ZZQX-segment-term-91`), take it down, run upkeep, then assert the bytes are in no file under `DATA_DIR` (recursive). Run it for a page that is:
 - still in the write buffer;
 - in a flushed segment;
 - in a merged segment;
@@ -175,7 +177,7 @@ No new dependencies. `Store::open` returns a boxed error, since the migration an
 - With segment rewrite disabled, the term *is* still found, which proves the assertion can fail.
 
 **Immediacy**
-- Search drops the page as soon as `delete` returns, before the compactor runs.
+- Search drops the page as soon as `delete` returns, before upkeep runs.
 
 **Crash recovery**
 - Pages past `flushed_through` are deleted and re-queued.
