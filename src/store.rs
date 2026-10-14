@@ -172,12 +172,18 @@ impl Store {
         recover_unflushed(&mut conn, segments.flushed_through())?;
         // ids in the segments must never be handed out again, even if this file fell behind them
         // (rolled back by a power loss, or wiped while segments/ was kept)
-        conn.execute(
-            "INSERT OR REPLACE INTO sqlite_sequence (name, seq)
-             VALUES ('pages', max(?1, coalesce(
-               (SELECT seq FROM sqlite_sequence WHERE name = 'pages'), 0)))",
-            [segments.flushed_through() as i64],
+        let floor = segments.flushed_through() as i64;
+        // (sqlite_sequence has no unique key on name: update the row, only inserting if absent)
+        let raised = conn.execute(
+            "UPDATE sqlite_sequence SET seq = max(seq, ?1) WHERE name = 'pages'",
+            [floor],
         )?;
+        if raised == 0 && floor > 0 {
+            conn.execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('pages', ?1)",
+                [floor],
+            )?;
+        }
         let dead: Vec<u64> = conn
             .prepare("SELECT id FROM dead_pages")?
             .query_map([], |r| r.get::<_, i64>(0))?
@@ -1574,6 +1580,56 @@ pub(crate) mod tests {
             store.items(&[old]).unwrap().is_empty(),
             "no item has the old id"
         );
+    }
+
+    #[test]
+    fn ids_never_repeat_when_a_rolled_back_sqlite_has_a_sequence_row() {
+        let dir = temp_dir("behind-seq");
+        let store = Store::open(&dir, 0).unwrap();
+        for i in 0..5 {
+            let item = format!("p{}", i);
+            store
+                .upsert(&item, &page(&item, "p", &[("oldterm", 1)]), 1)
+                .unwrap();
+        }
+        let old = store
+            .postings("oldterm")
+            .unwrap()
+            .iter()
+            .map(|p| p.0)
+            .max()
+            .unwrap();
+        store.flush().unwrap();
+        drop(store);
+        // a rollback: the pages are gone and the sequence is behind the segments
+        let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+        conn.execute_batch(
+            "DELETE FROM pages; UPDATE sqlite_sequence SET seq = 1 WHERE name = 'pages';",
+        )
+        .unwrap();
+        drop(conn);
+        drop(Store::open(&dir, 0).unwrap());
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("new", &page("new", "n", &[("newterm", 1)]), 1)
+            .unwrap();
+        let new = store.postings("newterm").unwrap()[0].0;
+        assert!(new > old, "{} should be above {}", new, old);
+        assert_eq!(
+            postings_by_item(&store, "newterm"),
+            vec![("new".into(), 1, 1)]
+        );
+        let rows: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_sequence WHERE name = 'pages'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]
