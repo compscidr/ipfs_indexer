@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 const FLUSH_POSTINGS: usize = 1_000_000;
@@ -44,6 +44,17 @@ struct State {
     frozen: Option<Arc<Buffer>>,
 }
 
+// a term_stats result: distinct terms and the top STATS_TOP, from segment set `generation`
+struct Stats {
+    generation: u64,
+    at: Instant,
+    count: usize,
+    top: Vec<(String, u32)>,
+}
+
+// sorted (term, value) streams for merge_terms
+type TermSource<'a, V> = Box<dyn Iterator<Item = io::Result<(Vec<u8>, V)>> + 'a>;
+
 pub struct Segments {
     // None in memory: the buffer holds everything and is never flushed
     dir: Option<PathBuf>,
@@ -63,8 +74,74 @@ pub struct Segments {
     wake: Condvar,
     flush_postings: usize,
     flush_age: Duration,
-    // (when, distinct terms, top STATS_TOP): a full dictionary merge is too slow for every /status
-    stats: Mutex<Option<(Instant, usize, Vec<(String, u32)>)>>,
+    // bumped by every install: cached Stats from an older segment set are stale
+    stats_gen: AtomicU64,
+    // a full dictionary merge is too slow for every /status; held only to read or swap the value
+    stats: Mutex<Option<Arc<Stats>>>,
+    // one computation at a time, which nothing else waits on unless there's no value yet
+    computing: Mutex<()>,
+    #[cfg(test)]
+    hook: Mutex<Option<HookFn>>,
+}
+
+// test seams: where a hook set by set_hook runs
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Hook {
+    StatsComputing,
+}
+
+#[cfg(test)]
+type HookFn = Arc<dyn Fn(&Segments, Hook) + Send + Sync>;
+
+// a mutex guarding no data of its own (or data valid at every step), taken even if a panic
+// poisoned it: a panicked upkeep round mustn't stop the next, or the flush at shutdown
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/**
+ * A k-way merge of sorted term streams: calls `each` once per distinct term with its entries as
+ * (source index, value). The heads are kept in a heap, so no term is copied per step.
+ */
+fn merge_terms<V>(
+    mut sources: Vec<TermSource<'_, V>>,
+    mut each: impl FnMut(&[u8], &[(usize, V)]) -> io::Result<()>,
+) -> io::Result<()> {
+    type Heads = BinaryHeap<Reverse<(Vec<u8>, usize)>>;
+    fn advance<V>(
+        sources: &mut [TermSource<'_, V>],
+        i: usize,
+        heads: &mut Heads,
+        values: &mut [Option<V>],
+    ) -> io::Result<()> {
+        if let Some(entry) = sources[i].next() {
+            let (term, value) = entry?;
+            values[i] = Some(value);
+            heads.push(Reverse((term, i)));
+        }
+        Ok(())
+    }
+    let mut values: Vec<Option<V>> = sources.iter().map(|_| None).collect();
+    let mut heads = Heads::new();
+    for i in 0..sources.len() {
+        advance(&mut sources, i, &mut heads, &mut values)?;
+    }
+    let mut group = Vec::new();
+    while let Some(Reverse((term, i))) = heads.pop() {
+        group.push((i, values[i].take().unwrap()));
+        advance(&mut sources, i, &mut heads, &mut values)?;
+        while heads.peek().is_some_and(|Reverse((next, _))| *next == term) {
+            let Reverse((_, j)) = heads.pop().unwrap();
+            group.push((j, values[j].take().unwrap()));
+            advance(&mut sources, j, &mut heads, &mut values)?;
+        }
+        each(&term, &group)?;
+        group.clear();
+    }
+    Ok(())
 }
 
 /// Overwrites a file with zeros, syncs it, then removes it: unlinking alone leaves the text in
@@ -164,7 +241,11 @@ impl Segments {
             wake: Condvar::new(),
             flush_postings: FLUSH_POSTINGS,
             flush_age: FLUSH_AGE,
+            stats_gen: AtomicU64::new(0),
             stats: Mutex::new(None),
+            computing: Mutex::new(()),
+            #[cfg(test)]
+            hook: Mutex::new(None),
         }
     }
 
@@ -281,7 +362,8 @@ impl Segments {
             return;
         }
         self.erase.lock().unwrap().extend(ids);
-        *self.stats.lock().unwrap() = None;
+        // only a counter: invalidating never waits for a term_stats computation
+        self.stats_gen.fetch_add(1, Ordering::SeqCst);
         self.wake();
     }
 
@@ -464,9 +546,8 @@ impl Segments {
                 state.frozen = None;
             }
         }
-        // after the swap, so a term_stats racing it can't cache the old set; not under the state
-        // lock, as term_stats holds the cache while it takes that lock
-        *self.stats.lock().unwrap() = None;
+        // after the swap, so a term_stats computing from the old set caches it as stale
+        self.stats_gen.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -558,30 +639,25 @@ impl Segments {
                     writer.add_doc(id, length)?;
                 }
             }
-            let mut terms = inputs
-                .iter()
-                .map(|s| s.terms())
-                .collect::<io::Result<Vec<_>>>()?;
-            let mut heads = terms
-                .iter_mut()
-                .map(|t| t.next().transpose())
-                .collect::<io::Result<Vec<_>>>()?;
-            while let Some(term) = heads.iter().flatten().map(|h| h.0.clone()).min() {
+            let mut sources: Vec<TermSource<'_, (u64, u64)>> = Vec::new();
+            for input in inputs {
+                let terms = input.terms()?;
+                sources.push(Box::new(
+                    terms.map(|t| t.map(|(term, df, at)| (term, (df, at)))),
+                ));
+            }
+            merge_terms(sources, |term, group| {
                 let mut list = Vec::new();
-                for i in 0..heads.len() {
-                    if heads[i].as_ref().is_some_and(|h| h.0 == term) {
-                        let (_, df, offset) = heads[i].take().unwrap();
-                        let postings = inputs[i].postings_at(df, offset)?;
-                        list.extend(postings.into_iter().filter(|(id, _)| !dead.contains(id)));
-                        heads[i] = terms[i].next().transpose()?;
-                    }
+                for &(i, (df, offset)) in group {
+                    let postings = inputs[i].postings_at(df, offset)?;
+                    list.extend(postings.into_iter().filter(|(id, _)| !dead.contains(id)));
                 }
                 if !list.is_empty() {
                     list.sort_unstable();
-                    writer.add_term(&term, &list)?;
+                    writer.add_term(term, &list)?;
                 }
-            }
-            Ok(())
+                Ok(())
+            })
         })?;
         let mut live: Vec<Arc<Segment>> = self
             .state
@@ -635,20 +711,43 @@ impl Segments {
         if self.dir.is_none() || n > STATS_TOP {
             return self.compute_term_stats(n);
         }
-        let mut cache = self.stats.lock().unwrap();
-        if let Some((at, count, top)) = &*cache {
-            if at.elapsed() < STATS_TTL {
-                return Ok((*count, top.iter().take(n).cloned().collect()));
-            }
+        let take = |stats: &Stats| (stats.count, stats.top.iter().take(n).cloned().collect());
+        let fresh = |stats: &Arc<Stats>| {
+            stats.generation == self.stats_gen.load(Ordering::SeqCst)
+                && stats.at.elapsed() < STATS_TTL
+        };
+        let cached = lock(&self.stats).clone();
+        if let Some(stats) = cached.as_ref().filter(|stats| fresh(stats)) {
+            return Ok(take(stats));
         }
+        // one computation at a time: meanwhile others take the stale value, if there is one
+        let _computing = match self.computing.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => match &cached {
+                Some(stats) => return Ok(take(stats)),
+                None => lock(&self.computing),
+            },
+        };
+        // computed while this caller waited
+        if let Some(stats) = lock(&self.stats).clone().filter(fresh) {
+            return Ok(take(&stats));
+        }
+        // read before the snapshot: an install after it leaves this value stale
+        let generation = self.stats_gen.load(Ordering::SeqCst);
         let (count, top) = self.compute_term_stats(STATS_TOP)?;
-        *cache = Some((Instant::now(), count, top.clone()));
-        Ok((count, top.into_iter().take(n).collect()))
+        let stats = Arc::new(Stats {
+            generation,
+            at: Instant::now(),
+            count,
+            top,
+        });
+        *lock(&self.stats) = Some(stats.clone());
+        Ok(take(&stats))
     }
 
     fn compute_term_stats(&self, n: usize) -> io::Result<(usize, Vec<(String, u32)>)> {
-        type Source = Box<dyn Iterator<Item = io::Result<(Vec<u8>, u64)>>>;
-        let in_buffer = |buffer: &Buffer| -> Source {
+        let in_buffer = |buffer: &Buffer| -> TermSource<'_, u64> {
             let terms: Vec<_> = buffer
                 .postings
                 .iter()
@@ -664,33 +763,32 @@ impl Segments {
         if let Some(frozen) = &state.frozen {
             sources.push(in_buffer(frozen));
         }
+        #[cfg(test)]
+        self.hook(Hook::StatsComputing);
         for segment in state.segments.iter() {
             let terms = segment.terms()?.map(|t| t.map(|(term, df, _)| (term, df)));
             sources.push(Box::new(terms));
         }
-        let mut heads = sources
-            .iter_mut()
-            .map(|s| s.next().transpose())
-            .collect::<io::Result<Vec<_>>>()?;
         let mut count = 0;
         // the best n so far, smallest first: (df, then the earlier term ranks higher)
         let mut top: BinaryHeap<Reverse<(u64, Reverse<Vec<u8>>)>> = BinaryHeap::new();
-        while let Some(term) = heads.iter().flatten().map(|h| h.0.clone()).min() {
-            let mut df = 0;
-            for i in 0..heads.len() {
-                if heads[i].as_ref().is_some_and(|h| h.0 == term) {
-                    df += heads[i].take().unwrap().1;
-                    heads[i] = sources[i].next().transpose()?;
-                }
-            }
+        merge_terms(sources, |term, group| {
             count += 1;
-            if n > 0 {
-                top.push(Reverse((df, Reverse(term))));
+            let df: u64 = group.iter().map(|&(_, df)| df).sum();
+            // copied only if it makes the top n
+            let enters = n > 0
+                && (top.len() < n
+                    || top.peek().is_some_and(|Reverse((low, Reverse(low_term)))| {
+                        df > *low || (df == *low && term < low_term.as_slice())
+                    }));
+            if enters {
+                top.push(Reverse((df, Reverse(term.to_vec()))));
                 if top.len() > n {
                     top.pop();
                 }
             }
-        }
+            Ok(())
+        })?;
         let mut ranked: Vec<(String, u32)> = top
             .into_iter()
             .map(|Reverse((df, Reverse(term)))| {
@@ -737,6 +835,18 @@ impl Segments {
 
     pub(crate) fn snapshot(&self) -> Arc<Vec<Arc<Segment>>> {
         self.state.read().unwrap().segments.clone()
+    }
+
+    pub(crate) fn set_hook(&self, hook: impl Fn(&Segments, Hook) + Send + Sync + 'static) {
+        *self.hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    fn hook(&self, at: Hook) {
+        // cloned out, so a hook can run code that reaches another hook
+        let hook = self.hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(self, at);
+        }
     }
 
     pub(crate) fn set_flush_limits(&mut self, postings: usize, age: Duration) {
@@ -1035,6 +1145,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn term_stats_break_df_ties_by_term_across_sources() {
+        let segments = Segments::open(&temp_dir("segments-stats-ties")).unwrap();
+        flushed(&segments, &[(1, &[("delta", 1), ("bravo", 1)])]);
+        flushed(
+            &segments,
+            &[(2, &[("charlie", 1), ("echo", 1), ("bravo", 1)])],
+        );
+        segments.add(3, 2, &words(&[("alpha", 1), ("echo", 1)]));
+        let top = |n| {
+            let (count, top) = segments.compute_term_stats(n).unwrap();
+            let terms: Vec<String> = top.into_iter().map(|(t, _)| t).collect();
+            (count, terms)
+        };
+        assert_eq!(
+            top(3),
+            (5, vec!["bravo".into(), "echo".into(), "alpha".into()])
+        );
+        assert_eq!(
+            top(10).1,
+            vec!["bravo", "echo", "alpha", "charlie", "delta"]
+        );
+        assert_eq!(top(0), (5, vec![]));
+    }
+
+    #[test]
     fn a_taken_down_page_stays_dead_while_a_search_holds_its_retired_file() {
         let dir = temp_dir("segments-retired-dead");
         let segments = Segments::open(&dir).unwrap();
@@ -1052,5 +1187,52 @@ pub(crate) mod tests {
         assert!(segments.postings("alpha").unwrap().iter().all(|p| p.0 != 3));
         drop(snapshot);
         assert_eq!(segments.maintain().unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn an_install_never_waits_for_term_stats_and_callers_get_the_stale_value() {
+        use std::sync::mpsc::channel;
+        let wait = Duration::from_secs(2);
+        let segments = Arc::new(Segments::open(&temp_dir("segments-stats-wait")).unwrap());
+        flushed(&segments, &[(1, &[("common", 1)])]);
+        assert_eq!(segments.term_stats(1).unwrap().0, 1);
+        segments.add(2, 1, &words(&[("fresh", 1)]));
+        segments.flush().unwrap(); // the cached value is stale now
+                                   // the next computation stops in the middle until released
+        let (entered, in_compute) = channel();
+        let (release, released) = channel::<()>();
+        let (entered, released) = (Mutex::new(Some(entered)), Mutex::new(released));
+        segments.set_hook(move |_, at| {
+            if at == Hook::StatsComputing {
+                if let Some(entered) = entered.lock().unwrap().take() {
+                    entered.send(()).unwrap();
+                    released.lock().unwrap().recv().unwrap();
+                }
+            }
+        });
+        let computing = segments.clone();
+        let first = std::thread::spawn(move || computing.term_stats(1).unwrap());
+        in_compute.recv_timeout(wait).unwrap();
+
+        let (done, flushed_in_time) = channel();
+        let installer = segments.clone();
+        segments.add(3, 1, &words(&[("later", 1)]));
+        std::thread::spawn(move || done.send(installer.flush().unwrap()).unwrap());
+        assert!(
+            flushed_in_time.recv_timeout(wait).is_ok(),
+            "an install doesn't wait for the computation"
+        );
+        let (sent, stale) = channel();
+        let caller = segments.clone();
+        std::thread::spawn(move || sent.send(caller.term_stats(1).unwrap()).unwrap());
+        assert_eq!(
+            stale.recv_timeout(wait),
+            Ok((1, vec![("common".to_string(), 1)])),
+            "another caller gets the stale value at once"
+        );
+        release.send(()).unwrap();
+        first.join().unwrap();
+        // invalidated during that computation: the next call computes again
+        assert_eq!(segments.term_stats(0).unwrap().0, 3);
     }
 }
