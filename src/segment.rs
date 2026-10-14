@@ -382,6 +382,13 @@ impl Segment {
         self.ids.binary_search(&id).ok()
     }
 
+    /// The ids of its pages from `from` to `to`, inclusive
+    pub fn ids_between(&self, from: u64, to: u64) -> &[u64] {
+        let start = self.ids.partition_point(|&id| id < from);
+        let end = self.ids.partition_point(|&id| id <= to);
+        &self.ids[start..end.max(start)]
+    }
+
     /// (page id, length), ascending by id
     pub fn docs(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
         self.ids.iter().copied().zip(self.lengths.iter().copied())
@@ -580,6 +587,9 @@ mod tests {
         assert!(segment.contains(300) && !segment.contains(301));
         assert_eq!(segment.length(150), Some(300));
         assert_eq!(segment.docs().count(), 300);
+        assert_eq!(segment.ids_between(298, 400), &[298, 299, 300]);
+        assert!(segment.ids_between(301, 400).is_empty());
+        assert!(segment.ids_between(5, 4).is_empty());
     }
 
     #[test]

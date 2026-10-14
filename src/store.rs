@@ -11,6 +11,8 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// record_orphans checks at most this many ids
+const MAX_ORPHAN_RANGE: u64 = 10_000_000;
 
 /**
  * The persisted index (#106): one SQLite file, `index.sqlite`, under DATA_DIR. secure_delete
@@ -184,6 +186,7 @@ impl Store {
                 [floor],
             )?;
         }
+        record_orphans(&mut conn, &segments)?;
         let dead: Vec<u64> = conn
             .prepare("SELECT id FROM dead_pages")?
             .query_map([], |r| r.get::<_, i64>(0))?
@@ -783,6 +786,51 @@ fn recover_unflushed(conn: &mut Connection, flushed_through: u64) -> rusqlite::R
         let mut queue = tx.prepare("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
         for item in &items {
             queue.execute([item])?;
+        }
+    }
+    tx.commit()
+}
+
+/**
+ * Ids in the segments past every row here, left when this file was rolled back behind them (a
+ * power loss with synchronous off): no page or dead_pages row refers to them, so nothing would
+ * ever erase their text. Recorded as dead and to erase (#249), with no item or cid.
+ */
+fn record_orphans(conn: &mut Connection, segments: &Segments) -> rusqlite::Result<()> {
+    let known: i64 = conn.query_row(
+        "SELECT max((SELECT coalesce(max(id), 0) FROM pages),
+                    (SELECT coalesce(max(id), 0) FROM dead_pages))",
+        [],
+        |r| r.get(0),
+    )?;
+    let (from, to) = (known as u64 + 1, segments.flushed_through());
+    if from > to {
+        return Ok(());
+    }
+    if to - from >= MAX_ORPHAN_RANGE {
+        log::warn!(
+            "Page ids {} to {} are in the segments but not the index file; too many to check, \
+             so their text stays until a wipe",
+            from,
+            to
+        );
+        return Ok(());
+    }
+    let orphans = segments.ids_between(from, to);
+    if orphans.is_empty() {
+        return Ok(());
+    }
+    log::warn!(
+        "{} pages in the segments have no record in the index file (rolled back?); erasing them",
+        orphans.len()
+    );
+    let tx = conn.transaction()?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO dead_pages (id, item, cid, died_at, erase) VALUES (?1, '', '', ?2, 1)",
+        )?;
+        for id in orphans {
+            insert.execute(params![id as i64, now_secs()])?;
         }
     }
     tx.commit()
@@ -1683,5 +1731,40 @@ pub(crate) mod tests {
         let mut queued = store.queue_load().unwrap();
         queued.sort();
         assert_eq!(queued, vec!["copy".to_string(), "lost".to_string()]);
+    }
+
+    #[test]
+    fn a_rolled_back_sqlite_leaves_no_orphan_text_in_the_segments() {
+        let dir = temp_dir("behind-orphans");
+        let store = Store::open(&dir, 0).unwrap();
+        for i in 0..5 {
+            let item = format!("p{}", i);
+            store
+                .upsert(&item, &page(&item, "p", &[("zzqxorphanterm", 1)]), 1)
+                .unwrap();
+        }
+        store.flush().unwrap();
+        drop(store);
+        // a rollback: the pages and their ids are gone from SQLite, but not from the segments
+        let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+        conn.execute_batch(
+            "DELETE FROM pages; UPDATE sqlite_sequence SET seq = 1 WHERE name = 'pages';",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open(&dir, 0).unwrap();
+        store.maintain();
+        assert!(
+            !dir_has(&dir, "zzqxorphanterm"),
+            "no page refers to them, so nothing else would ever erase them"
+        );
+        assert!(store.postings("zzqxorphanterm").unwrap().is_empty());
+        let rows: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM dead_pages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "erased, so their records went too");
     }
 }

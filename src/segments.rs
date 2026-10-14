@@ -463,6 +463,18 @@ impl Segments {
         Ok(found)
     }
 
+    /// The ids from `from` to `to`, inclusive, that a live segment holds, ascending
+    pub fn ids_between(&self, from: u64, to: u64) -> Vec<u64> {
+        let live = self.state.read().unwrap().segments.clone();
+        let mut ids: Vec<u64> = live
+            .iter()
+            .flat_map(|segment| segment.ids_between(from, to).iter().copied())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Pages search must no longer return: hidden at once, and dropped from the buffer
     pub fn set_dead(&self, ids: &[u64]) {
         if ids.is_empty() {
