@@ -654,6 +654,10 @@ impl Drop for Store {
 
 #[cfg(test)]
 impl Store {
+    pub(crate) fn segment_count(&self) -> usize {
+        self.segments.segment_count()
+    }
+
     // makes every following read/write fail, to exercise callers' error handling
     pub(crate) fn break_for_test(&self) {
         self.conn

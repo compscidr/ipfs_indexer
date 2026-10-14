@@ -2113,4 +2113,75 @@ mod tests {
         assert_eq!(queue.expire(-DAY), 1);
         assert_eq!(queue.keyword_length(), 0);
     }
+
+    #[test]
+    fn search_is_the_same_buffered_flushed_merged_and_reopened() {
+        // twelve pages with varied term counts and lengths, so BM25's order isn't trivial
+        let pages: Vec<(String, Vec<(&str, u32)>)> = (0..12u32)
+            .map(|i| {
+                let mut words = vec![("rust", i % 4 + 1), ("filler", 1 + i * 7 % 11)];
+                if i % 3 == 0 {
+                    words.push(("ipfs", 2));
+                }
+                if i % 2 == 1 {
+                    words.push(("crawler", 1 + i % 3));
+                }
+                if i == 7 {
+                    words.push(("zzqxrare", 1));
+                }
+                (format!("{}/p{}", GOOD, i), words)
+            })
+            .collect();
+        let queries = ["rust ipfs", "ipfs OR crawler", "zzqxrare", "rust"];
+        let results = |queue: &IndexQueue| -> Vec<(usize, Vec<String>)> {
+            queries
+                .iter()
+                .map(|query| {
+                    let (total, found) = queue.search(query, 0, 100);
+                    (total, found.into_iter().map(|r| r.cid).collect())
+                })
+                .collect()
+        };
+        let attached = |dir: &std::path::Path| {
+            let queue = IndexQueue::new();
+            queue
+                .attach_store(Store::open(dir, 0).unwrap(), 30 * DAY)
+                .unwrap();
+            queue
+        };
+        let segments = |queue: &IndexQueue| queue.store.get().unwrap().segment_count();
+
+        // all buffered, then flushed into one segment
+        let one = attached(&temp_dir("parity-one"));
+        for (item, words) in &pages {
+            one.index_for_test(item, &page(item, "t", words));
+        }
+        let buffered = results(&one);
+        one.flush_for_test();
+        assert_eq!(segments(&one), 1);
+        let flushed = results(&one);
+
+        // a segment per page, then ten of them merged
+        let dir = temp_dir("parity-merged");
+        let many = attached(&dir);
+        for (item, words) in &pages {
+            many.index_for_test(item, &page(item, "t", words));
+            many.flush_for_test();
+        }
+        assert_eq!(segments(&many), 12);
+        many.maintain_for_test();
+        assert_eq!(segments(&many), 3, "ten merged, two left");
+        let merged = results(&many);
+        drop(many);
+        let reopened = results(&attached(&dir));
+
+        let by_id: Vec<String> = pages.iter().map(|(item, _)| item.clone()).collect();
+        assert_eq!(buffered[3].0, 12);
+        assert_ne!(buffered[3].1, by_id, "ranked, not just in id order");
+        assert_eq!(buffered[1].0, 8, "the OR query");
+        assert_eq!(buffered[2], (1, vec![format!("{}/p7", GOOD)]));
+        assert_eq!(flushed, buffered, "after a flush");
+        assert_eq!(merged, buffered, "after a merge");
+        assert_eq!(reopened, buffered, "after a reopen");
+    }
 }
