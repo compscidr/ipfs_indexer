@@ -263,6 +263,16 @@ pub struct Segment {
 impl Segment {
     /// Opens and verifies (checksum, then structure) a segment file
     pub fn open(path: &Path) -> io::Result<Segment> {
+        Segment::read(path, true)
+    }
+
+    /// Opens a segment file this process just wrote and fsynced: its structure is checked, but
+    /// not its checksum, which would re-read the whole file (#247). Open checks it at startup.
+    pub fn open_written(path: &Path) -> io::Result<Segment> {
+        Segment::read(path, false)
+    }
+
+    fn read(path: &Path, verify: bool) -> io::Result<Segment> {
         let file = File::open(path)?;
         let bytes = file.metadata()?.len();
         if bytes < MAGIC.len() as u64 + 1 + FOOTER {
@@ -273,18 +283,20 @@ impl Segment {
             return Err(corrupt());
         }
         let field = |i: usize| u64::from_le_bytes(footer[i * 8..i * 8 + 8].try_into().unwrap());
-        let checked = bytes - 8 - END.len() as u64;
-        let mut hash = FNV_OFFSET;
-        let mut chunk = vec![0u8; 1 << 20];
-        let mut offset = 0;
-        while offset < checked {
-            let n = (checked - offset).min(chunk.len() as u64) as usize;
-            file.read_exact_at(&mut chunk[..n], offset)?;
-            hash = fnv1a(hash, &chunk[..n]);
-            offset += n as u64;
-        }
-        if hash != field(7) {
-            return Err(corrupt());
+        if verify {
+            let checked = bytes - 8 - END.len() as u64;
+            let mut hash = FNV_OFFSET;
+            let mut chunk = vec![0u8; 1 << 20];
+            let mut offset = 0;
+            while offset < checked {
+                let n = (checked - offset).min(chunk.len() as u64) as usize;
+                file.read_exact_at(&mut chunk[..n], offset)?;
+                hash = fnv1a(hash, &chunk[..n]);
+                offset += n as u64;
+            }
+            if hash != field(7) {
+                return Err(corrupt());
+            }
         }
         let header = read_at(&file, 0, MAGIC.len() as u64 + 1)?;
         if &header[..MAGIC.len()] != MAGIC {
@@ -354,12 +366,20 @@ impl Segment {
     }
 
     pub fn contains(&self, id: u64) -> bool {
-        self.ids.binary_search(&id).is_ok()
+        self.index(id).is_some()
     }
 
     /// The page's length in terms, if it's in this segment
     pub fn length(&self, id: u64) -> Option<u32> {
-        self.ids.binary_search(&id).ok().map(|i| self.lengths[i])
+        self.index(id).map(|i| self.lengths[i])
+    }
+
+    // the range check first: most ids asked about are in another segment
+    fn index(&self, id: u64) -> Option<usize> {
+        if id < self.info.min_id || id > self.info.max_id {
+            return None;
+        }
+        self.ids.binary_search(&id).ok()
     }
 
     /// (page id, length), ascending by id
@@ -581,6 +601,10 @@ mod tests {
         flipped[10] ^= 0xff;
         std::fs::write(&path, &flipped).unwrap();
         assert!(Segment::open(&path).is_err(), "checksum");
+        assert!(
+            Segment::open_written(&path).is_ok(),
+            "only open checks the checksum"
+        );
         std::fs::write(&path, &good[..good.len() - 1]).unwrap();
         assert!(Segment::open(&path).is_err(), "truncated");
         std::fs::write(&path, b"").unwrap();
