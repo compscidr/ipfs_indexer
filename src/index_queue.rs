@@ -6,7 +6,7 @@ use cid::Cid;
 use dashmap::{DashMap, Map};
 use log::{info, trace, warn};
 use scraper::{Html, Selector};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::ops::Not;
 use std::sync::{Mutex, OnceLock, RwLock};
@@ -84,6 +84,38 @@ pub fn normalize(text: &str) -> Vec<String> {
         .map(str::to_lowercase)
         .filter(|word| !STOPWORDS.contains(&word.as_str()))
         .collect()
+}
+
+/**
+ * A query's terms as AND-ed groups of OR-ed terms (#252): a page matches if it has at least one
+ * term of every group. Words are AND-ed; an uppercase OR between two words puts them in one
+ * group, binding tighter than AND, so "rust ipfs OR filecoin" is rust AND (ipfs OR filecoin).
+ * Lowercase "or" is a stopword. A word that normalizes to several terms ("ada-lovelace") joins
+ * by its first and last term.
+ */
+fn parse_query(query: &str) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut or_next = false;
+    for word in query.split_whitespace() {
+        if word == "OR" {
+            or_next = !groups.is_empty();
+            continue;
+        }
+        let terms = normalize(word);
+        for (i, term) in terms.iter().enumerate() {
+            match groups.last_mut() {
+                Some(group) if i == 0 && or_next => {
+                    if !group.contains(term) {
+                        group.push(term.clone())
+                    }
+                }
+                _ => groups.push(vec![term.clone()]),
+            }
+        }
+        // a skipped word ("ada OR the OR nft") leaves the OR waiting for the next one
+        or_next &= terms.is_empty();
+    }
+    groups
 }
 
 // skip anything bigger than this rather than pulling it all into memory
@@ -560,47 +592,64 @@ impl IndexQueue {
     }
 
     /**
-     * Pages containing every term of the query, best first, as (total matches, the page of them
-     * from offset, at most limit long). Scored by TF-IDF: each term counts
+     * Pages matching the query (see parse_query: every word, or any of the words joined by OR),
+     * best first, as (total matches, the page of them from offset, at most limit long). Scored by
+     * TF-IDF, summed over the query terms on the page: each counts
      * (1 + ln count on the page) * ln(1 + pages / pages with the term).
      */
     pub fn search(&self, query: &str, offset: usize, limit: usize) -> (usize, Vec<IndexResult>) {
-        let mut terms = normalize(query);
-        terms.sort();
-        terms.dedup();
+        let groups = parse_query(query);
         let pages = self.map.len().max(1) as f64;
-        let mut scores: Option<HashMap<String, f64>> = None;
-        for term in &terms {
-            let postings: HashMap<String, u32> = match self.store().postings(term) {
-                Ok(postings) if !postings.is_empty() => postings.into_iter().collect(),
-                Ok(_) => return (0, Vec::new()),
-                Err(err) => {
-                    warn!("Couldn't search for {:?}: {}", term, err);
-                    return (0, Vec::new());
+        // each distinct term's postings, read once
+        let mut postings: HashMap<&str, HashMap<String, u32>> = HashMap::new();
+        for group in &groups {
+            for term in group {
+                if postings.contains_key(term.as_str()) {
+                    continue;
                 }
-            };
-            let idf = (1.0 + pages / postings.len() as f64).ln();
-            let weight = |count: u32| (1.0 + (count.max(1) as f64).ln()) * idf;
-            scores = Some(match scores {
-                None => postings
-                    .iter()
-                    .map(|(page, count)| (page.clone(), weight(*count)))
-                    .collect(),
-                // AND: keep only pages that also have this term
-                Some(scores) => scores
-                    .into_iter()
-                    .filter_map(|(page, score)| {
-                        postings
-                            .get(&page)
-                            .map(|count| (page, score + weight(*count)))
-                    })
-                    .collect(),
-            });
+                match self.store().postings(term) {
+                    Ok(found) => postings.insert(term, found.into_iter().collect()),
+                    Err(err) => {
+                        warn!("Couldn't search for {:?}: {}", term, err);
+                        return (0, Vec::new());
+                    }
+                };
+            }
+            // a group none of whose terms are indexed matches nothing; skip reading the rest
+            if group.iter().all(|term| postings[term.as_str()].is_empty()) {
+                return (0, Vec::new());
+            }
         }
+        let weight = |term: &str, count: u32| {
+            let idf = (1.0 + pages / postings[term].len().max(1) as f64).ln();
+            (1.0 + (count.max(1) as f64).ln()) * idf
+        };
+        let has = |group: &Vec<String>, page: &String| {
+            group
+                .iter()
+                .any(|term| postings[term.as_str()].contains_key(page))
+        };
+        // candidates from the group with the fewest postings, kept if they match every group
+        let size = |group: &&Vec<String>| -> usize {
+            group.iter().map(|term| postings[term.as_str()].len()).sum()
+        };
+        let mut matches: HashSet<&String> = match groups.iter().min_by_key(size) {
+            Some(smallest) => smallest
+                .iter()
+                .flat_map(|term| postings[term.as_str()].keys())
+                .collect(),
+            None => HashSet::new(),
+        };
+        matches.retain(|page| groups.iter().all(|group| has(group, page)));
+        let scores = matches.into_iter().map(|page| {
+            let score: f64 = postings
+                .iter()
+                .filter_map(|(term, found)| found.get(page).map(|count| weight(term, *count)))
+                .sum();
+            (page.clone(), score)
+        });
         // only what's in the map is served (a page whose store write failed isn't in postings)
         let mut ranked: Vec<(f64, String)> = scores
-            .unwrap_or_default()
-            .into_iter()
             .filter(|(page, _)| self.map.contains_key(page))
             .map(|(page, score)| (score, page))
             .collect();
@@ -1572,6 +1621,54 @@ mod tests {
         assert!(found(&queue, "ada nft").is_empty());
         assert!(found(&queue, "the").is_empty());
         assert!(found(&queue, "").is_empty());
+    }
+
+    #[test]
+    fn parse_query_groups_terms_joined_by_or() {
+        let groups = |query: &str| parse_query(query);
+        assert_eq!(groups("ada lovelace"), vec![vec!["ada"], vec!["lovelace"]]);
+        assert_eq!(groups("ada OR nft"), vec![vec!["ada", "nft"]]);
+        // OR binds tighter than the implicit AND
+        assert_eq!(
+            groups("rust ipfs OR filecoin"),
+            vec![vec!["rust"], vec!["ipfs", "filecoin"]]
+        );
+        assert_eq!(groups("x OR y OR z"), vec![vec!["x", "y", "z"]]);
+        // lowercase "or" is a stopword, and a stray or doubled OR is ignored
+        assert_eq!(groups("ada or nft"), vec![vec!["ada"], vec!["nft"]]);
+        assert_eq!(groups("OR ada OR OR nft OR"), vec![vec!["ada", "nft"]]);
+        // a skipped word doesn't break the chain; OR joins the words beside it in a token
+        assert_eq!(groups("ada OR the OR nft"), vec![vec!["ada", "nft"]]);
+        assert_eq!(
+            groups("ada-lovelace OR nft"),
+            vec![vec!["ada"], vec!["lovelace", "nft"]]
+        );
+        assert_eq!(groups("Ada OR ada"), vec![vec!["ada"]]);
+        assert!(groups("OR the").is_empty());
+    }
+
+    #[test]
+    fn search_ors_terms_and_scores_by_the_terms_each_page_has() {
+        let queue = IndexQueue::new();
+        index_text(&queue, "bafyBoth", "Ada Lovelace wrote the notes.");
+        index_text(&queue, "bafyAda", "Ada, the language");
+        index_text(&queue, "bafyNft", "an NFT art DAO");
+        index_text(&queue, "bafyOther", "unrelated");
+        // pages with more of the terms rank higher
+        assert_eq!(
+            found(&queue, "ada OR lovelace"),
+            vec!["bafyBoth", "bafyAda"]
+        );
+        let mut any = found(&queue, "ada OR nft");
+        any.sort();
+        assert_eq!(any, vec!["bafyAda", "bafyBoth", "bafyNft"]);
+        // a term that matches nothing doesn't empty the results
+        assert_eq!(found(&queue, "absent OR nft"), vec!["bafyNft"]);
+        assert!(found(&queue, "absent OR missing").is_empty());
+        // each AND group still has to match
+        assert_eq!(found(&queue, "notes ada OR nft"), vec!["bafyBoth"]);
+        assert!(found(&queue, "absent ada OR nft").is_empty());
+        assert_eq!(queue.search("ada OR nft", 1, 1).0, 3);
     }
 
     #[test]
