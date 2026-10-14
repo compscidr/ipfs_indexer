@@ -1,6 +1,6 @@
 # Pages live only on disk (#231): design
 
-**Status:** draft · **Date:** 2026-10-14
+**Status:** approved · **Date:** 2026-10-14
 
 ## Goal
 
@@ -28,7 +28,6 @@ On prod (v0.2.9, 30 workers, about 2,300 pages/min), the 30-day window reaches a
 | Use | Today | After |
 |---|---|---|
 | Already indexed or mirrored, when admitting a link (`admit`) | map and mirrors lookups | `Store::known(item)`: `SELECT 1 FROM pages WHERE item = ?` or `SELECT 1 FROM mirrors WHERE item = ?`, on a dedicated read connection (`lookup`) so it doesn't wait on search or writes |
-| Same check when a worker pops an item | none (only the startup queue load dropped indexed items) | `known(item)` on pop: a queued item indexed in the meantime is skipped, not fetched again |
 | `index_length` (`/status` Index size, BM25's page count) | `map.len()` | `Store.pages` counter (exists) |
 | `mirror_length` | `mirrors.len()` | a new `Store.mirrors` counter, kept the same way as `pages` |
 | Search results → pages | `map.get(item)` | `Store::pages_by_id(ids)`: `item, cid, title, excerpt` for the K ids shown; ids not found (deleted meanwhile) are dropped, as now |
@@ -65,7 +64,9 @@ Badbits entries are SHA-256 hashes of `cid/` and `cid/path` prefixes, so the onl
 3. runs one expiry (`expire`, the indexed query) in the background, as the daily refresh thread does;
 4. finishes the erasures a crash interrupted (`maintain`, as now).
 
-**Removed:** the pre-#218 re-spelling of stored items (`rekey`, `normalize_item` on load). Like the migrations dropped in v0.2.9, it only fixed old data, and prod has none since the wipe. Queued items are already normalized by `admit` when added. Blocked and already-indexed queued items are now skipped when popped (`process_next` already checks `is_blocked`, and adds `known`).
+**Removed:** the pre-#218 re-spelling of stored items (`rekey`, `normalize_item` on load). Like the migrations dropped in v0.2.9, it only fixed old data, and prod has none since the wipe. Queued items are already normalized by `admit` when added.
+
+Blocked queued items are skipped when popped (`process_next` already checks `is_blocked`). Already-indexed queued items are fetched again, with no check when popped. Only `/admin/recrawl` and crash recovery put indexed pages in the queue, and recrawl exists to fetch them again. The startup load used to drop recrawl's leftovers on a restart; now they survive it.
 
 `attach_store`'s return value (pages loaded, blocked, expired) becomes the page count and the number of queued items; blocked and expired counts are logged when their background jobs finish.
 
@@ -110,7 +111,7 @@ They're opened like `reader`: read-only, with a busy timeout and the default cac
 - **New tests:**
   - A page blocked by a new local list entry is absent from `search` immediately after `set_local_denylist`, before the purge job has run; after `purge_for_test()` it's gone from `pages` and from every file (`dir_has`).
   - Setting the same local list twice queues no purge.
-  - `attach_store` on a store with pages and queued items doesn't call `load_all` / `queue_load`. Asserted by those functions being removed, plus a test that a blocked queued item is skipped on pop and an already-indexed one isn't fetched again.
+  - `attach_store` doesn't read every page or queued item: `load_all`, `mirrors_load` and `queue_load` become test-only helpers. A blocked queued item is skipped on pop.
   - `roots` counts match a `GROUP BY` over `pages` and `queue` after a mix of upserts, re-crawls, mirrors, deletes, queue adds, pops and removes; and after reopening.
   - The `roots` fill on a v0.2.9-shaped index matches the `GROUP BY`.
   - `/admin/recrawl` queues every indexed page with more than `WRITE_BATCH` pages.
