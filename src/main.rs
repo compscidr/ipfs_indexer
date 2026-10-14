@@ -14,6 +14,7 @@ mod admin;
 mod denylist;
 mod index_queue;
 mod index_result;
+mod segment;
 mod store;
 
 // crate version, plus the commit when built with GIT_SHA set (the docker build passes it)
