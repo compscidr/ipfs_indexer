@@ -379,7 +379,8 @@ impl Store {
 
     /// Every dead page version still recorded, as (id, item, cid, when it died)
     pub fn dead_versions(&self) -> rusqlite::Result<Vec<(u64, String, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        // a full scan: on the read connection, so upserts don't wait behind it
+        let conn = self.read_conn();
         let mut stmt = conn.prepare("SELECT id, item, cid, died_at FROM dead_pages")?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -1046,6 +1047,21 @@ pub(crate) mod tests {
             vec![("bafyR".to_string(), 2, 2)],
             "the last committed state, without waiting"
         );
+    }
+
+    #[test]
+    fn dead_versions_are_read_while_a_write_is_in_progress() {
+        let store = std::sync::Arc::new(Store::open(&temp_dir("reader-dead"), 0).unwrap());
+        store.upsert("bafyD", &page("bafyD", "d", &[]), 1).unwrap();
+        store.upsert("bafyD", &page("bafyD", "d", &[]), 2).unwrap();
+        // a crawl write holding the write connection
+        let writer = store.conn.lock().unwrap();
+        let (sent, got) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        std::thread::spawn(move || sent.send(reader.dead_versions().unwrap().len()));
+        let found = got.recv_timeout(Duration::from_secs(2));
+        drop(writer);
+        assert_eq!(found, Ok(1), "the purge's scan doesn't wait for the crawl");
     }
 
     #[test]

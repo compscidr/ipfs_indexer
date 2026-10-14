@@ -1,6 +1,6 @@
 # Segmented inverted index with takedown erasure (#247, #249): design
 
-**Status:** pending spec review · **Date:** 2026-10-13
+**Status:** approved · **Date:** 2026-10-13
 
 ## Goal
 
