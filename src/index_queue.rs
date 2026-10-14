@@ -280,6 +280,27 @@ impl IndexQueue {
         self.store().flush().unwrap();
     }
 
+    #[cfg(test)]
+    pub(crate) fn maintain_for_test(&self) {
+        self.store().maintain();
+    }
+
+    /// Waits for, then runs, one round of index upkeep (#247): for a dedicated thread
+    pub fn maintain_store(&self) {
+        let store = self.store();
+        store.wait_for_maintenance();
+        store.maintain();
+    }
+
+    /// Writes buffered postings to disk, for a clean shutdown
+    pub fn flush_store(&self) {
+        if let Some(store) = self.store.get() {
+            if let Err(err) = store.flush() {
+                warn!("Couldn't flush the index: {}", err);
+            }
+        }
+    }
+
     /// Limit gateway requests to `per_min` a minute across all workers (0 = no limit)
     pub fn set_gateway_rate(&self, per_min: u32) {
         let _ = self.throttle.set(Throttle::per_minute(per_min));
@@ -396,6 +417,15 @@ impl IndexQueue {
             store.queue_len(),
             dropped.len()
         );
+        // versions blocked while the index was down, then the erasures, before serving (#249)
+        let blocked_versions: Vec<u64> = store
+            .dead_versions()?
+            .into_iter()
+            .filter(|(_, item, cid, _)| self.blocked_quietly(item) || self.blocked_quietly(cid))
+            .map(|(id, ..)| id)
+            .collect();
+        store.erase_ids(&blocked_versions)?;
+        store.maintain();
         if self.store.set(store).is_err() {
             panic!("attach_store must run before the store is first used");
         }
@@ -446,6 +476,21 @@ impl IndexQueue {
         if let Err(err) = store.delete(&old, true) {
             warn!("Couldn't delete expired pages: {}", err);
             return 0;
+        }
+        // old versions of re-crawled pages don't outlive the retention window either
+        let cutoff = now_secs() - max_age_secs;
+        match store.dead_versions() {
+            Ok(versions) => {
+                let old_versions: Vec<u64> = versions
+                    .into_iter()
+                    .filter(|(.., died_at)| *died_at < cutoff)
+                    .map(|(id, ..)| id)
+                    .collect();
+                if let Err(err) = store.erase_ids(&old_versions) {
+                    warn!("Couldn't mark expired versions to erase: {}", err);
+                }
+            }
+            Err(err) => warn!("Couldn't check old page versions: {}", err),
         }
         for item in &old {
             self.map.remove(item);
@@ -513,6 +558,27 @@ impl IndexQueue {
                     removed.len(),
                     err
                 );
+            }
+            // superseded versions whose own item or cid is now blocked, e.g. one that redirected
+            // to a cid since taken down (#249)
+            match store.dead_versions() {
+                Ok(versions) => {
+                    let blocked: Vec<u64> = versions
+                        .into_iter()
+                        .filter(|(_, item, cid, _)| {
+                            denylist.is_blocked(item) || denylist.is_blocked(cid)
+                        })
+                        .map(|(id, ..)| id)
+                        .collect();
+                    if let Err(err) = store.erase_ids(&blocked) {
+                        warn!(
+                            "Couldn't mark {} blocked versions to erase: {}",
+                            blocked.len(),
+                            err
+                        );
+                    }
+                }
+                Err(err) => warn!("Couldn't check old page versions: {}", err),
             }
         }
         removed.len()
@@ -1162,6 +1228,63 @@ mod tests {
     const DAY: i64 = 24 * 60 * 60;
     const GOOD: &str = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
     const BAD: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+
+    use crate::store::tests::dir_has;
+
+    #[test]
+    fn a_takedown_hides_the_page_at_once_and_erases_it_from_every_file() {
+        let dir = temp_dir("takedown-segments");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.persist(BAD, &page(BAD, "t", &[("zzqxsegmentterm91", 2)]));
+        queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
+        queue.flush_for_test();
+        assert!(
+            dir_has(&dir, "zzqxsegmentterm91"),
+            "on disk before the takedown"
+        );
+
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        assert!(
+            queue.search("zzqxsegmentterm91", 0, 10).1.is_empty(),
+            "gone at once"
+        );
+        queue.maintain_for_test(); // what the upkeep thread does next
+        assert!(!dir_has(&dir, "zzqxsegmentterm91"));
+        assert_eq!(queue.search("alpha", 0, 10).1.len(), 1);
+    }
+
+    #[test]
+    fn a_takedown_of_an_old_versions_redirected_cid_erases_it() {
+        let dir = temp_dir("takedown-version");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        // GOOD's item once redirected to BAD's cid; it now resolves elsewhere
+        let old = page(BAD, "t", &[("zzqxredirectterm", 1)]); // its cid is BAD
+        queue.persist(GOOD, &old);
+        for i in 0..5 {
+            let item = format!("{}/other{}", GOOD, i);
+            queue.persist(&item, &page(&item, "o", &[("alpha", 1)]));
+        }
+        queue.flush_for_test();
+        queue.persist(GOOD, &page(GOOD, "t", &[("beta", 1)]));
+        queue.flush_for_test();
+        queue.maintain_for_test();
+        assert!(dir_has(&dir, "zzqxredirectterm"), "only in the old version");
+
+        queue.set_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue.maintain_for_test();
+        assert!(!dir_has(&dir, "zzqxredirectterm"));
+        assert_eq!(
+            queue.search("beta", 0, 10).1.len(),
+            1,
+            "the current page isn't blocked"
+        );
+    }
 
     fn file_has(store_dir: &std::path::Path, needle: &str) -> bool {
         let bytes = std::fs::read(store_dir.join("index.sqlite")).unwrap();
