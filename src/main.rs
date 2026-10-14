@@ -298,13 +298,7 @@ async fn main() -> std::io::Result<()> {
     };
     if let Ok(dir) = std::env::var("DATA_DIR") {
         info!("Index cache: at most {} MB in memory", cache_mb);
-        let attached = store::Store::open(std::path::Path::new(&dir), cache_mb)
-            .map_err(|err| err.to_string())
-            .and_then(|store| {
-                index_queue
-                    .attach_store(store, max_age_secs)
-                    .map_err(|err| err.to_string())
-            });
+        let attached = index_queue.open_store(std::path::Path::new(&dir), cache_mb, max_age_secs);
         match attached {
             Ok((loaded, blocked, expired)) => info!(
                 "Loaded {} pages from {}/index.sqlite (dropped {} blocked, {} expired)",

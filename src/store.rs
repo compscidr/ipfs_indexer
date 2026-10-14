@@ -1,7 +1,5 @@
-use crate::index_queue::normalize;
 use crate::index_result::IndexResult;
-use crate::segment::Posting;
-use crate::segments::{Maintained, Segments};
+use crate::segments::{erase_file, Maintained, Segments};
 use log::info;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::HashMap;
@@ -44,6 +42,13 @@ pub struct Store {
     pages: AtomicUsize,
     lengths: AtomicU64,
 }
+
+/**
+ * The most items one transaction deletes or queues. The rollback journal is in memory, so a
+ * transaction's size is RAM: one over a whole expiry, purge or recrawl could reach gigabytes,
+ * and being killed mid-commit with the journal gone corrupts the file.
+ */
+const WRITE_BATCH: usize = 1000;
 
 pub type OpenError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -95,19 +100,6 @@ const SCHEMA: &str = "
         item TEXT PRIMARY KEY
     );";
 
-// the inverted index before #247; only the migrations from older schemas create it
-const LEGACY_POSTINGS: &str = "
-    CREATE TABLE IF NOT EXISTS postings (
-        term  TEXT NOT NULL,
-        page  INTEGER NOT NULL,
-        count INTEGER NOT NULL,
-        PRIMARY KEY (term, page)
-    ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS terms (
-        term  TEXT PRIMARY KEY,
-        pages INTEGER NOT NULL
-    ) WITHOUT ROWID;";
-
 impl Store {
     /// Opens DATA_DIR's index; SQLite keeps at most cache_mb of it in memory
     pub fn open(dir: &Path, cache_mb: u32) -> Result<Store, OpenError> {
@@ -148,7 +140,7 @@ impl Store {
         // memory journal already means a crash can corrupt the file (rebuild); this extends that
         // to power loss.
         conn.pragma_update(None, "synchronous", "OFF")?;
-        // sorts and VACUUM's copy stay in RAM: a temp file would hold plaintext
+        // sorts and temp tables stay in RAM: a temp file would hold plaintext
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         // a commit waits for the reader's queries to finish rather than failing
         conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -156,16 +148,8 @@ impl Store {
             // negative: in KiB rather than pages
             conn.pragma_update(None, "cache_size", -(cache_mb as i64) * 1024)?;
         }
-        migrate_keywords_column(&mut conn)?;
+        refuse_old_format(&conn)?;
         conn.execute_batch(SCHEMA)?;
-        let has_text_hash: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('pages') WHERE name = 'text_hash'")?
-            .exists([])?;
-        if !has_text_hash {
-            conn.execute_batch("ALTER TABLE pages ADD COLUMN text_hash BLOB")?;
-        }
-        migrate_page_lengths(&mut conn)?;
-        migrate_postings_to_segments(&mut conn, &segments)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS pages_text_hash ON pages (text_hash);
              CREATE INDEX IF NOT EXISTS mirrors_page ON mirrors (page);
@@ -343,12 +327,21 @@ impl Store {
     }
 
     /**
-     * Deletes pages and their mirrors in one transaction (items that are mirrors themselves are
-     * dropped too); returns how many pages went. They leave search at once. With `erase`
-     * (takedowns, expiry), the segment files holding them or any earlier version of them are
-     * rewritten without them promptly (#249).
+     * Deletes pages and their mirrors (items that are mirrors themselves are dropped too);
+     * returns how many pages went. They leave search at once. With `erase` (takedowns, expiry),
+     * the segment files holding them or any earlier version of them are rewritten without them
+     * promptly (#249). Commits every WRITE_BATCH items, so an error part-way leaves the earlier
+     * batches deleted: callers retry the whole list (expiry and startup pick up what's left).
      */
     pub fn delete(&self, items: &[String], erase: bool) -> rusqlite::Result<usize> {
+        let mut deleted = 0;
+        for batch in items.chunks(WRITE_BATCH) {
+            deleted += self.delete_batch(batch, erase)?;
+        }
+        Ok(deleted)
+    }
+
+    fn delete_batch(&self, items: &[String], erase: bool) -> rusqlite::Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let (mut dead, mut erased, mut length) = (Vec::new(), Vec::new(), 0);
@@ -547,22 +540,28 @@ impl Store {
         self.segments.flush()
     }
 
-    /// Adds items to the frontier in one transaction; ones already there are ignored. Returns
-    /// how many were new.
+    /// Adds items to the frontier, committing every WRITE_BATCH items (an error part-way keeps
+    /// the batches before it); ones already there are ignored. Returns how many were new.
     pub fn queue_add(&self, items: &[String]) -> rusqlite::Result<usize> {
         let start = Instant::now();
-        let mut conn = self.conn.lock().unwrap();
-        let waited = start.elapsed();
-        let tx = conn.transaction()?;
-        let mut added = 0;
-        {
-            let mut stmt = tx.prepare_cached("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
-            for item in items {
-                added += stmt.execute([item])?;
+        let (mut added, mut waited) = (0, Duration::ZERO);
+        for batch in items.chunks(WRITE_BATCH) {
+            let locking = Instant::now();
+            let mut conn = self.conn.lock().unwrap();
+            waited += locking.elapsed();
+            let tx = conn.transaction()?;
+            let mut batch_added = 0;
+            {
+                let mut stmt =
+                    tx.prepare_cached("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
+                for item in batch {
+                    batch_added += stmt.execute([item])?;
+                }
             }
+            tx.commit()?;
+            self.queued.fetch_add(batch_added, Ordering::Relaxed);
+            added += batch_added;
         }
-        tx.commit()?;
-        self.queued.fetch_add(added, Ordering::Relaxed);
         info!(
             "Store queue_add: {} of {} new, waited {:?}, took {:?}",
             added,
@@ -574,17 +573,19 @@ impl Store {
     }
 
     pub fn queue_remove(&self, items: &[String]) -> rusqlite::Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        let mut removed = 0;
-        {
-            let mut stmt = tx.prepare_cached("DELETE FROM queue WHERE item = ?1")?;
-            for item in items {
-                removed += stmt.execute([item])?;
+        for batch in items.chunks(WRITE_BATCH) {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            let mut removed = 0;
+            {
+                let mut stmt = tx.prepare_cached("DELETE FROM queue WHERE item = ?1")?;
+                for item in batch {
+                    removed += stmt.execute([item])?;
+                }
             }
+            tx.commit()?;
+            self.queued.fetch_sub(removed, Ordering::Relaxed);
         }
-        tx.commit()?;
-        self.queued.fetch_sub(removed, Ordering::Relaxed);
         Ok(())
     }
 
@@ -660,108 +661,99 @@ impl Store {
 
     // makes every following read/write fail, to exercise callers' error handling
     pub(crate) fn break_for_test(&self) {
+        self.drop_table_for_test("pages");
+    }
+
+    // makes only what touches `table` fail
+    pub(crate) fn drop_table_for_test(&self, table: &str) {
         self.conn
             .lock()
             .unwrap()
-            .execute_batch("DROP TABLE pages")
+            .execute_batch(&format!("DROP TABLE {}", table))
             .unwrap();
     }
 }
 
+/// Wiping and rebuilding is how to upgrade an index file older than this one (see `OldFormat`)
+pub const WIPE: &str = "rm -r $DATA_DIR/index.sqlite* $DATA_DIR/segments";
+
 /**
- * #231: `pages` used to carry each page's keyword counts as text, and the inverted index was
- * rebuilt in RAM from them at every start. Moves them into `postings`/`terms` (once, in one
- * transaction) and gives pages an explicit id for postings to refer to. Counts saved before
- * #209 were keyed by raw words ("Files."); they're merged under normalized terms on the way.
+ * An index file from before v0.2.6 (postings still in SQLite, or pages without the columns
+ * added since). Converting one in place took hours and, on a 30 GB file, ran out of memory
+ * halfway and corrupted it, so it's refused: wipe it and it's rebuilt by crawling.
  */
-fn migrate_keywords_column(conn: &mut Connection) -> rusqlite::Result<()> {
-    let has_keywords: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('pages') WHERE name = 'keywords'")?
-        .exists([])?;
-    if !has_keywords {
-        return Ok(());
+#[derive(Debug)]
+pub struct OldFormat;
+
+impl std::fmt::Display for OldFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "index.sqlite is from before v0.2.6 and can't be converted; wipe it ({}) and it \
+             is rebuilt by crawling",
+            WIPE
+        )
     }
-    log::info!("Moving keyword counts into the postings table (one-time, #231)");
-    let tx = conn.transaction()?;
-    tx.execute_batch(
-        "ALTER TABLE pages RENAME TO pages_old;
-         CREATE TEMP TABLE staged (term TEXT NOT NULL, page INTEGER NOT NULL, count INTEGER NOT NULL);",
-    )?;
-    tx.execute_batch(SCHEMA)?;
-    tx.execute_batch(LEGACY_POSTINGS)?;
+}
+
+impl std::error::Error for OldFormat {}
+
+/// Whether opening failed because the index is damaged (SQLite's "malformed", or a segment or
+/// MANIFEST failing its checks), as opposed to a missing directory, permissions or a full disk
+pub fn is_corrupt(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(rusqlite::Error::SqliteFailure(failure, _)) = err.downcast_ref::<rusqlite::Error>()
     {
-        let mut old = tx.prepare(
-            "SELECT item, cid, title, excerpt, keywords, indexed_at FROM pages_old ORDER BY rowid",
-        )?;
-        let mut page = tx.prepare(
-            "INSERT INTO pages (item, cid, title, excerpt, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5)
-             RETURNING id",
-        )?;
-        let mut stage = tx.prepare("INSERT INTO staged (term, page, count) VALUES (?1, ?2, ?3)")?;
-        let mut rows = old.query([])?;
-        while let Some(row) = rows.next()? {
-            let keywords: String = row.get(4)?;
-            let id: i64 = page.query_row(
-                params![
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(5)?
-                ],
-                |r| r.get(0),
-            )?;
-            for (word, count) in decode_keywords(&keywords) {
-                for term in normalize(&word) {
-                    stage.execute(params![term, id, count])?;
-                }
-            }
-        }
+        return matches!(
+            failure.code,
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+        );
     }
-    // inserted in key order: far faster than random inserts into the b-tree
-    tx.execute_batch(
-        "INSERT INTO postings (term, page, count)
-           SELECT term, page, sum(count) FROM staged GROUP BY term, page ORDER BY term, page;
-         INSERT INTO terms (term, pages) SELECT term, count(*) FROM postings GROUP BY term;
-         UPDATE pages SET length = (SELECT coalesce(sum(count), 0) FROM staged
-                                    WHERE staged.page = pages.id);
-         DROP TABLE staged;
-         DROP TABLE pages_old;",
-    )?;
-    tx.commit()
+    matches!(err.downcast_ref::<std::io::Error>(), Some(io) if io.kind() == std::io::ErrorKind::InvalidData)
 }
 
 /**
- * #251: pages stored before BM25 have no length. Adds the column and fills it from their
- * postings, once.
+ * Erases DATA_DIR's index so the next open starts empty: index.sqlite (and anything SQLite left
+ * beside it) and every segment file, each zeroed before it's removed. A damaged file may have
+ * lost the record of which pages were taken down, so its text gets the same erasure (#249).
  */
-fn migrate_page_lengths(conn: &mut Connection) -> rusqlite::Result<()> {
-    let has_length: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('pages') WHERE name = 'length'")?
-        .exists([])?;
-    if has_length {
-        return Ok(());
+pub fn wipe(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let is_index = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("index.sqlite"));
+        if is_index && path.is_file() {
+            erase_file(&path)?;
+        }
     }
-    let has_postings: bool = conn
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'postings'")?
-        .exists([])?;
-    if !has_postings {
-        conn.execute_batch("ALTER TABLE pages ADD COLUMN length INTEGER NOT NULL DEFAULT 0")?;
-        return Ok(());
+    let segments = dir.join("segments");
+    if segments.is_dir() {
+        for entry in std::fs::read_dir(&segments)? {
+            erase_file(&entry?.path())?;
+        }
+        std::fs::remove_dir(&segments)?;
     }
-    log::info!("Computing page lengths from their postings (one-time, #251)");
-    // postings has no index on page, so a subquery per page would scan all of it for every
-    // page: one pass summing into a temp table (in memory, a row per page) instead
-    let tx = conn.transaction()?;
-    tx.execute_batch(
-        "ALTER TABLE pages ADD COLUMN length INTEGER NOT NULL DEFAULT 0;
-         CREATE TEMP TABLE lengths (page INTEGER PRIMARY KEY, length INTEGER NOT NULL);
-         INSERT INTO lengths (page, length) SELECT page, count FROM postings WHERE true
-           ON CONFLICT (page) DO UPDATE SET length = length + excluded.length;
-         UPDATE pages SET length = lengths.length FROM lengths WHERE lengths.page = pages.id;
-         DROP TABLE lengths;",
-    )?;
-    tx.commit()
+    Ok(())
+}
+
+fn refuse_old_format(conn: &Connection) -> Result<(), OpenError> {
+    let has_table = |name: &str| -> rusqlite::Result<bool> {
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+            .exists([name])
+    };
+    if !has_table("pages")? {
+        return Ok(()); // a new file
+    }
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('pages')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let has_column = |name: &str| columns.iter().any(|c| c == name);
+    if has_table("postings")? || !has_column("length") || !has_column("text_hash") {
+        return Err(Box::new(OldFormat));
+    }
+    Ok(())
 }
 
 /**
@@ -843,98 +835,6 @@ fn record_orphans(conn: &mut Connection, segments: &Segments) -> rusqlite::Resul
         }
     }
     tx.commit()
-}
-
-/**
- * #247: postings move from SQLite into segment files. Streams the postings table (in term order
- * already) into one segment, then drops it, rebuilds `pages` with AUTOINCREMENT keeping its ids,
- * and vacuums. If this is interrupted the postings table is still there, and the next start
- * redoes it, erasing the segment the earlier attempt wrote.
- */
-fn migrate_postings_to_segments(
-    conn: &mut Connection,
-    segments: &Segments,
-) -> Result<(), OpenError> {
-    let has_postings: bool = conn
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'postings'")?
-        .exists([])?;
-    if !has_postings {
-        return Ok(());
-    }
-    info!("Moving postings into segment files (one-time, #247)");
-    let max_id: i64 = conn.query_row("SELECT coalesce(max(id), 0) FROM pages", [], |r| r.get(0))?;
-    let sql = std::io::Error::other;
-    segments.bulk_load(max_id as u64, |writer| {
-        let mut docs = conn
-            .prepare("SELECT id, length FROM pages ORDER BY id")
-            .map_err(sql)?;
-        let mut rows = docs.query([]).map_err(sql)?;
-        while let Some(row) = rows.next().map_err(sql)? {
-            let id: i64 = row.get(0).map_err(sql)?;
-            let length: i64 = row.get(1).map_err(sql)?;
-            writer.add_doc(id as u64, length as u32)?;
-        }
-        // BINARY collation is bytewise, the order segments need
-        let mut postings = conn
-            .prepare(
-                "SELECT postings.term, postings.page, postings.count FROM postings
-                 JOIN pages ON pages.id = postings.page ORDER BY postings.term, postings.page",
-            )
-            .map_err(sql)?;
-        let mut rows = postings.query([]).map_err(sql)?;
-        let (mut term, mut list): (Option<String>, Vec<Posting>) = (None, Vec::new());
-        while let Some(row) = rows.next().map_err(sql)? {
-            let next: String = row.get(0).map_err(sql)?;
-            if term.as_deref() != Some(next.as_str()) {
-                if let Some(done) = term.replace(next) {
-                    writer.add_term(done.as_bytes(), &list)?;
-                    list.clear();
-                }
-            }
-            let page: i64 = row.get(1).map_err(sql)?;
-            let count: i64 = row.get(2).map_err(sql)?;
-            list.push((page as u64, count as u32));
-        }
-        if let Some(done) = term {
-            writer.add_term(done.as_bytes(), &list)?;
-        }
-        Ok(())
-    })?;
-    let tx = conn.transaction()?;
-    tx.execute_batch(
-        "CREATE TABLE pages_new (
-             id         INTEGER PRIMARY KEY AUTOINCREMENT,
-             item       TEXT NOT NULL UNIQUE,
-             cid        TEXT NOT NULL,
-             title      TEXT NOT NULL,
-             excerpt    TEXT NOT NULL,
-             indexed_at INTEGER NOT NULL,
-             length     INTEGER NOT NULL DEFAULT 0,
-             text_hash  BLOB
-         );
-         INSERT INTO pages_new (id, item, cid, title, excerpt, indexed_at, length, text_hash)
-           SELECT id, item, cid, title, excerpt, indexed_at, length, text_hash FROM pages;
-         DROP TABLE pages;
-         ALTER TABLE pages_new RENAME TO pages;
-         DROP TABLE postings;
-         DROP TABLE IF EXISTS terms;",
-    )?;
-    tx.commit()?;
-    // secure_delete zeroed the dropped tables' pages; this gives the space back
-    if let Err(err) = conn.execute_batch("VACUUM") {
-        log::warn!("Couldn't vacuum after moving the postings: {}", err);
-    }
-    Ok(())
-}
-
-// the old keywords column: "word count" per line
-fn decode_keywords(text: &str) -> HashMap<String, u32> {
-    text.lines()
-        .filter_map(|line| {
-            let (word, count) = line.split_once(' ')?;
-            Some((word.to_string(), count.parse().ok()?))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1290,30 +1190,54 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn adds_the_text_hash_column_to_an_existing_index() {
-        // the schema between #231 and #253
-        let dir = temp_dir("texthash");
-        Connection::open(dir.join("index.sqlite"))
-            .unwrap()
-            .execute_batch(
-                "CREATE TABLE pages (id INTEGER PRIMARY KEY, item TEXT NOT NULL UNIQUE,
-                   cid TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
-                   indexed_at INTEGER NOT NULL);
-                 CREATE TABLE postings (term TEXT NOT NULL, page INTEGER NOT NULL,
-                   count INTEGER NOT NULL, PRIMARY KEY (term, page)) WITHOUT ROWID;
-                 INSERT INTO pages VALUES (1, 'bafyA', 'bafyA', 'A', 'e', 5);",
-            )
-            .unwrap();
-        let store = Store::open(&dir, 0).unwrap();
-        assert_eq!(store.load_all().unwrap().len(), 1);
-        assert_eq!(
+    fn deletes_and_queue_changes_bigger_than_a_batch_all_land() {
+        let store = Store::open_in_memory().unwrap();
+        let n = WRITE_BATCH * 2 + 500;
+        let items: Vec<String> = (0..n).map(|i| format!("bafyQ{}", i)).collect();
+        assert_eq!(store.queue_add(&items).unwrap(), n);
+        assert_eq!(store.queue_len(), n);
+        store.queue_remove(&items).unwrap();
+        assert_eq!(store.queue_len(), 0);
+
+        for item in &items {
             store
-                .upsert("bafyB", &hashed("bafyB", &[], b"h"), 1)
-                .unwrap(),
-            Upserted::Indexed
-        );
-        drop(store);
-        assert_eq!(Store::open(&dir, 0).unwrap().load_all().unwrap().len(), 2);
+                .upsert(item, &page(item, "t", &[("word", 1)]), 1)
+                .unwrap();
+        }
+        assert_eq!(store.delete(&items, true).unwrap(), n);
+        assert!(store.load_all().unwrap().is_empty());
+        assert_eq!(store.average_length(), 0.0);
+    }
+
+    #[test]
+    fn refuses_an_index_from_before_segments_and_leaves_it_alone() {
+        let schemas = [
+            // before #231: keyword counts as text
+            "CREATE TABLE pages (item TEXT PRIMARY KEY, cid TEXT NOT NULL, title TEXT NOT NULL,
+               excerpt TEXT NOT NULL, keywords TEXT NOT NULL, indexed_at INTEGER NOT NULL);",
+            // #231 to #251: postings in SQLite, no length
+            "CREATE TABLE pages (id INTEGER PRIMARY KEY, item TEXT NOT NULL UNIQUE,
+               cid TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
+               indexed_at INTEGER NOT NULL);
+             CREATE TABLE postings (term TEXT NOT NULL, page INTEGER NOT NULL,
+               count INTEGER NOT NULL, PRIMARY KEY (term, page)) WITHOUT ROWID;",
+            // #251 to #247: every column, postings still in SQLite
+            "CREATE TABLE pages (id INTEGER PRIMARY KEY, item TEXT NOT NULL UNIQUE,
+               cid TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
+               indexed_at INTEGER NOT NULL, length INTEGER NOT NULL DEFAULT 0, text_hash BLOB);
+             CREATE TABLE postings (term TEXT NOT NULL, page INTEGER NOT NULL,
+               count INTEGER NOT NULL, PRIMARY KEY (term, page)) WITHOUT ROWID;",
+        ];
+        for (i, schema) in schemas.iter().enumerate() {
+            let dir = temp_dir(&format!("old-format-{}", i));
+            let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+            conn.execute_batch(schema).unwrap();
+            drop(conn);
+            let err = Store::open(&dir, 0).err().expect("an old index is refused");
+            assert!(err.is::<OldFormat>(), "schema {}: {}", i, err);
+            assert!(!is_corrupt(&*err), "an old index isn't wiped as corrupt");
+            assert!(dir_has_table(&dir, "pages"), "schema {} left as it was", i);
+        }
     }
 
     #[test]
@@ -1339,82 +1263,6 @@ pub(crate) mod tests {
         assert_eq!(store.average_length(), 1.0);
         drop(store);
         assert_eq!(Store::open(&dir, 0).unwrap().average_length(), 1.0);
-    }
-
-    #[test]
-    fn migrates_pages_without_a_length() {
-        // the schema between #231 and #251
-        let dir = temp_dir("migrate-length");
-        let conn = Connection::open(dir.join("index.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE pages (id INTEGER PRIMARY KEY, item TEXT NOT NULL UNIQUE,
-               cid TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
-               indexed_at INTEGER NOT NULL);
-             CREATE TABLE postings (term TEXT NOT NULL, page INTEGER NOT NULL,
-               count INTEGER NOT NULL, PRIMARY KEY (term, page)) WITHOUT ROWID;
-             INSERT INTO pages VALUES (1, 'bafyA', 'bafyA', 'A', 'e', 5);
-             INSERT INTO pages VALUES (2, 'bafyB', 'bafyB', 'B', 'e', 6);
-             INSERT INTO pages VALUES (3, 'bafyC', 'bafyC', 'C', 'e', 7);
-             INSERT INTO postings VALUES ('alpha', 1, 2), ('beta', 1, 3), ('alpha', 2, 1);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let store = Store::open(&dir, 0).unwrap();
-        let mut alpha = postings_by_item(&store, "alpha");
-        alpha.sort();
-        assert_eq!(
-            alpha,
-            vec![("bafyA".to_string(), 2, 5), ("bafyB".to_string(), 1, 1)]
-        );
-        // C has no postings: length 0
-        assert_eq!(store.average_length(), 2.0);
-        assert!(!dir_has_table(&dir, "postings"));
-    }
-
-    #[test]
-    fn decode_skips_malformed_keyword_lines() {
-        let decoded = decode_keywords("good 3\nno-count\nbad x\n\nalso 1");
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded.get("good"), Some(&3));
-    }
-
-    #[test]
-    fn migrates_the_old_keywords_column_into_postings() {
-        // the schema before #231, with counts saved before #209 normalization
-        let dir = temp_dir("migrate");
-        let conn = Connection::open(dir.join("index.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE pages (item TEXT PRIMARY KEY, cid TEXT NOT NULL, title TEXT NOT NULL,
-               excerpt TEXT NOT NULL, keywords TEXT NOT NULL, indexed_at INTEGER NOT NULL);
-             CREATE TABLE queue (item TEXT PRIMARY KEY);
-             INSERT INTO pages VALUES ('bafyA', 'bafyA', 'A', 'e', 'files. 2\nFiles 1\nalpha 1\n', 5);
-             INSERT INTO pages VALUES ('bafyB', 'bafyB', 'B', 'e', 'alpha 4\n', 6);
-             INSERT INTO queue VALUES ('bafyQ');",
-        )
-        .unwrap();
-        drop(conn);
-
-        let store = Store::open(&dir, 0).unwrap();
-        assert_eq!(
-            postings_by_item(&store, "files"),
-            vec![("bafyA".to_string(), 3, 4)]
-        );
-        let mut alpha = postings_by_item(&store, "alpha");
-        alpha.sort();
-        assert_eq!(
-            alpha,
-            vec![("bafyA".to_string(), 1, 4), ("bafyB".to_string(), 4, 4)]
-        );
-        assert_eq!(store.term_count(), 2);
-        assert_eq!(store.average_length(), 4.0);
-        assert_eq!(store.top_terms(1).unwrap(), vec![("alpha".to_string(), 2)]);
-        assert_eq!(store.load_all().unwrap().len(), 2);
-        assert_eq!(store.queue_load().unwrap(), vec!["bafyQ"]);
-        assert!(!dir_has_table(&dir, "postings"));
-        // and re-opening doesn't migrate again
-        drop(store);
-        assert_eq!(Store::open(&dir, 0).unwrap().term_count(), 2);
     }
 
     #[test]
@@ -1594,48 +1442,6 @@ pub(crate) mod tests {
         assert!(dir_has(&dir, "zzqxsegmentterm91"));
         Store::open(&dir, 0).unwrap();
         assert!(!dir_has(&dir, "zzqxsegmentterm91"));
-    }
-
-    #[test]
-    fn migrates_postings_into_a_segment_and_out_of_sqlite() {
-        // the schema between #251 and #247
-        let dir = temp_dir("migrate-segments");
-        let conn = Connection::open(dir.join("index.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE pages (id INTEGER PRIMARY KEY, item TEXT NOT NULL UNIQUE,
-               cid TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
-               indexed_at INTEGER NOT NULL, length INTEGER NOT NULL DEFAULT 0, text_hash BLOB);
-             CREATE TABLE postings (term TEXT NOT NULL, page INTEGER NOT NULL,
-               count INTEGER NOT NULL, PRIMARY KEY (term, page)) WITHOUT ROWID;
-             CREATE TABLE terms (term TEXT PRIMARY KEY, pages INTEGER NOT NULL) WITHOUT ROWID;
-             INSERT INTO pages VALUES (4, 'a', 'a', 't', 'e', 1, 3, NULL),
-                                      (9, 'b', 'b', 't', 'e', 1, 1, NULL);
-             INSERT INTO postings VALUES ('zzqxmigratedterm', 4, 2), ('shared', 4, 1),
-                                         ('shared', 9, 1);
-             INSERT INTO terms VALUES ('zzqxmigratedterm', 1), ('shared', 2);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let store = Store::open(&dir, 0).unwrap();
-        assert_eq!(
-            postings_by_item(&store, "shared"),
-            vec![("a".into(), 1, 3), ("b".into(), 1, 1)]
-        );
-        assert_eq!(
-            postings_by_item(&store, "zzqxmigratedterm"),
-            vec![("a".into(), 2, 3)]
-        );
-        assert!(!dir_has_table(&dir, "postings") && !dir_has_table(&dir, "terms"));
-        assert!(!contains(
-            &fs::read(dir.join("index.sqlite")).unwrap(),
-            "zzqxmigratedterm"
-        ));
-        // ids kept, never reused: not even the highest one's, once its page is gone
-        store.delete(&["b".to_string()], false).unwrap();
-        store.upsert("c", &page("c", "c", &[]), 1).unwrap();
-        let c = store.items(&[10]).unwrap();
-        assert_eq!(c.get(&10).map(String::as_str), Some("c"));
     }
 
     #[test]

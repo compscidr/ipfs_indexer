@@ -187,7 +187,7 @@ pub struct Segments {
     retired: Mutex<Vec<Retired>>,
     // one merge cascade at a time
     merging: Mutex<()>,
-    // flushes and erase rewrites (and bulk_load), one at a time; never held by a merge
+    // flushes and erase rewrites, one at a time; never held by a merge
     writes: Mutex<()>,
     // an install's read-modify-write of the segment set and the manifest
     install: Mutex<()>,
@@ -1216,23 +1216,6 @@ impl Segments {
             .collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok((count, ranked))
-    }
-
-    /// Replaces every segment with one written by `fill`, for the #247 migration. What was
-    /// there (from an interrupted earlier attempt) is erased.
-    /// Only at startup, before any search can hold a segment: the old files are erased at once.
-    pub fn bulk_load(
-        &self,
-        flushed_through: u64,
-        fill: impl FnOnce(&mut SegmentWriter) -> io::Result<()>,
-    ) -> io::Result<()> {
-        let _writes = lock(&self.writes);
-        let old: Vec<Arc<Segment>> = self.state.read().unwrap().segments.to_vec();
-        let pin = self.pin();
-        let segment = self.write_segment(fill)?;
-        self.install(&old, segment, &pin, Some(flushed_through))?;
-        drop(old);
-        self.retire()
     }
 }
 

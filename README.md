@@ -54,18 +54,18 @@ For your own takedowns, set `LOCAL_DENYLIST=/path/to/local.deny`:
 Set `DATA_DIR` to keep the index across restarts: pages, mirrors and the crawl queue in `$DATA_DIR/index.sqlite`, the keyword index in `$DATA_DIR/segments/`.
 
 - **Stored per page:** the CID/path, title, 128-character excerpt, keyword counts and when it was indexed. Nothing else.
-- **The keyword index** (which pages each word is on, and how often) lives on disk, not in memory (#231), in immutable segment files listed by `segments/MANIFEST` (#247). New pages are buffered in memory and written as a new segment every 60 s or 1M keyword entries; a background thread merges small segments into larger ones, up to 1 GiB; segments that size or larger aren't merged further, which bounds how long a merge or a takedown's rewrite takes, at the cost of a few more files per search on a very large index. An index from before this keeps its keyword index inside `index.sqlite`; it's moved into a segment on the first start, which can take a few minutes for a large index.
+- **The keyword index** (which pages each word is on, and how often) lives on disk, not in memory (#231), in immutable segment files listed by `segments/MANIFEST` (#247). New pages are buffered in memory and written as a new segment every 60 s or 1M keyword entries; a background thread merges small segments into larger ones, up to 1 GiB; segments that size or larger aren't merged further, which bounds how long a merge or a takedown's rewrite takes, at the cost of a few more files per search on a very large index. An `index.sqlite` from before v0.2.6 (keyword index still inside it) isn't converted: the indexer refuses to start and says to wipe it (converting one in place ran out of memory on a 30 GB index and corrupted it).
 - **The crawl queue** (CID/paths waiting to be fetched, no content) is stored too, so a restart resumes the crawl. It lives only on disk, not in memory (#231). An item leaves it when a worker takes it, so a crash loses at most the few items being fetched.
 - **Startup:** both denylists are loaded first. Stored pages that are now denylisted, or older than `INDEX_MAX_AGE_DAYS`, are deleted. Only then are the remaining pages loaded, and the saved queue (minus anything now denylisted or already indexed); then crawling and serving start.
 - **Takedowns:**
   - Whenever a denylist refresh removes pages, they leave search results at once. Their rows are deleted from `index.sqlite`, where `secure_delete` overwrites them with zeros.
   - Within seconds, every segment file holding the page, or any earlier version of it (a re-crawl gets a new entry), is rewritten without it. The old files are overwritten with zeros, synced and removed (#249). Expired pages and expired old versions are erased the same way.
-  - The rollback journal is kept in memory, so plaintext copies of pages are never written to a separate journal file.
+  - The rollback journal is kept in memory, so plaintext copies of pages are never written to a separate journal file. Large deletes and queue changes (expiry, purges, `/admin/recrawl`) commit 1000 items at a time, so that journal stays small.
   - Erasure at the filesystem or SSD level (old blocks, wear levelling, copy-on-write filesystems such as btrfs or ZFS keeping the old blocks) is outside what the indexer can guarantee, for both `index.sqlite` and the segment files. Use full-disk encryption on the data volume for that.
 - **Expiry:** expired pages are dropped daily, and the seed is queued again so the crawl reaches them again.
 - **No backups:** the index is deliberately not backed up. It can be rebuilt by crawling, and a backup is a copy takedowns can't reach.
 - **Wipe:** stop the indexer, `rm -r $DATA_DIR/index.sqlite* $DATA_DIR/segments`, and start it again.
-- **After a crash:** with the journal in memory, and `synchronous=OFF` (commits aren't fsynced, so spinning disks keep up), a crash mid-write or a power loss can corrupt `index.sqlite`. The indexer then refuses to start ("Couldn't use DATA_DIR"). Wipe as above and it rebuilds by crawling. Pages indexed since the last segment was written are queued again on the next start, not lost.
+- **After a crash:** with the journal in memory, and `synchronous=OFF` (commits aren't fsynced), a crash mid-write or a power loss can corrupt `index.sqlite`. If the next start finds it damaged ("database disk image is malformed", or a segment failing its checksum), it logs `The index in … is damaged`, erases the index files (zeroed, as for takedowns, since the damaged file may have lost the record of what was taken down) and starts empty, rebuilding by crawling. Other errors (permissions, a full disk, an old format) still stop it with "Couldn't use DATA_DIR". Without damage, pages indexed since the last segment was written are queued again on the next start, not lost.
 
 ## Docker
 - **Just the indexer,** against the default public gateway. Run from the repository root (the build context needs `Cargo.toml` and `src`):
@@ -77,7 +77,7 @@ Set `DATA_DIR` to keep the index across restarts: pages, mirrors and the crawl q
   - The node (Kubo) is locked down so it never re-serves what the crawler fetched: no providing, DHT client only, Bitswap server off, GC at 2 GB, and no inbound swarm port.
   - It also has the badbits denylist, re-downloaded on every `up`.
 
-Production (ubuntu-cube, with the index on its HDD array) is deployed by the `ipfs_indexer` role in [compscidr/iac](https://github.com/compscidr/iac).
+Production (ubuntu-cube, with the index on its NVMe) is deployed by the `ipfs_indexer` role in [compscidr/iac](https://github.com/compscidr/iac).
 
 To release: bump `version` in `Cargo.toml`, merge, then push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). That publishes `ghcr.io/compscidr/ipfs_indexer:v0.2.0`; set `ipfs_indexer_version` in the iac role to the tag and deploy.
 
