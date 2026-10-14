@@ -750,11 +750,16 @@ fn migrate_page_lengths(conn: &mut Connection) -> rusqlite::Result<()> {
         return Ok(());
     }
     log::info!("Computing page lengths from their postings (one-time, #251)");
+    // postings has no index on page, so a subquery per page would scan all of it for every
+    // page: one pass summing into a temp table (in memory, a row per page) instead
     let tx = conn.transaction()?;
     tx.execute_batch(
         "ALTER TABLE pages ADD COLUMN length INTEGER NOT NULL DEFAULT 0;
-         UPDATE pages SET length = (SELECT coalesce(sum(count), 0) FROM postings
-                                    WHERE postings.page = pages.id);",
+         CREATE TEMP TABLE lengths (page INTEGER PRIMARY KEY, length INTEGER NOT NULL);
+         INSERT INTO lengths (page, length) SELECT page, count FROM postings WHERE true
+           ON CONFLICT (page) DO UPDATE SET length = length + excluded.length;
+         UPDATE pages SET length = lengths.length FROM lengths WHERE lengths.page = pages.id;
+         DROP TABLE lengths;",
     )?;
     tx.commit()
 }
@@ -1349,6 +1354,7 @@ pub(crate) mod tests {
                count INTEGER NOT NULL, PRIMARY KEY (term, page)) WITHOUT ROWID;
              INSERT INTO pages VALUES (1, 'bafyA', 'bafyA', 'A', 'e', 5);
              INSERT INTO pages VALUES (2, 'bafyB', 'bafyB', 'B', 'e', 6);
+             INSERT INTO pages VALUES (3, 'bafyC', 'bafyC', 'C', 'e', 7);
              INSERT INTO postings VALUES ('alpha', 1, 2), ('beta', 1, 3), ('alpha', 2, 1);",
         )
         .unwrap();
@@ -1361,7 +1367,8 @@ pub(crate) mod tests {
             alpha,
             vec![("bafyA".to_string(), 2, 5), ("bafyB".to_string(), 1, 1)]
         );
-        assert_eq!(store.average_length(), 3.0);
+        // C has no postings: length 0
+        assert_eq!(store.average_length(), 2.0);
         assert!(!dir_has_table(&dir, "postings"));
     }
 
