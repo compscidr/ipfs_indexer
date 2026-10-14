@@ -47,7 +47,7 @@ struct State {
 pub struct Segments {
     // None in memory: the buffer holds everything and is never flushed
     dir: Option<PathBuf>,
-    // lock order: buffer, then state, then dead
+    // lock order: buffer, then state, then retired, then dead
     buffer: RwLock<Buffer>,
     state: RwLock<State>,
     dead: RwLock<HashSet<u64>>,
@@ -320,16 +320,26 @@ impl Segments {
     pub fn maintain(&self) -> io::Result<Vec<u64>> {
         let _maintenance = self.maintenance.lock().unwrap();
         if self.dir.is_some() {
-            if self.flush_due() {
-                self.flush_locked()?;
-            }
-            self.erase_pending()?;
-            while let Some(inputs) = self.pick_merge() {
-                self.rewrite(&inputs)?;
-            }
-            self.retire()?;
+            // retire and prune run even if an earlier step failed, so one bad rewrite can't keep
+            // a taken-down file on disk; the first error is returned after
+            let mut result = self.upkeep();
+            let retired = self.retire();
+            result = result.and(retired);
+            let gone = self.prune_dead();
+            return result.map(|()| gone);
         }
         Ok(self.prune_dead())
+    }
+
+    fn upkeep(&self) -> io::Result<()> {
+        if self.flush_due() {
+            self.flush_locked()?;
+        }
+        self.erase_pending()?;
+        while let Some(inputs) = self.pick_merge() {
+            self.rewrite(&inputs)?;
+        }
+        Ok(())
     }
 
     fn flush_due(&self) -> bool {
@@ -447,12 +457,16 @@ impl Segments {
         )?;
         self.flushed_through
             .store(flushed_through, Ordering::SeqCst);
-        *self.stats.lock().unwrap() = None;
-        let mut state = self.state.write().unwrap();
-        state.segments = Arc::new(live);
-        if clear_frozen {
-            state.frozen = None;
+        {
+            let mut state = self.state.write().unwrap();
+            state.segments = Arc::new(live);
+            if clear_frozen {
+                state.frozen = None;
+            }
         }
+        // after the swap, so a term_stats racing it can't cache the old set; not under the state
+        // lock, as term_stats holds the cache while it takes that lock
+        *self.stats.lock().unwrap() = None;
         Ok(())
     }
 
@@ -460,6 +474,8 @@ impl Segments {
     fn prune_dead(&self) -> Vec<u64> {
         let buffer = self.buffer.read().unwrap();
         let state = self.state.read().unwrap().clone();
+        // a search may still read a retired file, so its pages stay dead until it's erased
+        let retired = self.retired.lock().unwrap();
         let mut dead = self.dead.write().unwrap();
         let gone: Vec<u64> = dead
             .iter()
@@ -471,6 +487,7 @@ impl Segments {
                         .as_ref()
                         .is_some_and(|f| f.lengths.contains_key(&id))
                     && !state.segments.iter().any(|s| s.contains(id))
+                    && !retired.iter().any(|s| s.contains(id))
             })
             .collect();
         for id in &gone {
@@ -590,16 +607,21 @@ impl Segments {
     // erases retired files no search holds any more (only `retired` has them)
     fn retire(&self) -> io::Result<()> {
         let mut retired = self.retired.lock().unwrap();
-        let (ready, held): (Vec<_>, Vec<_>) = retired
-            .drain(..)
+        let (ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut *retired)
+            .into_iter()
             .partition(|segment| Arc::strong_count(segment) == 1);
         *retired = held;
         drop(retired);
-        for segment in ready {
-            let path = segment.path().to_path_buf();
-            drop(segment);
-            // on failure the file stays unnamed by the manifest, so the next open erases it
-            erase_file(&path)?;
+        let mut ready = ready.into_iter();
+        while let Some(segment) = ready.next() {
+            // the Arc is kept while erasing: the file only needs no other holder
+            if let Err(err) = erase_file(segment.path()) {
+                // this one and the rest are retried next round
+                let mut retired = self.retired.lock().unwrap();
+                retired.push(segment);
+                retired.extend(ready);
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -1010,5 +1032,25 @@ pub(crate) mod tests {
         assert_eq!(segments.term_stats(0).unwrap().0, 3);
         segments.flush().unwrap();
         assert_eq!(segments.term_stats(0).unwrap().0, 4);
+    }
+
+    #[test]
+    fn a_taken_down_page_stays_dead_while_a_search_holds_its_retired_file() {
+        let dir = temp_dir("segments-retired-dead");
+        let segments = Segments::open(&dir).unwrap();
+        for id in 1..=6 {
+            segments.add(id, 1, &words(&[("alpha", 1)]));
+        }
+        segments.flush().unwrap();
+        let snapshot = segments.snapshot();
+        segments.set_dead(&[3]);
+        segments.mark_erase(&[3]);
+        assert!(
+            segments.maintain().unwrap().is_empty(),
+            "the old file still holds it"
+        );
+        assert!(segments.postings("alpha").unwrap().iter().all(|p| p.0 != 3));
+        drop(snapshot);
+        assert_eq!(segments.maintain().unwrap(), vec![3]);
     }
 }
