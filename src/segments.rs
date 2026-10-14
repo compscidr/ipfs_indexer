@@ -74,6 +74,13 @@ pub fn erase_file(path: &Path) -> io::Result<()> {
     fs::remove_file(path)
 }
 
+// erases a segment written but never installed, so its page text doesn't outlive the attempt
+fn discard(segment: Arc<Segment>) {
+    let path = segment.path().to_path_buf();
+    drop(segment);
+    let _ = erase_file(&path);
+}
+
 // (next_gen, flushed_through, segment file names); None if there's no manifest yet
 fn read_manifest(dir: &Path) -> io::Result<Option<(u64, u64, Vec<String>)>> {
     let text = match fs::read_to_string(dir.join("MANIFEST")) {
@@ -349,9 +356,18 @@ impl Segments {
             Ok(())
         })?;
         let mut live: Vec<Arc<Segment>> = self.state.read().unwrap().segments.to_vec();
+        let added = segment.clone();
         live.extend(segment);
         let flushed_through = self.flushed_through().max(frozen.max_id);
-        self.install(live, flushed_through, true)
+        match self.install(live, flushed_through, true) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if let Some(added) = added {
+                    discard(added);
+                }
+                Err(err)
+            }
+        }
     }
 
     // writes a new segment file; a failed write's partial file is erased. None if it has no pages.
@@ -366,16 +382,23 @@ impl Segments {
             fill(&mut writer)?;
             writer.finish()
         });
-        match written {
-            Ok(info) if info.docs == 0 => {
-                erase_file(&path)?;
-                Ok(None)
-            }
-            Ok(_) => Ok(Some(Arc::new(Segment::open(&path)?))),
+        let info = match written {
+            Ok(info) => info,
             Err(err) => {
                 if path.exists() {
                     let _ = erase_file(&path);
                 }
+                return Err(err);
+            }
+        };
+        if info.docs == 0 {
+            erase_file(&path)?;
+            return Ok(None);
+        }
+        match Segment::open(&path) {
+            Ok(segment) => Ok(Some(Arc::new(segment))),
+            Err(err) => {
+                let _ = erase_file(&path);
                 Err(err)
             }
         }
@@ -431,6 +454,8 @@ impl Segments {
 
     /// Replaces every segment with one written by `fill`, for the #247 migration. What was
     /// there (from an interrupted earlier attempt) is erased.
+    /// Only at startup, before any search can hold a segment: the old files are erased at once,
+    /// not retired, so a search holding one would read zeros.
     pub fn bulk_load(
         &self,
         flushed_through: u64,
@@ -439,7 +464,13 @@ impl Segments {
         let _maintenance = self.maintenance.lock().unwrap();
         let old: Vec<Arc<Segment>> = self.state.read().unwrap().segments.to_vec();
         let segment = self.write_segment(fill)?;
-        self.install(segment.into_iter().collect(), flushed_through, false)?;
+        let added = segment.clone();
+        if let Err(err) = self.install(segment.into_iter().collect(), flushed_through, false) {
+            if let Some(added) = added {
+                discard(added);
+            }
+            return Err(err);
+        }
         for segment in old {
             let path = segment.path().to_path_buf();
             drop(segment);
@@ -602,6 +633,21 @@ pub(crate) mod tests {
         });
         assert!(result.is_err());
         assert!(!dir_has(&dir, "zzqxpartialterm"));
+    }
+
+    #[test]
+    fn a_segment_whose_manifest_write_fails_is_erased() {
+        let dir = temp_dir("segments-install");
+        let segments = Segments::open(&dir).unwrap();
+        segments.add(1, 1, &words(&[("zzqxinstallterm", 1)]));
+        // rename(2) of a file over a directory fails on Linux, so the manifest install fails
+        fs::create_dir(dir.join("MANIFEST")).unwrap();
+        assert!(segments.flush().is_err());
+        assert!(
+            !dir_has(&dir, "zzqxinstallterm"),
+            "the unlisted segment's text is erased"
+        );
+        assert_eq!(segments.segment_count(), 0);
     }
 
     #[test]
