@@ -1,10 +1,10 @@
 use crate::denylist::{normalize_item, Denylist};
 use crate::index_result::IndexResult;
-use crate::store::{now_secs, Store, Upserted};
+use crate::store::{self, now_secs, OpenError, Store, Upserted};
 use actix_web::body::MessageBody;
 use cid::Cid;
 use dashmap::{DashMap, Map};
-use log::{info, trace, warn};
+use log::{error, info, trace, warn};
 use scraper::{Html, Selector};
 use sha2::Digest;
 use std::collections::{HashMap, HashSet};
@@ -347,6 +347,38 @@ impl IndexQueue {
         let removed = self.purge(&denylist);
         *self.local_denylist.write().unwrap() = denylist;
         removed
+    }
+
+    /**
+     * Opens DATA_DIR's index and attaches it (see attach_store). A damaged index is erased and
+     * started again empty, once, rather than refusing to start until someone wipes it by hand:
+     * it's rebuilt by crawling either way.
+     */
+    pub fn open_store(
+        &self,
+        dir: &std::path::Path,
+        cache_mb: u32,
+        max_age_secs: i64,
+    ) -> Result<(usize, usize, usize), OpenError> {
+        let open = || -> Result<_, OpenError> {
+            let store = Store::open(dir, cache_mb)?;
+            Ok(self.attach_store(store, max_age_secs)?)
+        };
+        match open() {
+            Err(err) if store::is_corrupt(&*err) => {
+                error!(
+                    "The index in {} is damaged ({}); erasing it and starting again empty",
+                    dir.display(),
+                    err
+                );
+                store::wipe(dir)?;
+                // what attach_store loaded before it hit the damage
+                self.map.clear();
+                self.mirrors.clear();
+                open()
+            }
+            other => other,
+        }
     }
 
     /**
@@ -1342,6 +1374,116 @@ mod tests {
                 .upsert(item, &page(item, title, &[("shared", 1), (title, 1)]), *at)
                 .unwrap();
         }
+    }
+
+    // overwrites part of a file, the way an interrupted write leaves it
+    fn damage(path: &std::path::Path, from: usize) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let to = bytes.len().min(from + 64 * 1024);
+        assert!(
+            from < to,
+            "{} is too small to damage at {}",
+            path.display(),
+            from
+        );
+        bytes[from..to].fill(0xAB);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn assert_wiped_and_working(queue: &IndexQueue, dir: &std::path::Path, old_text: &str) {
+        assert_eq!(queue.index_length(), 0);
+        assert!(!dir_has(dir, old_text), "the damaged files' text is erased");
+        queue.persist(GOOD, &page(GOOD, "t", &[("afterwipe", 1)]));
+        assert_eq!(queue.search("afterwipe", 0, 10).1.len(), 1);
+    }
+
+    #[test]
+    fn open_store_wipes_an_index_that_isnt_sqlite() {
+        let dir = temp_dir("wipe-garbage");
+        std::fs::write(
+            dir.join("index.sqlite"),
+            b"garbagetext: not a sqlite database at all",
+        )
+        .unwrap();
+        let queue = IndexQueue::new();
+        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0, 0));
+        assert_wiped_and_working(&queue, &dir, "garbagetext");
+    }
+
+    #[test]
+    fn open_store_wipes_an_index_damaged_mid_file() {
+        // what prod saw: valid header, "database disk image is malformed" further in
+        let dir = temp_dir("wipe-malformed");
+        let rows: Vec<(String, String)> = (0..400)
+            .map(|i| {
+                (
+                    format!("{}/p{}", GOOD, i),
+                    format!("damagedtitle{:0>200}", i),
+                )
+            })
+            .collect();
+        let rows: Vec<(&str, &str, i64)> = rows
+            .iter()
+            .map(|(item, title)| (item.as_str(), title.as_str(), now_secs()))
+            .collect();
+        seed(&dir, &rows);
+        let file = dir.join("index.sqlite");
+        assert!(std::fs::metadata(&file).unwrap().len() > 3 * 4096);
+        damage(&file, 2 * 4096);
+        let err = Store::open(&dir, 0)
+            .and_then(|s| Ok(IndexQueue::new().attach_store(s, 30 * DAY)?))
+            .err()
+            .expect("the damage is noticed");
+        assert!(store::is_corrupt(&*err), "{}", err);
+
+        let queue = IndexQueue::new();
+        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0, 0));
+        assert_wiped_and_working(&queue, &dir, "damagedtitle");
+    }
+
+    #[test]
+    fn open_store_wipes_an_index_with_a_damaged_segment() {
+        let dir = temp_dir("wipe-segment");
+        let queue = IndexQueue::new();
+        queue.open_store(&dir, 0, 30 * DAY).unwrap();
+        queue.persist(BAD, &page(BAD, "t", &[("segmenttext77", 1)]));
+        queue.flush_for_test();
+        drop(queue);
+        let segment = std::fs::read_dir(dir.join("segments"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "seg"))
+            .expect("a segment was written");
+        damage(&segment, 16);
+
+        let queue = IndexQueue::new();
+        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0, 0));
+        assert_wiped_and_working(&queue, &dir, "segmenttext77");
+    }
+
+    #[test]
+    fn open_store_leaves_an_old_index_or_a_bad_data_dir_alone() {
+        let dir = temp_dir("no-wipe");
+        rusqlite::Connection::open(dir.join("index.sqlite"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE pages (id INTEGER PRIMARY KEY, item TEXT NOT NULL UNIQUE,
+                   cid TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
+                   indexed_at INTEGER NOT NULL);
+                 INSERT INTO pages VALUES (1, 'bafyA', 'bafyA', 'oldformattitle', 'e', 5);",
+            )
+            .unwrap();
+        let err = IndexQueue::new()
+            .open_store(&dir, 0, 30 * DAY)
+            .err()
+            .unwrap();
+        assert!(err.is::<store::OldFormat>(), "{}", err);
+        assert!(dir_has(&dir, "oldformattitle"), "kept for the operator");
+
+        let file = dir.join("a-file");
+        std::fs::write(&file, b"keepme").unwrap();
+        assert!(IndexQueue::new().open_store(&file, 0, 30 * DAY).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"keepme");
     }
 
     #[test]
