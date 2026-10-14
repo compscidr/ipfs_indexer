@@ -118,6 +118,10 @@ fn parse_query(query: &str) -> Vec<Vec<String>> {
     groups
 }
 
+// BM25's term-frequency saturation and length normalization, Lucene's and Tantivy's defaults
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
+
 // skip anything bigger than this rather than pulling it all into memory
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -594,21 +598,30 @@ impl IndexQueue {
     /**
      * Pages matching the query (see parse_query: every word, or any of the words joined by OR),
      * best first, as (total matches, the page of them from offset, at most limit long). Scored by
-     * TF-IDF, summed over the query terms on the page: each counts
-     * (1 + ln count on the page) * ln(1 + pages / pages with the term).
+     * BM25 (#251), as Lucene and Tantivy do, summed over the query terms on the page: each counts
+     * idf * count * (k1 + 1) / (count + k1 * (1 - b + b * length / average length)), with
+     * idf = ln(1 + (pages - df + 0.5) / (df + 0.5)), df the pages with the term and length the
+     * page's terms. Long pages that mention a term in passing rank below focused ones.
      */
     pub fn search(&self, query: &str, offset: usize, limit: usize) -> (usize, Vec<IndexResult>) {
         let groups = parse_query(query);
-        let pages = self.map.len().max(1) as f64;
-        // each distinct term's postings, read once
-        let mut postings: HashMap<&str, HashMap<String, u32>> = HashMap::new();
+        let pages = self.map.len() as f64;
+        let average = self.store().average_length().max(1.0);
+        // each distinct term's postings, read once: page -> (count, page length)
+        let mut postings: HashMap<&str, HashMap<String, (u32, u32)>> = HashMap::new();
         for group in &groups {
             for term in group {
                 if postings.contains_key(term.as_str()) {
                     continue;
                 }
                 match self.store().postings(term) {
-                    Ok(found) => postings.insert(term, found.into_iter().collect()),
+                    Ok(found) => postings.insert(
+                        term,
+                        found
+                            .into_iter()
+                            .map(|(page, count, length)| (page, (count, length)))
+                            .collect(),
+                    ),
                     Err(err) => {
                         warn!("Couldn't search for {:?}: {}", term, err);
                         return (0, Vec::new());
@@ -620,9 +633,12 @@ impl IndexQueue {
                 return (0, Vec::new());
             }
         }
-        let weight = |term: &str, count: u32| {
-            let idf = (1.0 + pages / postings[term].len().max(1) as f64).ln();
-            (1.0 + (count.max(1) as f64).ln()) * idf
+        let weight = |term: &str, (count, length): (u32, u32)| {
+            let df = postings[term].len() as f64;
+            let idf = (1.0 + (pages - df + 0.5) / (df + 0.5)).ln();
+            let count = count as f64;
+            let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * length as f64 / average);
+            idf * count * (BM25_K1 + 1.0) / (count + norm)
         };
         let has = |group: &Vec<String>, page: &String| {
             group
@@ -644,7 +660,7 @@ impl IndexQueue {
         let scores = matches.into_iter().map(|page| {
             let score: f64 = postings
                 .iter()
-                .filter_map(|(term, found)| found.get(page).map(|count| weight(term, *count)))
+                .filter_map(|(term, found)| found.get(page).map(|posting| weight(term, *posting)))
                 .sum();
             (page.clone(), score)
         });
@@ -1362,7 +1378,7 @@ mod tests {
         );
         assert_eq!(
             Store::open(&dir, 0).unwrap().postings("alpha").unwrap(),
-            vec![(GOOD.to_string(), 3)],
+            vec![(GOOD.to_string(), 3, 3)],
             "counts kept on disk"
         );
 
@@ -1672,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ranks_by_tf_idf_and_pages_with_offset_and_limit() {
+    fn search_ranks_by_bm25_and_pages_with_offset_and_limit() {
         let queue = IndexQueue::new();
         index_text(&queue, "bafyOnce", "rust ipfs");
         index_text(&queue, "bafyThrice", "rust rust rust ipfs");
@@ -1697,6 +1713,20 @@ mod tests {
     }
 
     #[test]
+    fn search_ranks_focused_pages_above_long_ones_mentioning_a_term_in_passing() {
+        let queue = IndexQueue::new();
+        // "bafyALong" would win the tie on item name under TF-IDF
+        index_text(
+            &queue,
+            "bafyALong",
+            "rust mentioned once among many other unrelated words about gardening cooking travel",
+        );
+        index_text(&queue, "bafyBShort", "rust crawler");
+        index_text(&queue, "bafyOther", "unrelated");
+        assert_eq!(found(&queue, "rust"), vec!["bafyBShort", "bafyALong"]);
+    }
+
+    #[test]
     fn purged_and_expired_pages_leave_the_keyword_index() {
         // they used to linger in the in-memory index, only filtered out at search time
         let dir = temp_dir("purge-postings");
@@ -1714,7 +1744,7 @@ mod tests {
         assert!(store.postings("takedownword").unwrap().is_empty());
         assert_eq!(
             store.postings("shared").unwrap(),
-            vec![(BAD.to_string(), 1)]
+            vec![(BAD.to_string(), 1, 1)]
         );
         assert_eq!(queue.keyword_length(), 1);
         assert!(

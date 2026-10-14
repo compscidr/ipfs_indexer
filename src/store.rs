@@ -4,7 +4,7 @@ use log::info;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,9 @@ pub struct Store {
     // rows in `terms` and `queue`, kept here since counting them for every /status is a full scan
     terms: AtomicUsize,
     queued: AtomicUsize,
+    // rows in `pages` and the sum of their lengths, for BM25's average page length (#251)
+    pages: AtomicUsize,
+    lengths: AtomicU64,
 }
 
 pub fn now_secs() -> i64 {
@@ -46,7 +49,9 @@ const SCHEMA: &str = "
         cid        TEXT NOT NULL,
         title      TEXT NOT NULL,
         excerpt    TEXT NOT NULL,
-        indexed_at INTEGER NOT NULL
+        indexed_at INTEGER NOT NULL,
+        -- how many terms the page has (the sum of its postings' counts), for BM25 (#251)
+        length     INTEGER NOT NULL DEFAULT 0
     );
     -- the inverted index (#231): how often each term appears on each page
     CREATE TABLE IF NOT EXISTS postings (
@@ -102,14 +107,22 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         // after the bulk load in the migration: deleting a page's postings needs it
         conn.execute_batch("CREATE INDEX IF NOT EXISTS postings_page ON postings (page)")?;
+        migrate_page_lengths(&mut conn)?;
         let terms: i64 = conn.query_row("SELECT count(*) FROM terms", [], |r| r.get(0))?;
         let queued: i64 = conn.query_row("SELECT count(*) FROM queue", [], |r| r.get(0))?;
+        let (pages, lengths): (i64, i64) = conn.query_row(
+            "SELECT count(*), coalesce(sum(length), 0) FROM pages",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         Ok(Store {
             conn: Mutex::new(conn),
             reader: None,
             path,
             terms: AtomicUsize::new(terms as usize),
             queued: AtomicUsize::new(queued as usize),
+            pages: AtomicUsize::new(pages as usize),
+            lengths: AtomicU64::new(lengths as u64),
         })
     }
 
@@ -134,13 +147,27 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let waited = start.elapsed();
         let tx = conn.transaction()?;
+        let length: i64 = result.keywords.values().map(|&count| count as i64).sum();
+        let old_length: Option<i64> = tx
+            .prepare_cached("SELECT length FROM pages WHERE item = ?1")?
+            .query_row([item], |r| r.get(0))
+            .optional()?;
         // ON CONFLICT keeps the row's id, so a re-crawl replaces its postings in place
         let id: i64 = tx.query_row(
-            "INSERT INTO pages (item, cid, title, excerpt, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO pages (item, cid, title, excerpt, indexed_at, length)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (item) DO UPDATE SET cid = excluded.cid, title = excluded.title,
-               excerpt = excluded.excerpt, indexed_at = excluded.indexed_at
+               excerpt = excluded.excerpt, indexed_at = excluded.indexed_at,
+               length = excluded.length
              RETURNING id",
-            params![item, result.cid, result.title, result.excerpt, indexed_at],
+            params![
+                item,
+                result.cid,
+                result.title,
+                result.excerpt,
+                indexed_at,
+                length
+            ],
             |r| r.get(0),
         )?;
         let mut terms = self.remove_postings(&tx, id)?;
@@ -160,6 +187,13 @@ impl Store {
         }
         tx.commit()?;
         self.adjust_terms(terms);
+        match old_length {
+            Some(old) => self.adjust_lengths(0, old as u64),
+            None => {
+                self.pages.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.lengths.fetch_add(length as u64, Ordering::Relaxed);
         info!(
             "Store upsert {}: {} terms, waited {:?}, took {:?}",
             item,
@@ -199,23 +233,33 @@ impl Store {
         }
     }
 
+    // removes pages from the running page count and length total
+    fn adjust_lengths(&self, pages: usize, length: u64) {
+        self.pages.fetch_sub(pages, Ordering::Relaxed);
+        self.lengths.fetch_sub(length, Ordering::Relaxed);
+    }
+
     /// Deletes pages and their postings in one transaction; returns how many pages went
     pub fn delete(&self, items: &[String]) -> rusqlite::Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let (mut deleted, mut terms) = (0, 0);
+        let (mut deleted, mut terms, mut length) = (0, 0, 0);
         {
-            let mut stmt = tx.prepare("DELETE FROM pages WHERE item = ?1 RETURNING id")?;
+            let mut stmt = tx.prepare("DELETE FROM pages WHERE item = ?1 RETURNING id, length")?;
             for item in items {
-                let id: Option<i64> = stmt.query_row([item], |r| r.get(0)).optional()?;
-                if let Some(id) = id {
+                let row: Option<(i64, i64)> = stmt
+                    .query_row([item], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                if let Some((id, page_length)) = row {
                     deleted += 1;
+                    length += page_length as u64;
                     terms += self.remove_postings(&tx, id)?;
                 }
             }
         }
         tx.commit()?;
         self.adjust_terms(terms);
+        self.adjust_lengths(deleted, length);
         Ok(deleted)
     }
 
@@ -250,15 +294,24 @@ impl Store {
         rows.collect()
     }
 
-    /// The pages a term is on, as (item, how often it appears there)
-    pub fn postings(&self, term: &str) -> rusqlite::Result<Vec<(String, u32)>> {
+    /// The pages a term is on, as (item, how often it appears there, the page's length)
+    pub fn postings(&self, term: &str) -> rusqlite::Result<Vec<(String, u32, u32)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare_cached(
-            "SELECT pages.item, postings.count FROM postings JOIN pages ON pages.id = postings.page
-             WHERE postings.term = ?1",
+            "SELECT pages.item, postings.count, pages.length
+             FROM postings JOIN pages ON pages.id = postings.page WHERE postings.term = ?1",
         )?;
-        let rows = stmt.query_map([term], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map([term], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect()
+    }
+
+    /// The mean page length in terms, for BM25; 0 with no pages
+    pub fn average_length(&self) -> f64 {
+        let pages = self.pages.load(Ordering::Relaxed);
+        if pages == 0 {
+            return 0.0;
+        }
+        self.lengths.load(Ordering::Relaxed) as f64 / pages as f64
     }
 
     pub fn term_count(&self) -> usize {
@@ -435,8 +488,31 @@ fn migrate_keywords_column(conn: &mut Connection) -> rusqlite::Result<()> {
         "INSERT INTO postings (term, page, count)
            SELECT term, page, sum(count) FROM staged GROUP BY term, page ORDER BY term, page;
          INSERT INTO terms (term, pages) SELECT term, count(*) FROM postings GROUP BY term;
+         UPDATE pages SET length = (SELECT coalesce(sum(count), 0) FROM staged
+                                    WHERE staged.page = pages.id);
          DROP TABLE staged;
          DROP TABLE pages_old;",
+    )?;
+    tx.commit()
+}
+
+/**
+ * #251: pages stored before BM25 have no length. Adds the column and fills it from their
+ * postings, once.
+ */
+fn migrate_page_lengths(conn: &mut Connection) -> rusqlite::Result<()> {
+    let has_length: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('pages') WHERE name = 'length'")?
+        .exists([])?;
+    if has_length {
+        return Ok(());
+    }
+    log::info!("Computing page lengths from their postings (one-time, #251)");
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE pages ADD COLUMN length INTEGER NOT NULL DEFAULT 0;
+         UPDATE pages SET length = (SELECT coalesce(sum(count), 0) FROM postings
+                                    WHERE postings.page = pages.id);",
     )?;
     tx.commit()
 }
@@ -519,7 +595,7 @@ pub(crate) mod tests {
         let store = Store::open(&dir, 0).unwrap();
         assert_eq!(
             store.postings("alpha").unwrap(),
-            vec![("bafyA/x".to_string(), 3)]
+            vec![("bafyA/x".to_string(), 3, 3)]
         );
         assert!(
             store.postings("beta").unwrap().is_empty(),
@@ -609,7 +685,7 @@ pub(crate) mod tests {
         tx.execute("DELETE FROM postings", []).unwrap();
         assert_eq!(
             store.postings("word").unwrap(),
-            vec![("bafyR".to_string(), 2)],
+            vec![("bafyR".to_string(), 2, 2)],
             "the last committed state, without waiting"
         );
     }
@@ -665,6 +741,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tracks_page_lengths_across_upserts_deletes_and_reopens() {
+        let dir = temp_dir("lengths");
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(store.average_length(), 0.0);
+        store
+            .upsert("a", &page("a", "a", &[("x", 2), ("y", 4)]), 1)
+            .unwrap();
+        store.upsert("b", &page("b", "b", &[("x", 2)]), 1).unwrap();
+        assert_eq!(store.average_length(), 4.0, "(6 + 2) / 2");
+        assert_eq!(
+            store.postings("x").unwrap().iter().find(|p| p.0 == "a"),
+            Some(&("a".to_string(), 2, 6))
+        );
+        // a re-crawl replaces the length rather than adding a page
+        store.upsert("a", &page("a", "a", &[("x", 1)]), 2).unwrap();
+        assert_eq!(store.average_length(), 1.5, "(1 + 2) / 2");
+        store.delete(&["b".to_string()]).unwrap();
+        assert_eq!(store.average_length(), 1.0);
+        drop(store);
+        assert_eq!(Store::open(&dir, 0).unwrap().average_length(), 1.0);
+    }
+
+    #[test]
+    fn migrates_pages_without_a_length() {
+        // the schema between #231 and #251
+        let dir = temp_dir("migrate-length");
+        let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pages (id INTEGER PRIMARY KEY, item TEXT NOT NULL UNIQUE,
+               cid TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
+               indexed_at INTEGER NOT NULL);
+             CREATE TABLE postings (term TEXT NOT NULL, page INTEGER NOT NULL,
+               count INTEGER NOT NULL, PRIMARY KEY (term, page)) WITHOUT ROWID;
+             INSERT INTO pages VALUES (1, 'bafyA', 'bafyA', 'A', 'e', 5);
+             INSERT INTO pages VALUES (2, 'bafyB', 'bafyB', 'B', 'e', 6);
+             INSERT INTO postings VALUES ('alpha', 1, 2), ('beta', 1, 3), ('alpha', 2, 1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&dir, 0).unwrap();
+        let mut alpha = store.postings("alpha").unwrap();
+        alpha.sort();
+        assert_eq!(
+            alpha,
+            vec![("bafyA".to_string(), 2, 5), ("bafyB".to_string(), 1, 1)]
+        );
+        assert_eq!(store.average_length(), 3.0);
+    }
+
+    #[test]
     fn decode_skips_malformed_keyword_lines() {
         let decoded = decode_keywords("good 3\nno-count\nbad x\n\nalso 1");
         assert_eq!(decoded.len(), 2);
@@ -690,15 +817,16 @@ pub(crate) mod tests {
         let store = Store::open(&dir, 0).unwrap();
         assert_eq!(
             store.postings("files").unwrap(),
-            vec![("bafyA".to_string(), 3)]
+            vec![("bafyA".to_string(), 3, 4)]
         );
         let mut alpha = store.postings("alpha").unwrap();
         alpha.sort();
         assert_eq!(
             alpha,
-            vec![("bafyA".to_string(), 1), ("bafyB".to_string(), 4)]
+            vec![("bafyA".to_string(), 1, 4), ("bafyB".to_string(), 4, 4)]
         );
         assert_eq!(store.term_count(), 2);
+        assert_eq!(store.average_length(), 4.0);
         assert_eq!(store.top_terms(1).unwrap(), vec![("alpha".to_string(), 2)]);
         assert_eq!(store.load_all().unwrap().len(), 2);
         assert_eq!(store.queue_load().unwrap(), vec!["bafyQ"]);
