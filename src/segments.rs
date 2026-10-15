@@ -8,9 +8,9 @@
  *
  * Lock order: merging, writes, install, retiring, then dead, buffer, state, retired.
  * term_stats takes computing, then buffer and state (released), then stats. erase and
- * upgrades_after are only taken on their own. The wake signals are leaves: install raises merge_due holding the install
- * lock. The Store's connection lock comes before buffer (add), and is never held across a call
- * that waits on merging, writes, install or retiring.
+ * upgrades_after are only taken on their own. The wake signals are leaves: install raises
+ * merge_due holding the install lock. The Store's connection lock comes before buffer (add), and
+ * is never held across a call that waits on merging, writes, install or retiring.
  */
 use crate::segment::{Posting, Segment, SegmentWriter};
 use std::cmp::Reverse;
