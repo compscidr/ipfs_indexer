@@ -6,7 +6,7 @@ use crate::store::{self, now_secs, OpenError, Store, Upserted};
 use actix_web::body::MessageBody;
 use cid::Cid;
 use dashmap::Map;
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use scraper::{Html, Selector};
 use sha2::Digest;
 use std::collections::HashMap;
@@ -697,7 +697,7 @@ impl IndexQueue {
         }
         match self.store().queue_add(&items) {
             Ok(added) => {
-                info!("Enqueued {} of {} items", added, items.len());
+                debug!("Enqueued {} of {} items", added, items.len());
                 added
             }
             Err(err) => {
@@ -861,7 +861,7 @@ impl IndexQueue {
             }
         };
         if !self.is_blocked(&item) {
-            warn!("Indexing {}", item);
+            debug!("Indexing {}", item);
             match self.retrieve_content(gateway.to_string(), item.clone()) {
                 // a mirror's links lead to more of the mirror: the original's were followed
                 Some((result, links)) => {
@@ -872,7 +872,7 @@ impl IndexQueue {
                 // for now give up on error
                 None => warn!("Error retrieving CID {}", item),
             }
-            info!("Done {} in {:?}", item, start.elapsed());
+            debug!("Done {} in {:?}", item, start.elapsed());
         }
         true
     }
@@ -883,11 +883,11 @@ impl IndexQueue {
      */
     fn retrieve_content(&self, gateway: String, cid: String) -> Option<(IndexResult, Vec<String>)> {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
-        warn!("Retreiving {}", url);
+        debug!("Retrieving {}", url);
         self.wait_for_gateway();
         let fetch_start = Instant::now();
         let fetched = fetch_html(&url);
-        info!("Fetched {} in {:?}", cid, fetch_start.elapsed());
+        debug!("Fetched {} in {:?}", cid, fetch_start.elapsed());
         let health = match &fetched {
             Err(err) if is_gateway_error(err) => Err(err.to_string()),
             _ => Ok(()),
@@ -929,19 +929,19 @@ impl IndexQueue {
         let noscript = document.select(&selector).next();
 
         if noscript.is_some() {
-            info!("found noscript");
+            debug!("found noscript");
             let inner_html = noscript.unwrap().inner_html();
             if inner_html.find("meta http-equiv=\"refresh\"").is_none() {
                 warn!("no meta http-equiv=\"refresh\" found");
             } else {
-                info!("found meta http-equiv=\"refresh\"");
+                debug!("found meta http-equiv=\"refresh\"");
                 let start_bytes = inner_html.find("url=").unwrap_or(0);
                 let end_bytes = inner_html[start_bytes..]
                     .find("\"")
                     .unwrap_or(inner_html.len())
                     + start_bytes;
                 let redirect_url = &inner_html[start_bytes + 4..end_bytes];
-                warn!("Redirecting to {}", redirect_url);
+                debug!("Redirecting to {}", redirect_url);
                 // assuming relative
                 let newurl = format!("{}/{}", url, redirect_url);
 

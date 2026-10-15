@@ -27,7 +27,7 @@ RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080   # your own gateway (h
 | `INDEX_MAX_AGE_DAYS` | `30` | With `DATA_DIR`, pages older than this are dropped. |
 | `CRAWL_WORKERS` | `10` | How many pages are fetched at once. A fetch through Kubo takes about 2 s, so each worker adds roughly 30 pages a minute; raise it (e.g. `30`) with your own gateway. On the public gateway `GATEWAY_REQUESTS_PER_MIN` is the limit, not this. |
 | `GATEWAY_REQUESTS_PER_MIN` | `100` on the default public gateway, no limit with your own gateway | Spaces out gateway requests across all workers (`0` = no limit). Filebase allows 200 a minute. |
-| `RUST_LOG` | unset | Log level, e.g. `info`. |
+| `RUST_LOG` | unset | Log level, e.g. `info`: startup, warnings and errors, and one line a minute with the indexing rate, index size and queue length. `debug` adds several lines per page fetched, per queue write and per search query (about 3 GB a day at 4,000 pages a minute). |
 
 The indexer **exits at startup** if it can't download the badbits list, read a configured `LOCAL_DENYLIST`, or open a configured `DATA_DIR`, rather than run without them.
 
