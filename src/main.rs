@@ -5,7 +5,7 @@ use std::sync::Arc;
 use threadpool::ThreadPool;
 
 use actix_web::{get, web, App, HttpResponse, HttpServer};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use simple_logger::SimpleLogger;
 
 use crate::denylist::Denylist;
@@ -161,7 +161,7 @@ async fn search_handler(
             return HttpResponse::BadRequest().body(format!("{} must be a number", name))
         }
     };
-    info!("Searching for {}", query);
+    debug!("Searching for {}", query);
     let (total, results) = data.search(&query, offset, limit);
     if total == 0 {
         HttpResponse::Ok().body(format!("No results found for {}", query))
@@ -387,6 +387,17 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     });
     info!("Crawl workers: {}", n_workers);
+    // per-page lines are debug (about 3 GB a day at info): one line a minute says how the crawl is going
+    let summary_queue = Arc::clone(&index_queue);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        info!(
+            "Indexed per minute: {} Index size: {} Queue length: {}",
+            summary_queue.indexed_per_minute(),
+            summary_queue.index_length(),
+            summary_queue.queue_length()
+        );
+    });
     let pool = ThreadPool::new(n_workers);
 
     // todo: find some way to shutdown the pool when the server stops

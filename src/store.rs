@@ -1,6 +1,6 @@
 use crate::index_result::IndexResult;
 use crate::segments::{erase_file, Maintained, Segments};
-use log::info;
+use log::debug;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -296,7 +296,7 @@ impl Store {
                     self.segments.set_dead(&[old as u64]);
                     self.adjust_lengths(1, length);
                 }
-                info!(
+                debug!(
                     "Store upsert {}: mirror of {}, waited {:?}, took {:?}",
                     item,
                     original,
@@ -343,7 +343,7 @@ impl Store {
         self.mirrors.fetch_sub(unmirrored, Ordering::Relaxed);
         self.pages.fetch_add(1, Ordering::Relaxed);
         self.lengths.fetch_add(length as u64, Ordering::Relaxed);
-        info!(
+        debug!(
             "Store upsert {}: {} terms, waited {:?}, took {:?}",
             item,
             result.keywords.len(),
@@ -581,7 +581,7 @@ impl Store {
             self.queued.fetch_add(batch_added, Ordering::Relaxed);
             added += batch_added;
         }
-        info!(
+        debug!(
             "Store queue_add: {} of {} new, waited {:?}, took {:?}",
             added,
             items.len(),
@@ -631,7 +631,7 @@ impl Store {
         // not on empty polls: idle workers poll every 200ms
         if item.is_some() {
             self.queued.fetch_sub(1, Ordering::Relaxed);
-            info!(
+            debug!(
                 "Store queue_pop: waited {:?}, took {:?}",
                 waited,
                 start.elapsed() - waited
