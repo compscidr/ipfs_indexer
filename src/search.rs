@@ -79,6 +79,8 @@ impl Query {
 
 /// BM25 for one query: each term's idf, and the average page length
 pub struct Scorer {
+    // each term's df as given, for one word's total
+    dfs: Vec<u64>,
     idf: Vec<f64>,
     average: f64,
 }
@@ -95,6 +97,7 @@ impl Scorer {
             })
             .collect();
         Scorer {
+            dfs: dfs.to_vec(),
             idf,
             average: average.max(1.0),
         }
@@ -141,7 +144,7 @@ pub fn search(
         }
     }
     let ranked = top.ranked();
-    let mut total = total(view, query)?;
+    let mut total = total(view, query, scorer)?;
     // an estimate can come out below what was found
     total.n = total.n.max(ranked.len());
     Ok((total, ranked))
@@ -358,7 +361,11 @@ fn walk(
         let end = groups.iter().filter_map(Group::block_end).min().unwrap();
         let bound: f64 = groups.iter().map(|g| g.bound(scorer)).sum();
         if bound * (1.0 + SLACK) < top.threshold() {
-            target = end + 1;
+            // a garbled last id of u64::MAX would wrap back to 0 and loop
+            let Some(after) = end.checked_add(1) else {
+                return Ok(());
+            };
+            target = after;
             continue;
         }
         let Some(candidate) = groups[lead].seek(target)? else {
@@ -391,7 +398,10 @@ fn walk(
             let score = score(&mut groups, query, scorer, candidate, length)?;
             top.offer(score, candidate);
         }
-        target = candidate + 1;
+        let Some(after) = candidate.checked_add(1) else {
+            return Ok(());
+        };
+        target = after;
     }
 }
 
@@ -474,7 +484,11 @@ fn count(
         if all && !view.is_dead(candidate) {
             matches += 1;
         }
-        target = candidate + 1;
+        // the last id there can be: nothing follows it
+        let Some(after) = candidate.checked_add(1) else {
+            return Ok((matches, consumed, lead_df, true));
+        };
+        target = after;
     }
     let complete = groups[lead].seek(target)?.is_none();
     Ok((matches, consumed, lead_df, complete))
@@ -502,16 +516,15 @@ fn round2(n: f64) -> usize {
     ((n / scale).round() * scale) as usize
 }
 
-// how many pages match: df for one word, an exact count for a small smallest group, else an
-// estimate from a sample of each segment
-fn total(view: &View, query: &Query) -> io::Result<Total> {
+// how many pages match: df for one word (the scorer's), an exact count for a small smallest
+// group, else an estimate from a sample of each segment
+fn total(view: &View, query: &Query, scorer: &Scorer) -> io::Result<Total> {
     if query.groups.is_empty() {
         return Ok(Total { n: 0, about: false });
     }
     if query.groups.len() == 1 && query.groups[0].len() == 1 {
-        let df = dfs(view, query)?[query.groups[0][0]];
         return Ok(Total {
-            n: df as usize,
+            n: scorer.dfs[query.groups[0][0]] as usize,
             about: false,
         });
     }
@@ -864,6 +877,23 @@ mod tests {
         assert_eq!(found.len(), 1000);
         assert!(total.about, "{:?}", total);
         assert!(total.n >= found.len(), "{:?} < {}", total, found.len());
+    }
+
+    #[test]
+    fn the_highest_page_id_ends_a_walk_instead_of_wrapping() {
+        let segments = Segments::open(&temp_dir("search-max-id")).unwrap();
+        for id in [1, u64::MAX] {
+            segments.add(id, 5, &words(&[("alpha", 1), ("beta", 1)]));
+        }
+        segments.flush().unwrap();
+        for query in [groups(&[&["alpha"]]), groups(&[&["alpha"], &["beta"]])] {
+            let parsed = Query::new(&query);
+            let view = segments.view(&terms(&parsed));
+            let scorer = Scorer::new(2, 5.0, &dfs(&view, &parsed).unwrap());
+            let (total, found) = search(&view, &parsed, &scorer, 10).unwrap();
+            assert_eq!(found, vec![1, u64::MAX], "{:?}", query);
+            assert_eq!(total, Total { n: 2, about: false });
+        }
     }
 
     #[test]

@@ -38,6 +38,8 @@ const WINDOW: u64 = 64 * 1024;
 #[cfg(test)]
 thread_local! {
     pub(crate) static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // window reads for a range that began inside the window but ran past its end
+    pub(crate) static STRADDLED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 const END: &[u8] = b"ipxend";
 const FOOTER: u64 = 7 * 8 + 8 + 6;
@@ -671,6 +673,10 @@ impl<'a> Cursor<'a> {
         let len = len.min(end.saturating_sub(offset));
         let held = self.window_at + self.window.len() as u64;
         if offset < self.window_at || offset + len > held {
+            #[cfg(test)]
+            if offset >= self.window_at && offset < held {
+                STRADDLED.with(|s| s.set(s.get() + 1));
+            }
             let size = len.max(WINDOW).min(end.saturating_sub(offset));
             self.window = read_at(&self.segment.file, offset, size)?;
             self.window_at = offset;
@@ -696,8 +702,8 @@ impl<'a> Cursor<'a> {
         if n == 0 || n > BLOCK || last < base || (self.passed > 0 && last == base) {
             return Err(corrupt());
         }
-        let body_at = at + pos as u64;
-        self.next = body_at + body_len;
+        let body_at = at.checked_add(pos as u64).ok_or_else(corrupt)?;
+        self.next = body_at.checked_add(body_len).ok_or_else(corrupt)?;
         self.block = Some(Block {
             n,
             base,
@@ -1111,6 +1117,56 @@ mod tests {
         assert_eq!(skipping.seek(1001).unwrap(), None);
         assert!(skipping.done());
         assert_eq!(skipping.block_last(), None);
+    }
+
+    #[test]
+    fn a_list_over_the_read_ahead_window_reads_the_same_by_next_and_by_seek() {
+        let path = temp_dir("segment-window").join("1.seg");
+        // 40,000 postings at scattered ids, with two-byte counts: several windows' worth
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let mut id = 0;
+        let postings: Vec<Posting> = (0..40_000)
+            .map(|_| {
+                id += 1 + random(300);
+                (id, 128 + random(10_000) as u32)
+            })
+            .collect();
+        let docs: Vec<(u64, u32)> = postings.iter().map(|&(id, _)| (id, 7)).collect();
+        write(&path, &docs, &[("big", postings.clone())]);
+        let segment = Segment::open(&path).unwrap();
+        assert!(segment.dict_off > 3 * WINDOW, "{} bytes", segment.dict_off);
+        assert_eq!(segment.postings(b"big").unwrap(), postings);
+
+        let straddled = STRADDLED.with(|s| s.get());
+        let mut cursor = segment.cursor(b"big").unwrap().unwrap();
+        let mut walked = Vec::new();
+        let mut at = cursor.current().unwrap();
+        while let Some(posting) = at {
+            walked.push(posting);
+            at = cursor.next().unwrap();
+        }
+        assert_eq!(walked, postings);
+        assert!(
+            STRADDLED.with(|s| s.get()) > straddled,
+            "a header or body ran past the window's end"
+        );
+
+        // seeks to ids on, between and past postings, in steps of up to several blocks
+        let mut cursor = segment.cursor(b"big").unwrap().unwrap();
+        let mut target = 0;
+        while target <= id + 1 {
+            let i = postings.partition_point(|p| p.0 < target);
+            assert_eq!(cursor.seek(target).unwrap(), postings.get(i).copied());
+            target += 1 + random(2_000);
+        }
+        assert_eq!(cursor.seek(id + 1).unwrap(), None);
+        assert!(cursor.done());
     }
 
     #[test]
