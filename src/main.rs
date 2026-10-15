@@ -15,6 +15,7 @@ mod admin;
 mod denylist;
 mod index_queue;
 mod index_result;
+mod rate;
 mod search;
 mod segment;
 mod segments;
@@ -38,11 +39,12 @@ struct Gateway(String);
 #[get("/status")]
 async fn status(queue: web::Data<IndexQueue>, gateway: web::Data<Gateway>) -> HttpResponse {
     HttpResponse::Ok().body(format!(
-        "Queue length: {} Index size: {} Mirrors skipped: {} Number of Keywords: {} Gateway: {} ({}) Version: {}",
+        "Queue length: {} Index size: {} Mirrors skipped: {} Number of Keywords: {} Indexed per minute: {} Gateway: {} ({}) Version: {}",
         queue.queue_length(),
         queue.index_length(),
         queue.mirror_length(),
         queue.keyword_length(),
+        queue.indexed_per_minute(),
         gateway.0,
         queue.gateway_health(),
         version()
