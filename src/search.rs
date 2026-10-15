@@ -244,7 +244,7 @@ impl Group<'_> {
     fn block_end(&self) -> Option<u64> {
         self.cursors
             .iter()
-            .filter_map(|c| c.cursor.block().map(|b| b.0))
+            .filter_map(|c| c.cursor.block_last())
             .min()
     }
 
@@ -252,9 +252,9 @@ impl Group<'_> {
     fn bound(&self, scorer: &Scorer) -> f64 {
         self.cursors
             .iter()
-            .filter_map(|c| {
-                let (_, max_count, shortest) = c.cursor.block()?;
-                Some(scorer.weight(c.term, max_count, shortest))
+            .map(|c| {
+                c.cursor
+                    .block_bound(|count, length| scorer.weight(c.term, count, length))
             })
             .sum()
     }
@@ -734,7 +734,33 @@ mod tests {
                 about: false
             }
         );
-        assert!(decoded <= 2, "decoded {} of 50 blocks", decoded);
+        assert!(decoded <= 1, "decoded {} of 50 blocks", decoded);
+    }
+
+    #[test]
+    fn a_block_whose_high_counts_are_on_long_pages_is_skipped() {
+        let segments = Segments::open(&temp_dir("search-impacts")).unwrap();
+        // the first ten say it often on short pages; after them, every block has both a short
+        // page that says it once and a long one that says it often, but no page doing both
+        for id in 1..=6400u64 {
+            let (length, count) = match id {
+                1..=10 => (10, 9),
+                _ if id % 2 == 0 => (10, 1),
+                _ => (5000, 9),
+            };
+            segments.add(id, length, &words(&[("common", count)]));
+        }
+        segments.flush().unwrap();
+        let query = Query::new(&groups(&[&["common"]]));
+        let view = segments.view(&["common"]);
+        let scorer = Scorer::new(6400, 2500.0, &dfs(&view, &query).unwrap());
+        let before = DECODED.with(|d| d.get());
+        let (_, top) = search(&view, &query, &scorer, 10).unwrap();
+        let decoded = DECODED.with(|d| d.get()) - before;
+        assert_eq!(top, (1..=10).collect::<Vec<u64>>());
+        assert_eq!(top, exhaustive(&view, &query, &scorer, 10));
+        // a bound of (highest count, shortest page) would beat the tenth score in every block
+        assert!(decoded <= 1, "decoded {} of 50 blocks", decoded);
     }
 
     #[test]

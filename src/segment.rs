@@ -4,9 +4,11 @@
  *
  *   header    "ipxseg", version u8
  *   docs      (id delta, length) per page, ascending by id
- *   postings  per term, blocks of up to BLOCK postings: n, last id, body bytes, max count, and
- *             (v2) the shortest page among them: the most a block's pages can score, for #248's
- *             pruning; then the id deltas, then the counts. A v1 block has no shortest page.
+ *   postings  per term, blocks of up to BLOCK postings: n, last id, body bytes, then (v2) its
+ *             impacts: k, and k (count, page length) pairs, count and length each ascending,
+ *             such that every posting has at most one's count on a page at least as long; the
+ *             most a block's pages can score, for #248's pruning. Then the id deltas, then the
+ *             counts. A v1 block has max count where the impacts are, and no lengths.
  *   dict      per term, ascending bytewise: shared prefix, suffix length, suffix, df, offset of
  *             its first block; prefixes restart every SPARSE terms
  *   sparse    every SPARSE-th term: length, term, its dict entry's offset within dict
@@ -25,8 +27,10 @@ const BLOCK: usize = 128;
 const SPARSE: u64 = 64;
 const MAGIC: &[u8] = b"ipxseg";
 pub(crate) const VERSION: u8 = 2;
-// a block header is at most five varints
-const HEAD_MAX: u64 = 50;
+// a v2 block's (count, length) pairs at most: the rest are merged into these
+const IMPACTS_MAX: usize = 8;
+// a block header is at most this many bytes: four varints, then two per impact
+const HEAD_MAX: u64 = (4 + 2 * IMPACTS_MAX as u64) * 10;
 // how much a cursor reads at once
 const WINDOW: u64 = 64 * 1024;
 
@@ -109,6 +113,69 @@ fn read_at(file: &File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/**
+ * A block's impacts (#248): its postings' (count, page length) pairs that no other beats on both
+ * (a count at least as high on a page at most as long), count and length ascending. Past
+ * IMPACTS_MAX, runs of neighbours are merged into (their highest count, their shortest page):
+ * looser, but still at least every posting it stands for.
+ */
+fn impacts(mut pairs: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    // highest count first, then shortest page: each pair kept is shorter than all before it
+    pairs.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut frontier: Vec<(u32, u32)> = Vec::new();
+    for pair in pairs {
+        if frontier.last().is_none_or(|last| pair.1 < last.1) {
+            frontier.push(pair);
+        }
+    }
+    frontier.reverse();
+    if frontier.len() <= IMPACTS_MAX {
+        return frontier;
+    }
+    // IMPACTS_MAX runs, as even as can be; in each run, the last count is the highest and the
+    // first length the shortest
+    let (n, runs) = (frontier.len(), IMPACTS_MAX);
+    (0..runs)
+        .map(|r| {
+            let (start, end) = (r * n / runs, (r + 1) * n / runs);
+            (frontier[end - 1].0, frontier[start].1)
+        })
+        .collect()
+}
+
+// a block's impacts from its header; a v1 block's one: (max count, the segment's shortest page)
+fn read_impacts(head: &[u8], pos: &mut usize, version: u8, shortest: u32) -> io::Result<Impacts> {
+    let mut impacts = Impacts {
+        k: 1,
+        pairs: [(0, 0); IMPACTS_MAX],
+    };
+    if version == 1 {
+        impacts.pairs[0] = (get_varint(head, pos)? as u32, shortest);
+        return Ok(impacts);
+    }
+    impacts.k = get_varint(head, pos)? as usize;
+    if impacts.k == 0 || impacts.k > IMPACTS_MAX {
+        return Err(corrupt());
+    }
+    for pair in impacts.pairs[..impacts.k].iter_mut() {
+        *pair = (get_varint(head, pos)? as u32, get_varint(head, pos)? as u32);
+    }
+    Ok(impacts)
+}
+
+// a block's (count, page length) pairs, the first k used
+#[derive(Clone, Copy)]
+struct Impacts {
+    k: usize,
+    pairs: [(u32, u32); IMPACTS_MAX],
+}
+
+impl Impacts {
+    fn pairs(&self) -> &[(u32, u32)] {
+        &self.pairs[..self.k]
+    }
+}
+
 pub struct SegmentWriter {
     out: BufWriter<File>,
     pos: u64,
@@ -122,7 +189,7 @@ pub struct SegmentWriter {
     terms: u64,
     last_term: Vec<u8>,
     version: u8,
-    // the pages written so far and their lengths, for each block's shortest page (v2)
+    // the pages written so far and their lengths, for each block's impacts (v2)
     ids: Vec<u64>,
     lengths: Vec<u32>,
 }
@@ -207,18 +274,23 @@ impl SegmentWriter {
             put_varint(&mut head, block.len() as u64);
             put_varint(&mut head, prev);
             put_varint(&mut head, body.len() as u64);
-            put_varint(&mut head, block.iter().map(|p| p.1).max().unwrap() as u64);
             if self.version >= 2 {
                 // a posting whose page wasn't added gets 0: the loosest bound, never a wrong one
-                let shortest = block
+                let pairs: Vec<(u32, u32)> = block
                     .iter()
-                    .map(|&(id, _)| match self.ids.binary_search(&id) {
-                        Ok(i) => self.lengths[i],
-                        Err(_) => 0,
+                    .map(|&(id, count)| match self.ids.binary_search(&id) {
+                        Ok(i) => (count, self.lengths[i]),
+                        Err(_) => (count, 0),
                     })
-                    .min()
-                    .unwrap();
-                put_varint(&mut head, shortest as u64);
+                    .collect();
+                let impacts = impacts(pairs);
+                put_varint(&mut head, impacts.len() as u64);
+                for (count, length) in impacts {
+                    put_varint(&mut head, count as u64);
+                    put_varint(&mut head, length as u64);
+                }
+            } else {
+                put_varint(&mut head, block.iter().map(|p| p.1).max().unwrap() as u64);
             }
             self.write(&head)?;
             self.write(&body)?;
@@ -296,7 +368,7 @@ pub struct Segment {
     ids: Vec<u64>,
     lengths: Vec<u32>,
     version: u8,
-    // the shortest page: a v1 block's bound, having none of its own
+    // the shortest page: a v1 block's bound's length, having no impacts
     shortest: u32,
 }
 
@@ -505,7 +577,6 @@ impl Segment {
         let mut out = Vec::with_capacity(df as usize);
         let mut prev = 0u64;
         while (out.len() as u64) < df {
-            // a block header is at most five varints
             let head = read_at(
                 &self.file,
                 offset,
@@ -515,10 +586,7 @@ impl Segment {
             let n = get_varint(&head, &mut pos)? as usize;
             let _last = get_varint(&head, &mut pos)?;
             let body_len = get_varint(&head, &mut pos)?;
-            let _max_count = get_varint(&head, &mut pos)?;
-            if self.version >= 2 {
-                get_varint(&head, &mut pos)?;
-            }
+            read_impacts(&head, &mut pos, self.version, self.shortest)?;
             if n == 0 || n > BLOCK {
                 return Err(corrupt());
             }
@@ -573,8 +641,7 @@ struct Block {
     // the block before's last id: the base of this one's first delta
     base: u64,
     last: u64,
-    max_count: u32,
-    shortest: u32,
+    impacts: Impacts,
     body_at: u64,
     body_len: u64,
     // decoded on first use
@@ -625,11 +692,7 @@ impl<'a> Cursor<'a> {
         let n = get_varint(head, &mut pos)? as usize;
         let last = get_varint(head, &mut pos)?;
         let body_len = get_varint(head, &mut pos)?;
-        let max_count = get_varint(head, &mut pos)? as u32;
-        let shortest = match version {
-            1 => segment_shortest,
-            _ => get_varint(head, &mut pos)? as u32,
-        };
+        let impacts = read_impacts(head, &mut pos, version, segment_shortest)?;
         if n == 0 || n > BLOCK || last < base || (self.passed > 0 && last == base) {
             return Err(corrupt());
         }
@@ -639,8 +702,7 @@ impl<'a> Cursor<'a> {
             n,
             base,
             last,
-            max_count,
-            shortest,
+            impacts,
             body_at,
             body_len,
             postings: None,
@@ -699,11 +761,30 @@ impl<'a> Cursor<'a> {
         self.block.is_none()
     }
 
-    /// The current block's last id, highest count and shortest page; none once done
-    pub fn block(&self) -> Option<(u64, u32, u32)> {
-        self.block
-            .as_ref()
-            .map(|b| (b.last, b.max_count, b.shortest))
+    /// The current block's last id; none once done
+    pub fn block_last(&self) -> Option<u64> {
+        self.block.as_ref().map(|b| b.last)
+    }
+
+    /**
+     * The most `weight` comes to for any posting in the current block, given a weight that
+     * grows with count and falls with page length: its highest over the block's impacts. 0 once
+     * done.
+     */
+    pub fn block_bound(&self, weight: impl Fn(u32, u32) -> f64) -> f64 {
+        self.block.as_ref().map_or(0.0, |b| {
+            b.impacts
+                .pairs()
+                .iter()
+                .map(|&(count, length)| weight(count, length))
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+    }
+
+    /// The current block's (count, page length) impacts; none once done
+    #[cfg(test)]
+    pub fn block_impacts(&self) -> Option<Vec<(u32, u32)>> {
+        self.block.as_ref().map(|b| b.impacts.pairs().to_vec())
     }
 
     /// Moves to the first block whose last id is at least `target`, reading only headers
@@ -888,10 +969,23 @@ mod tests {
         assert!(Segment::open(&path).is_err(), "empty");
     }
 
+    // the (count, length) pairs no other beats on both, by brute force, ascending
+    fn frontier(pairs: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = pairs
+            .iter()
+            .copied()
+            .filter(|&p| !pairs.iter().any(|&q| q != p && q.0 >= p.0 && q.1 <= p.1))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     #[test]
     fn every_posting_is_within_its_blocks_bounds_in_v1_and_v2() {
         for version in [1u8, 2] {
             let path = temp_dir(&format!("segment-bounds-v{}", version)).join("1.seg");
+            // lengths 1..=500, each once in every 500 pages
             let docs: Vec<(u64, u32)> = (1..=1000)
                 .map(|id| (id, (id * 37 % 500 + 1) as u32))
                 .collect();
@@ -899,10 +993,20 @@ mod tests {
                 .filter(|id| id % 3 != 0)
                 .map(|id| (id, (id * 7 % 9 + 1) as u32))
                 .collect();
+            // one block of 128 whose counts rise with page length: all 128 on the frontier
+            let mut by_length: Vec<(u64, u32)> = docs[..128].to_vec();
+            by_length.sort_by_key(|d| d.1);
+            let mut climb: Vec<Posting> = by_length
+                .iter()
+                .enumerate()
+                .map(|(rank, &(id, _))| (id, rank as u32 + 1))
+                .collect();
+            climb.sort();
             let mut writer = SegmentWriter::create_version(&path, version).unwrap();
             for &(id, length) in &docs {
                 writer.add_doc(id, length).unwrap();
             }
+            writer.add_term(b"climb", &climb).unwrap();
             writer.add_term(b"word", &postings).unwrap();
             writer.finish().unwrap();
 
@@ -910,39 +1014,65 @@ mod tests {
             assert_eq!(segment.version(), version);
             assert_eq!(segment.df(b"word").unwrap(), postings.len() as u64);
             assert_eq!(segment.df(b"absent").unwrap(), 0);
-            let mut cursor = segment.cursor(b"word").unwrap().unwrap();
-            // per block: (last id, shortest length it claims, lengths of its postings)
-            let mut blocks: Vec<(u64, u32, Vec<u32>)> = Vec::new();
-            let mut seen = Vec::new();
-            let mut at = cursor.current().unwrap();
-            while let Some((id, count)) = at {
-                let (last, max_count, shortest) = cursor.block().unwrap();
-                let length = segment.length(id).unwrap();
-                assert!(
-                    id <= last && count <= max_count && length >= shortest,
-                    "{} v{}",
-                    id,
-                    version
-                );
-                if blocks.last().map(|b| b.0) != Some(last) {
-                    blocks.push((last, shortest, Vec::new()));
+            for (term, list) in [("word", &postings), ("climb", &climb)] {
+                let mut cursor = segment.cursor(term.as_bytes()).unwrap().unwrap();
+                // per block: (last id, its impacts, its postings' (count, length))
+                let mut blocks: Vec<(u64, Vec<(u32, u32)>, Vec<(u32, u32)>)> = Vec::new();
+                let mut seen = Vec::new();
+                let mut at = cursor.current().unwrap();
+                while let Some((id, count)) = at {
+                    let last = cursor.block_last().unwrap();
+                    let impacts = cursor.block_impacts().unwrap();
+                    let length = segment.length(id).unwrap();
+                    assert!(id <= last, "{} v{}", id, version);
+                    assert!(
+                        impacts.iter().any(|&(c, l)| count <= c && length >= l),
+                        "{} ({}, {}) not under {:?} v{}",
+                        id,
+                        count,
+                        length,
+                        impacts,
+                        version
+                    );
+                    if blocks.last().map(|b| b.0) != Some(last) {
+                        blocks.push((last, impacts, Vec::new()));
+                    }
+                    blocks.last_mut().unwrap().2.push((count, length));
+                    seen.push((id, count));
+                    at = cursor.next().unwrap();
                 }
-                blocks.last_mut().unwrap().2.push(length);
-                seen.push((id, count));
-                at = cursor.next().unwrap();
+                assert!(cursor.done());
+                assert_eq!(cursor.block_bound(|_, _| 1.0), 0.0, "none once done");
+                assert_eq!(&seen, list);
+                for (_, impacts, pairs) in &blocks {
+                    if version == 1 {
+                        let max = pairs.iter().map(|p| p.0).max().unwrap();
+                        assert_eq!(impacts, &vec![(max, 1)], "the segment's shortest page");
+                        continue;
+                    }
+                    assert!(impacts
+                        .windows(2)
+                        .all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+                    let exact = frontier(pairs);
+                    if exact.len() <= IMPACTS_MAX {
+                        // tight: each is a posting's own
+                        assert_eq!(impacts, &exact);
+                    } else {
+                        assert_eq!(impacts.len(), IMPACTS_MAX, "coarsened to fit");
+                    }
+                }
             }
-            assert!(cursor.done());
-            assert_eq!(seen, postings);
             if version == 2 {
-                // tight: the block's own shortest page, not the segment's
-                for (_, shortest, lengths) in &blocks {
-                    assert_eq!(*shortest, *lengths.iter().min().unwrap());
-                }
-            } else {
-                assert!(
-                    blocks.iter().all(|b| b.1 == 1),
-                    "v1 uses the segment's shortest page"
-                );
+                let mut cursor = segment.cursor(b"climb").unwrap().unwrap();
+                assert_eq!(cursor.block_impacts().unwrap().len(), IMPACTS_MAX);
+                // the bound is the highest weight over the impacts
+                let weight = |count: u32, length: u32| count as f64 / (length as f64 + 10.0);
+                let best = climb
+                    .iter()
+                    .map(|&(id, count)| weight(count, segment.length(id).unwrap()))
+                    .fold(0.0, f64::max);
+                assert!(cursor.block_bound(weight) >= best);
+                assert!(cursor.current().unwrap().is_some());
             }
         }
     }
@@ -977,10 +1107,10 @@ mod tests {
         let before = DECODED.with(|d| d.get());
         skipping.seek_block(900).unwrap();
         assert_eq!(DECODED.with(|d| d.get()), before, "headers only");
-        assert_eq!(skipping.block().unwrap().0, 1000);
+        assert_eq!(skipping.block_last(), Some(1000));
         assert_eq!(skipping.seek(1001).unwrap(), None);
         assert!(skipping.done());
-        assert_eq!(skipping.block(), None);
+        assert_eq!(skipping.block_last(), None);
     }
 
     #[test]

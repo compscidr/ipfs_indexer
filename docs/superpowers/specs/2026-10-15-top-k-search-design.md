@@ -33,13 +33,16 @@ The time is linear in matches. At the roughly 100M pages of a 30-day window, `wi
 ## Segment format v2
 
 - **Version:** `VERSION = 2`.
-- **Block header:** n, last id (absolute), body byte length, max count, and new, the **shortest page length** among the block's postings, as a varint. The body is unchanged.
+- **Block header:** n, last id (absolute), body byte length, then the block's **impacts**: k, and k (count, page length) pairs, all varints. The body is unchanged. A header is at most 4 + 2 × 8 varints (200 bytes).
+- **Impacts** (as Lucene's): the Pareto frontier of the block's postings' (count, page length) pairs, the pairs no other posting beats on both (a count at least as high on a page at most as long). They're sorted by count ascending, so lengths ascend strictly too.
+  - At most `IMPACTS_MAX = 8` pairs. A larger frontier is coarsened: split into 8 runs of neighbours, as even as can be, each written as (its highest count, its shortest length). That's looser, but every posting is still at or under one pair.
+  - Why not (max count, shortest page)? Those usually come from different postings, so with spread-out counts and lengths nearly every block's bound beats θ, and common words prune almost nothing.
 - **Writing it:**
-  - `SegmentWriter` already receives every page's length (`add_doc`) before any term (`add_term`). It keeps the (id, length) pairs it has written, sorted by id, and `add_term` looks each posting's length up there.
+  - `SegmentWriter` already receives every page's length (`add_doc`) before any term (`add_term`). It keeps the (id, length) pairs it has written, sorted by id, and `add_term` looks each posting's length up there. A posting whose page wasn't added counts as length 0, the loosest bound.
   - Flushes, merges and #249 erase rewrites all write through `add_term`, so all three produce v2 with no other change.
 - **Reading v1 and v2:**
   - `read()` accepts versions 1 and 2.
-  - A v1 block has no shortest length, so its bound uses the segment's shortest page length. That length is computed at open from the `lengths` array already loaded. The bound is valid but loose.
+  - A v1 block has max count where v2 has impacts, and no lengths. It reads as one impact: (max count, the segment's shortest page length), computed at open from the `lengths` array already loaded. The bound is valid but loose.
 - **Upgrade:**
   - Each round, the merge thread rewrites at most one v1 segment to v2 on its own. It uses the same rewrite path as #249 erasure: the new file is installed, and the old one is retired, then zeroed, synced and removed once no search reads it.
   - Only the merge thread upgrades. The maintenance run at startup (`Store::open`) doesn't, so a start isn't held up rewriting every v1 file; they stay searchable meanwhile.
@@ -53,7 +56,7 @@ A term cursor reads one term's postings in one segment, block by block, through 
 - **`seek(target)`:** moves to the first posting with id ≥ `target`.
   - It walks block headers, skipping bodies, until it reaches a block whose last id ≥ `target`. Only that block's body is decoded.
   - It never moves backwards.
-- **Current block:** exposes the block's last id, max count and shortest length, for bounds, before its body is decoded.
+- **Current block:** `block_last()` gives its last id, and `block_bound(weight)` the highest `weight(count, length)` over its impacts (0 once done), for bounds, before its body is decoded.
 - **Current posting:** id and count. The page length comes from `Segment::length(id)`, as now.
 - **`postings_at`** stays for merges and rewrites.
 
@@ -66,7 +69,7 @@ Parsing is unchanged: an AND of OR groups, with stopwords dropped.
    - The difference is small except right after `/admin/recrawl`, when it can reach about 2× until merges catch up. Scores shift slightly with it.
    - If any group's `df` is 0, the result is empty with a total of 0.
 2. **Weight.** Same BM25 as now: `idf = ln(1 + (pages − df + 0.5)/(df + 0.5))`, `weight(count, length) = idf · count · (k1+1) / (count + k1·(1 − b + b·length/average))`, with k1 = 1.2 and b = 0.75.
-   - `weight` increases with count and decreases with length, so `weight(max count, shortest length)` is an upper bound for every posting in a block.
+   - `weight` increases with count and decreases with length, and every posting in a block is at or under one of its impacts, so the highest weight over the impacts is an upper bound for every posting in the block (exact unless coarsened).
    - Bounds are computed at query time from the current idf and average, so they never go stale.
 3. **Heap.** It holds K = `offset + limit` entries, ordered by score descending, then lower page id, as today's sort is.
    - θ is the K-th score once the heap is full, and −∞ before that.
@@ -117,7 +120,7 @@ Parsing is unchanged: an AND of OR groups, with stopwords dropped.
 ## Testing
 
 - **Same results (Success 1):** a randomized test builds several segments (some v1, some v2), a write buffer and dead ids, with skewed term frequencies and page lengths. Over hundreds of queries (one word, AND, OR, mixed; K from 1 to 1,000; offsets), `search`'s ids and order must equal a test-only exhaustive search that uses the same `df`.
-- **Bounds:** for v1 and v2 segments, every block's bound is at least the weight of every posting in it.
+- **Bounds:** for v1 and v2 segments, every posting's (count, length) is at or under one of its block's impacts; a v2 block's impacts are its exact frontier (each a posting's own) when that has 8 pairs or fewer, and a coarsened one (a block of 128 frontier points) still covers every posting.
 - **Cursor:** `seek` hits exact ids, ids between postings, ids past the end, and block boundaries.
 - **Pruning works:** on a skewed corpus, a top-10 query decodes fewer blocks than the term has (counted by a test hook).
 - **Upgrade:** a v1 segment is rewritten to v2 by one merge round, the old file is erased (`dir_has`), and results are unchanged. Opening a store leaves v1 files in place, and a failed upgrade doesn't stop a due tier merge.
