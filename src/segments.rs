@@ -215,8 +215,6 @@ pub struct Segments {
 }
 
 /// A search's snapshot of the index (#248); see Segments::view
-// used by search (#248), wired in by a later commit
-#[allow(dead_code)]
 pub struct View<'a> {
     pub segments: Vec<Arc<Segment>>,
     pub buffered: HashMap<String, Vec<(u64, u32, u32)>>,
@@ -224,8 +222,6 @@ pub struct View<'a> {
 }
 
 impl View<'_> {
-    // used by search (#248), wired in by a later commit
-    #[allow(dead_code)]
     /// Whether a page was deleted after its postings were written
     pub fn is_dead(&self, id: u64) -> bool {
         self.owner.dead.read().unwrap().ids.contains(&id)
@@ -514,6 +510,7 @@ impl Segments {
     }
 
     /// The live pages a term is on, as (id, count, page length)
+    #[cfg(test)]
     pub fn postings(&self, term: &str) -> io::Result<Vec<(u64, u32, u32)>> {
         let in_buffer = |buffer: &Buffer| -> Vec<(u64, u32, u32)> {
             buffer.postings.get(term).map_or(Vec::new(), |list| {
@@ -1523,7 +1520,6 @@ pub(crate) mod tests {
         assert_eq!(segments.postings("a").unwrap(), vec![(1, 1, 1)]);
     }
 
-    // one segment per page, flushed one at a time
     #[test]
     fn a_view_has_live_segments_largest_first_and_live_buffered_postings() {
         let dir = temp_dir("segments-view");
@@ -1590,6 +1586,7 @@ pub(crate) mod tests {
         );
     }
 
+    // one segment per page, flushed one at a time
     fn flushed(segments: &Segments, pages: &[(u64, &[(&str, u32)])]) {
         for &(id, pairs) in pages {
             segments.add(id, pairs.iter().map(|p| p.1).sum(), &words(pairs));

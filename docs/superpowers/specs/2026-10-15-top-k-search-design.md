@@ -78,7 +78,7 @@ Parsing is unchanged: an AND of OR groups, with stopwords dropped.
      - If the bound is below θ, advance the lead past the smallest last id among the current blocks. No body is decoded.
      - Otherwise, seek every group to the candidate. If a group lands past it, that id becomes the next candidate (leapfrog).
    - **Score:** if every group has the candidate and it isn't in the dead set, compute its exact score (the sum of the weights of the terms the page has, as now) and offer it to the heap.
-   - **Rounding:** bounds and scores sum the same terms in the same order, and floating-point addition is monotonic, so a bound is never below the score it bounds. The comparison still uses `bound < θ` (strict), so ties are scored.
+   - **Rounding:** bounds are sums of per-cursor upper bounds, so a bound is never below the score it bounds except by floating-point rounding. A region is skipped only when bound × (1 + 1e-9) < θ (strict), so ties are scored.
 5. **Write buffer and frozen buffer:** scored exhaustively into the same heap, as today. They hold at most 60 s of pages.
 6. **After the walk:**
    - Take heap entries `offset..offset+limit` in order.

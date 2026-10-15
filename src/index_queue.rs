@@ -1,5 +1,6 @@
 use crate::denylist::{normalize_item, Denylist};
 use crate::index_result::IndexResult;
+use crate::search::{self, Query, Scorer, Total, MAX_RANKED};
 use crate::store::{self, now_secs, OpenError, Store, Upserted};
 use actix_web::body::MessageBody;
 use cid::Cid;
@@ -7,7 +8,7 @@ use dashmap::Map;
 use log::{error, info, trace, warn};
 use scraper::{Html, Selector};
 use sha2::Digest;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Read;
 use std::ops::Not;
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
@@ -108,10 +109,6 @@ fn parse_query(query: &str) -> Vec<Vec<String>> {
     }
     groups
 }
-
-// BM25's term-frequency saturation and length normalization, Lucene's and Tantivy's defaults
-const BM25_K1: f64 = 1.2;
-const BM25_B: f64 = 0.75;
 
 // a purge scan batch that fails to read is tried this many times, this far apart (#231)
 const PURGE_READ_TRIES: u32 = 3;
@@ -774,92 +771,47 @@ impl IndexQueue {
     }
 
     /**
-     * Pages matching the query (see parse_query: every word, or any of the words joined by OR),
-     * best first, as (total matches, the page of them from offset, at most limit long). Scored by
-     * BM25 (#251), as Lucene and Tantivy do, summed over the query terms on the page: each counts
-     * idf * count * (k1 + 1) / (count + k1 * (1 - b + b * length / average length)), with
-     * idf = ln(1 + (pages - df + 0.5) / (df + 0.5)), df the pages with the term and length the
-     * page's terms. Long pages that mention a term in passing rank below focused ones.
+     * The best pages for a query, ranked by BM25 (#248): at most `offset + limit` of them, clamped
+     * to MAX_RANKED, are ranked; `offset..offset + limit` are returned. The total is exact for one
+     * word or a small smallest group, else an estimate.
      */
-    pub fn search(&self, query: &str, offset: usize, limit: usize) -> (usize, Vec<IndexResult>) {
-        let groups = parse_query(query);
-        let pages = self.store().page_count() as f64;
-        let average = self.store().average_length().max(1.0);
-        // each distinct term's postings, read once: page id -> (count, page length)
-        let mut postings: HashMap<&str, HashMap<u64, (u32, u32)>> = HashMap::new();
-        for group in &groups {
-            for term in group {
-                if postings.contains_key(term.as_str()) {
-                    continue;
-                }
-                match self.store().postings(term) {
-                    Ok(found) => postings.insert(
-                        term,
-                        found
-                            .into_iter()
-                            .map(|(page, count, length)| (page, (count, length)))
-                            .collect(),
-                    ),
-                    Err(err) => {
-                        warn!("Couldn't search for {:?}: {}", term, err);
-                        return (0, Vec::new());
-                    }
-                };
+    pub fn search(&self, query: &str, offset: usize, limit: usize) -> (Total, Vec<IndexResult>) {
+        let none = (Total { n: 0, about: false }, Vec::new());
+        let query = Query::new(&parse_query(query));
+        let terms: Vec<&str> = query.terms.iter().map(String::as_str).collect();
+        let view = self.store().view(&terms);
+        let dfs = match search::dfs(&view, &query) {
+            Ok(dfs) => dfs,
+            Err(err) => {
+                warn!("Couldn't search for {:?}: {}", query.terms, err);
+                return none;
             }
-            // a group none of whose terms are indexed matches nothing; skip reading the rest
-            if group.iter().all(|term| postings[term.as_str()].is_empty()) {
-                return (0, Vec::new());
-            }
+        };
+        // a group none of whose terms are indexed matches nothing
+        if query.groups.iter().any(|g| g.iter().all(|&t| dfs[t] == 0)) {
+            return none;
         }
-        let weight = |term: &str, (count, length): (u32, u32)| {
-            let df = postings[term].len() as f64;
-            let idf = (1.0 + (pages - df + 0.5) / (df + 0.5)).ln();
-            let count = count as f64;
-            let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * length as f64 / average);
-            idf * count * (BM25_K1 + 1.0) / (count + norm)
+        let scorer = Scorer::new(
+            self.store().page_count() as u64,
+            self.store().average_length(),
+            &dfs,
+        );
+        let k = offset.saturating_add(limit).min(MAX_RANKED);
+        let (total, ranked) = match search::search(&view, &query, &scorer, k) {
+            Ok(found) => found,
+            Err(err) => {
+                warn!("Couldn't search for {:?}: {}", query.terms, err);
+                return none;
+            }
         };
-        let has = |group: &Vec<String>, page: &u64| {
-            group
-                .iter()
-                .any(|term| postings[term.as_str()].contains_key(page))
-        };
-        // candidates from the group with the fewest postings, kept if they match every group
-        let size = |group: &&Vec<String>| -> usize {
-            group.iter().map(|term| postings[term.as_str()].len()).sum()
-        };
-        let mut matches: HashSet<u64> = match groups.iter().min_by_key(size) {
-            Some(smallest) => smallest
-                .iter()
-                .flat_map(|term| postings[term.as_str()].keys().copied())
-                .collect(),
-            None => HashSet::new(),
-        };
-        matches.retain(|page| groups.iter().all(|group| has(group, page)));
-        let mut ranked: Vec<(f64, u64)> = matches
-            .into_iter()
-            .map(|page| {
-                let score: f64 = postings
-                    .iter()
-                    .filter_map(|(term, found)| found.get(&page).map(|p| weight(term, *p)))
-                    .sum();
-                (score, page)
-            })
-            .collect();
-        // ties: the page indexed first
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        let total = ranked.len();
+        drop(view);
         // resolve only the requested page of results to items, not every match
-        let shown: Vec<u64> = ranked
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(_, page)| page)
-            .collect();
+        let shown: Vec<u64> = ranked.into_iter().skip(offset).take(limit).collect();
         let found = match self.store().pages_by_id(&shown) {
             Ok(found) => found,
             Err(err) => {
                 warn!("Couldn't look up search results: {}", err);
-                return (0, Vec::new());
+                return none;
             }
         };
         // a page deleted since its postings were read isn't found; one a denylist blocks isn't
@@ -2318,7 +2270,25 @@ mod tests {
             vec!["bafyOnce"]
         );
         let (total, page) = queue.search("rust", 5, 10);
-        assert_eq!((total, page.len()), (3, 0));
+        assert_eq!((total.n, page.len()), (3, 0));
+    }
+
+    #[test]
+    fn search_ranks_at_most_a_thousand_and_reports_the_total_past_them() {
+        let queue = IndexQueue::new();
+        for i in 0..1005 {
+            index_text(&queue, &format!("bafyPage{}", i), "rust");
+        }
+        let (total, page) = queue.search("rust", 0, usize::MAX);
+        assert_eq!((total.n, page.len()), (1005, 1000));
+        let (total, page) = queue.search("rust", 995, 10);
+        assert_eq!((total.n, page.len()), (1005, 5));
+        let (total, page) = queue.search("rust", 1000, 10);
+        assert_eq!(
+            (total.n, page.len()),
+            (1005, 0),
+            "past the ranked: the total, no results"
+        );
     }
 
     #[test]
@@ -2389,7 +2359,7 @@ mod tests {
                 .iter()
                 .map(|query| {
                     let (total, found) = queue.search(query, 0, 100);
-                    (total, found.into_iter().map(|r| r.cid).collect())
+                    (total.n, found.into_iter().map(|r| r.cid).collect())
                 })
                 .collect()
         };

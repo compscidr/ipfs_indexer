@@ -4,8 +4,6 @@
  * K are skipped by their headers alone (block-max). The buffer is scored in full. Totals are the
  * dictionary df for one word, an exact count when the smallest group is small, else an estimate.
  */
-// wired into IndexQueue::search in the next commit (#248)
-#![allow(dead_code)]
 use crate::segment::{Cursor, Segment};
 use crate::segments::View;
 use std::cmp::Ordering;

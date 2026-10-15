@@ -141,7 +141,7 @@ async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpRe
     }
 }
 
-// ranked results; ?limit=n&offset=m pages through them (#209), all of them by default
+// ranked results; ?limit=n&offset=m pages through them (#209): 100 by default, the first 1,000 at most (#248)
 #[get("/search/{query}")]
 async fn search_handler(
     data: web::Data<IndexQueue>,
@@ -153,7 +153,7 @@ async fn search_handler(
         None => Ok(default),
         Some(value) => value.parse::<usize>().map_err(|_| name.to_string()),
     };
-    let (offset, limit) = match (number("offset", 0), number("limit", usize::MAX)) {
+    let (offset, limit) = match (number("offset", 0), number("limit", 100)) {
         (Ok(offset), Ok(limit)) => (offset, limit),
         (Err(name), _) | (_, Err(name)) => {
             return HttpResponse::BadRequest().body(format!("{} must be a number", name))
@@ -603,6 +603,39 @@ mod tests {
 
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_search_defaults_to_a_hundred_results() {
+        let index_queue = web::Data::new(IndexQueue::new());
+        let cid = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
+        for i in 0..101 {
+            let item = format!("{}/p{}", cid, i);
+            let counts = HashMap::from([("word".to_string(), 1)]);
+            index_queue.index_for_test(
+                &item,
+                &crate::index_result::IndexResult::new(
+                    item.clone(),
+                    "t".into(),
+                    "e".into(),
+                    counts,
+                ),
+            );
+        }
+        let app = test::init_service(
+            App::new()
+                .app_data(index_queue.clone())
+                .service(search_handler),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/search/word").to_request();
+        let body = String::from_utf8(test::call_and_read_body(&app, req).await.to_vec()).unwrap();
+        assert!(
+            body.starts_with("Results for word (101 total): "),
+            "{}",
+            body
+        );
+        assert_eq!(body.matches("CID: ").count(), 100);
     }
 
     #[actix_web::test]

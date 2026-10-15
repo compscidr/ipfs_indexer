@@ -28,8 +28,6 @@ pub(crate) const VERSION: u8 = 2;
 // a block header is at most five varints
 const HEAD_MAX: u64 = 50;
 // how much a cursor reads at once
-// used by search (#248), wired in by a later commit
-#[allow(dead_code)]
 const WINDOW: u64 = 64 * 1024;
 
 // blocks decoded by cursors on this thread, so tests can see what pruning skipped
@@ -299,7 +297,6 @@ pub struct Segment {
     lengths: Vec<u32>,
     version: u8,
     // the shortest page: a v1 block's bound, having none of its own
-    #[allow(dead_code)] // used by search (#248), wired in by a later commit
     shortest: u32,
 }
 
@@ -411,15 +408,11 @@ impl Segment {
     }
 
     /// How many pages a term is on here (dead ones included), or 0
-    // used by search (#248), wired in by a later commit
-    #[allow(dead_code)]
     pub fn df(&self, term: &[u8]) -> io::Result<u64> {
         Ok(self.find(term)?.map_or(0, |(df, _)| df))
     }
 
     /// A cursor over a term's postings (#248), or none if it isn't in this segment
-    // used by search (#248), wired in by a later commit
-    #[allow(dead_code)]
     pub fn cursor(&self, term: &[u8]) -> io::Result<Option<Cursor<'_>>> {
         match self.find(term)? {
             Some((df, offset)) => Cursor::new(self, df, offset).map(Some),
@@ -465,6 +458,7 @@ impl Segment {
     }
 
     /// The postings for a term, or none if it isn't in this segment
+    #[cfg(test)]
     pub fn postings(&self, term: &[u8]) -> io::Result<Vec<Posting>> {
         match self.find(term)? {
             Some((df, offset)) => self.postings_at(df, offset),
@@ -560,8 +554,6 @@ impl Segment {
  * and skipped without decoding the postings behind them, so a search can pass over blocks
  * whose pages can't make its results. Moves only forward.
  */
-// used by search (#248), wired in by a later commit
-#[allow(dead_code)]
 pub struct Cursor<'a> {
     segment: &'a Segment,
     df: u64,
@@ -576,8 +568,6 @@ pub struct Cursor<'a> {
     window_at: u64,
 }
 
-// used by search (#248), wired in by a later commit
-#[allow(dead_code)]
 struct Block {
     n: usize,
     // the block before's last id: the base of this one's first delta
@@ -593,8 +583,6 @@ struct Block {
     i: usize,
 }
 
-// used by search (#248), wired in by a later commit
-#[allow(dead_code)]
 impl<'a> Cursor<'a> {
     fn new(segment: &'a Segment, df: u64, offset: u64) -> io::Result<Cursor<'a>> {
         let mut cursor = Cursor {
@@ -748,6 +736,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// Moves past the current posting; the one after it, none once done
+    #[cfg(test)]
     pub fn next(&mut self) -> io::Result<Option<Posting>> {
         self.decode()?;
         if let Some(b) = self.block.as_mut() {

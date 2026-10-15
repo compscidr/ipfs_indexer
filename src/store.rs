@@ -458,13 +458,12 @@ impl Store {
     }
 
     /// What a search reads (#248); see Segments::view
-    // used by search (#248), wired in by a later commit
-    #[allow(dead_code)]
     pub fn view(&self, terms: &[&str]) -> crate::segments::View<'_> {
         self.segments.view(terms)
     }
 
     /// The live pages a term is on, as (page id, how often it appears there, the page's length)
+    #[cfg(test)]
     pub fn postings(&self, term: &str) -> std::io::Result<Vec<(u64, u32, u32)>> {
         self.segments.postings(term)
     }
