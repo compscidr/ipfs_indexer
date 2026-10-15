@@ -437,19 +437,23 @@ impl Store {
         rows.collect()
     }
 
-    /// Dead versions to erase from the segment files promptly (#249)
+    /// Dead versions to erase from the segment files promptly (#249); commits every
+    /// WRITE_BATCH ids, so an error part-way keeps the batches before it
     pub fn erase_ids(&self, ids: &[u64]) -> rusqlite::Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare("UPDATE dead_pages SET erase = 1 WHERE id = ?1")?;
-            for &id in ids {
-                stmt.execute([id as i64])?;
+        for batch in ids.chunks(WRITE_BATCH) {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            {
+                let mut stmt =
+                    tx.prepare_cached("UPDATE dead_pages SET erase = 1 WHERE id = ?1")?;
+                for &id in batch {
+                    stmt.execute([id as i64])?;
+                }
             }
+            tx.commit()?;
+            drop(conn);
+            self.segments.mark_erase(batch);
         }
-        tx.commit()?;
-        drop(conn);
-        self.segments.mark_erase(ids);
         Ok(())
     }
 
@@ -509,18 +513,22 @@ impl Store {
         if dropped.is_empty() {
             return;
         }
-        let mut conn = self.conn.lock().unwrap();
-        let deleted = conn.transaction().and_then(|tx| {
-            {
-                let mut stmt = tx.prepare_cached("DELETE FROM dead_pages WHERE id = ?1")?;
-                for &id in &dropped {
-                    stmt.execute([id as i64])?;
+        // a batch per transaction: after an expiry this can be every dead version there is
+        for batch in dropped.chunks(WRITE_BATCH) {
+            let mut conn = self.conn.lock().unwrap();
+            let deleted = conn.transaction().and_then(|tx| {
+                {
+                    let mut stmt = tx.prepare_cached("DELETE FROM dead_pages WHERE id = ?1")?;
+                    for &id in batch {
+                        stmt.execute([id as i64])?;
+                    }
                 }
+                tx.commit()
+            });
+            if let Err(err) = deleted {
+                log::warn!("Couldn't drop {} dead page ids: {}", batch.len(), err);
+                return;
             }
-            tx.commit()
-        });
-        if let Err(err) = deleted {
-            log::warn!("Couldn't drop {} dead page ids: {}", dropped.len(), err);
         }
     }
 
@@ -1453,6 +1461,47 @@ pub(crate) mod tests {
         assert_eq!(store.delete(&items, true).unwrap(), n);
         assert!(store.load_all().unwrap().is_empty());
         assert_eq!(store.average_length(), 0.0);
+    }
+
+    #[test]
+    fn erasing_and_dropping_more_dead_versions_than_a_batch_all_land() {
+        let store = Store::open_in_memory().unwrap();
+        let n = WRITE_BATCH * 2 + 500;
+        let items: Vec<String> = (0..n).map(|i| format!("bafyQ{}", i)).collect();
+        for at in [1, 2] {
+            for item in &items {
+                store
+                    .upsert(item, &page(item, "t", &[("word", at)]), at as i64)
+                    .unwrap();
+            }
+        }
+        store.flush().unwrap();
+        let dead: Vec<u64> = store
+            .dead_versions()
+            .unwrap()
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        assert_eq!(dead.len(), n, "each first version superseded");
+        store.erase_ids(&dead).unwrap();
+        let count = |sql: &str| -> i64 {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(sql, [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            count("SELECT count(*) FROM dead_pages WHERE erase = 1"),
+            n as i64
+        );
+        store.maintain();
+        assert_eq!(
+            count("SELECT count(*) FROM dead_pages"),
+            0,
+            "erased, so every record went, batch by batch"
+        );
     }
 
     #[test]
