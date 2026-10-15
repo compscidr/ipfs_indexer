@@ -42,6 +42,7 @@ The time is linear in matches. At the roughly 100M pages of a 30-day window, `wi
   - A v1 block has no shortest length, so its bound uses the segment's shortest page length. That length is computed at open from the `lengths` array already loaded. The bound is valid but loose.
 - **Upgrade:**
   - Each round, the merge thread rewrites at most one v1 segment to v2 on its own. It uses the same rewrite path as #249 erasure: the new file is installed, and the old one is retired, then zeroed, synced and removed once no search reads it.
+  - Only the merge thread upgrades. The maintenance run at startup (`Store::open`) doesn't, so a start isn't held up rewriting every v1 file; they stay searchable meanwhile.
   - Segments of 1 GiB or more are included, since merges never touch them. Memory is bounded by one segment's rewrite, as for erasure.
   - Each upgrade is logged.
 
@@ -111,7 +112,7 @@ Parsing is unchanged: an AND of OR groups, with stopwords dropped.
 ## Errors
 
 - A read or decode error in a cursor is logged, and the search returns no results, as a postings error does today.
-- A v1 segment that fails its upgrade rewrite stays v1 (still searchable with loose bounds), and the error is logged. It's tried again next round.
+- A v1 segment that fails its upgrade rewrite stays v1 (still searchable with loose bounds), and the error is logged. Upgrades then wait 10 minutes before they're tried again; tier and mostly-dead merges go on meanwhile.
 
 ## Testing
 
@@ -119,7 +120,7 @@ Parsing is unchanged: an AND of OR groups, with stopwords dropped.
 - **Bounds:** for v1 and v2 segments, every block's bound is at least the weight of every posting in it.
 - **Cursor:** `seek` hits exact ids, ids between postings, ids past the end, and block boundaries.
 - **Pruning works:** on a skewed corpus, a top-10 query decodes fewer blocks than the term has (counted by a test hook).
-- **Upgrade:** a v1 segment is rewritten to v2 by one merge round, the old file is erased (`dir_has`), and results are unchanged.
+- **Upgrade:** a v1 segment is rewritten to v2 by one merge round, the old file is erased (`dir_has`), and results are unchanged. Opening a store leaves v1 files in place, and a failed upgrade doesn't stop a due tier merge.
 - **Totals:** an exact count at or below 10,000; an estimate above it, formatted as `about`, and within 25% on a uniform synthetic corpus.
 - **API:** the default `limit` is 100; `offset + limit` is clamped to 1,000; `offset` ≥ 1,000 gives empty results with the total.
 - **Measurement (throwaway, not committed):** synthetic 1M and 10M pages with Zipf-distributed terms, timing the Success 2 queries before (main) and after. The numbers go in the PR.
