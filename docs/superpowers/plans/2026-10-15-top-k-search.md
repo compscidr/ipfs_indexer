@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Historical note:** this is the plan as executed task by task. The final whole-branch review found the per-block (max count, shortest page) bound too loose to prune common words. Before v2 shipped, it was replaced with per-block **impacts**: up to 8 (count, page length) pairs per block, read through `Cursor::block_last()` / `block_bound()`, with `HEAD_MAX = 200`. The review also moved v1 upgrades off the startup path, onto the merge thread with a backoff. The spec (`docs/superpowers/specs/2026-10-15-top-k-search-design.md`) and `src/segment.rs` describe what shipped.
+
 **Goal:** Make search time depend on the number of results shown (top K), not on the number of matching pages (#248).
 
 **Architecture:**
