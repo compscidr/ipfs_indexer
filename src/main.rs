@@ -15,6 +15,7 @@ mod admin;
 mod denylist;
 mod index_queue;
 mod index_result;
+mod search;
 mod segment;
 mod segments;
 mod store;
@@ -142,7 +143,7 @@ async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpRe
 
 // ranked results; ?limit=n&offset=m pages through them (#209), all of them by default
 #[get("/search/{query}")]
-async fn search(
+async fn search_handler(
     data: web::Data<IndexQueue>,
     item: web::Path<String>,
     params: web::Query<HashMap<String, String>>,
@@ -405,7 +406,7 @@ async fn main() -> std::io::Result<()> {
             .service(version_handler)
             .service(resources)
             .service(enqueue)
-            .service(search)
+            .service(search_handler)
             .service(keywords)
             .service(roots)
             .configure(|cfg| admin::configure(cfg, admin.clone()))
@@ -593,8 +594,12 @@ mod tests {
             .uri("/search/searchItem")
             .to_request();
 
-        let app =
-            test::init_service(App::new().app_data(index_queue.clone()).service(search)).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(index_queue.clone())
+                .service(search_handler),
+        )
+        .await;
 
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
@@ -617,8 +622,12 @@ mod tests {
                 &crate::index_result::IndexResult::new(item.into(), "t".into(), "e".into(), counts),
             );
         }
-        let app =
-            test::init_service(App::new().app_data(index_queue.clone()).service(search)).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(index_queue.clone())
+                .service(search_handler),
+        )
+        .await;
 
         let req = test::TestRequest::get()
             .uri("/search/Word?limit=2")
