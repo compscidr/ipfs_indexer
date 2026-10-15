@@ -105,8 +105,11 @@ const SCHEMA: &str = "
     -- the crawl frontier (#224): items waiting to be fetched, in insertion order
     CREATE TABLE IF NOT EXISTS queue (
         item TEXT PRIMARY KEY
-    );
-    -- indexed pages and queued items per root CID, kept in step with them for /roots (#231)
+    );";
+
+// indexed pages and queued items per root CID, kept in step with them for /roots (#231). Apart
+// from SCHEMA: an index from before it creates it in the same transaction that fills it.
+const ROOTS_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS roots (
         root   TEXT PRIMARY KEY,
         pages  INTEGER NOT NULL,
@@ -176,6 +179,8 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         if has_pages && !has_roots {
             fill_roots(&mut conn)?;
+        } else {
+            conn.execute_batch(ROOTS_SCHEMA)?;
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS pages_text_hash ON pages (text_hash);
@@ -897,13 +902,16 @@ fn bump_root(tx: &Connection, item: &str, pages: i64, queued: i64) -> rusqlite::
 }
 
 /**
- * Fills `roots` from `pages` and `queue`, once, for an index from before it (v0.2.9). Two
- * GROUP BYs in one transaction: it inserts one row per root (a few hundred), so the in-memory
- * journal and the sorter stay small however many pages there are.
+ * Creates and fills `roots` from `pages` and `queue`, once, for an index from before it
+ * (v0.2.9). One transaction, so a fill that's cut short leaves no table and the next open fills
+ * it again. It inserts one row per root (a few hundred), so the in-memory journal stays small;
+ * the two GROUP BYs sort every row's root in memory (temp_store), about 350 MB at 2M pages and
+ * 3M queued, which is fine at that size for a one-time step.
  */
 fn fill_roots(conn: &mut Connection) -> rusqlite::Result<()> {
     log::info!("Counting pages and queued items per root (one-time, #231)");
     let tx = conn.transaction()?;
+    tx.execute_batch(ROOTS_SCHEMA)?;
     tx.execute_batch(
         "INSERT INTO roots (root, pages, queued)
            SELECT substr(item, 1, instr(item || '/', '/') - 1) AS r, count(*), 0
@@ -1949,6 +1957,37 @@ pub(crate) mod tests {
             roots_table(&store),
             vec![("a".to_string(), 2, 1), ("b".to_string(), 0, 1)]
         );
+    }
+
+    #[test]
+    fn a_roots_fill_cut_short_leaves_no_table_and_the_next_open_fills_it() {
+        let dir = temp_dir("roots-fill-fails");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("a/1", &page("a/1", "t", &[("x", 1)]), 1)
+            .unwrap();
+        store.queue_add(&["a/2".into()]).unwrap();
+        drop(store);
+        {
+            // a v0.2.9 index whose queue fails to read part-way through the fill
+            let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+            conn.execute_batch(
+                "DROP TABLE roots;
+                 ALTER TABLE queue RENAME TO queue_kept;
+                 CREATE VIEW queue AS SELECT abs(-9223372036854775808) AS item;",
+            )
+            .unwrap();
+        }
+        let err = Store::open(&dir, 0).err().unwrap();
+        assert!(err.to_string().contains("integer overflow"), "{}", err);
+        assert!(!dir_has_table(&dir, "roots"), "rolled back, table and all");
+        {
+            let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+            conn.execute_batch("DROP VIEW queue; ALTER TABLE queue_kept RENAME TO queue;")
+                .unwrap();
+        }
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(roots_table(&store), vec![("a".to_string(), 1, 1)]);
     }
 
     #[test]
