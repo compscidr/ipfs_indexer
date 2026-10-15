@@ -300,9 +300,9 @@ async fn main() -> std::io::Result<()> {
         info!("Index cache: at most {} MB in memory", cache_mb);
         let attached = index_queue.open_store(std::path::Path::new(&dir), cache_mb, max_age_secs);
         match attached {
-            Ok((loaded, blocked, expired)) => info!(
-                "Loaded {} pages from {}/index.sqlite (dropped {} blocked, {} expired)",
-                loaded, dir, blocked, expired
+            Ok((pages, queued)) => info!(
+                "Opened {}/index.sqlite: {} pages, {} queued",
+                dir, pages, queued
             ),
             Err(err) => {
                 error!("Couldn't use DATA_DIR {}: {}", dir, err);
@@ -585,7 +585,14 @@ mod tests {
     #[actix_web::test]
     async fn test_search_limit_and_bad_params() {
         let index_queue = web::Data::new(IndexQueue::new());
-        for item in ["bafyA", "bafyB", "bafyC"] {
+        // real CIDs: search serves no other (#231)
+        let cid = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
+        for item in [
+            format!("{}/A", cid),
+            format!("{}/B", cid),
+            format!("{}/C", cid),
+        ] {
+            let item = item.as_str();
             let counts = HashMap::from([("word".to_string(), 1)]);
             index_queue.index_for_test(
                 item,

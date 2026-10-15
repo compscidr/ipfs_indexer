@@ -55,7 +55,7 @@ pub struct Store {
  * transaction's size is RAM: one over a whole expiry, purge or recrawl could reach gigabytes,
  * and being killed mid-commit with the journal gone corrupts the file.
  */
-const WRITE_BATCH: usize = 1000;
+pub(crate) const WRITE_BATCH: usize = 1000;
 
 pub type OpenError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -447,49 +447,6 @@ impl Store {
         Ok(())
     }
 
-    /// Moves a page to a new item (and cid), keeping its postings; false if `to` exists already
-    pub fn rekey(&self, from: &str, to: &str, cid: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        match conn.execute(
-            "UPDATE pages SET item = ?2, cid = ?3 WHERE item = ?1",
-            params![from, to, cid],
-        ) {
-            Ok(_) => Ok(true),
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                Ok(false)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Every page, without keyword counts (those stay on disk)
-    // #231: removed with the maps (Task 3)
-    pub fn load_all(&self) -> rusqlite::Result<Vec<(String, IndexResult, i64)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT item, cid, title, excerpt, indexed_at FROM pages")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                IndexResult::new(r.get(1)?, r.get(2)?, r.get(3)?, HashMap::new()),
-                r.get(4)?,
-            ))
-        })?;
-        rows.collect()
-    }
-
-    /// Every mirror, as (item, the item of the page it has the same text as)
-    // #231: removed with the maps (Task 3)
-    pub fn mirrors_load(&self) -> rusqlite::Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT mirrors.item, pages.item FROM mirrors JOIN pages ON pages.id = mirrors.page",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        rows.collect()
-    }
-
     /// The live pages a term is on, as (page id, how often it appears there, the page's length)
     pub fn postings(&self, term: &str) -> std::io::Result<Vec<(u64, u32, u32)>> {
         self.segments.postings(term)
@@ -610,6 +567,8 @@ impl Store {
         Ok(added)
     }
 
+    // startup's queue check was its only caller (#231); kept, roots and all, for tests
+    #[cfg(test)]
     pub fn queue_remove(&self, items: &[String]) -> rusqlite::Result<()> {
         for batch in items.chunks(WRITE_BATCH) {
             let mut conn = self.conn.lock().unwrap();
@@ -681,17 +640,12 @@ impl Store {
         rows.collect()
     }
 
-    pub fn mirror_count(&self) -> usize {
-        self.mirrors.load(Ordering::Relaxed)
+    pub fn page_count(&self) -> usize {
+        self.pages.load(Ordering::Relaxed)
     }
 
-    /// The frontier in the order it was added
-    // #231: removed with the maps (Task 3)
-    pub fn queue_load(&self) -> rusqlite::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT item FROM queue ORDER BY rowid")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
-        rows.collect()
+    pub fn mirror_count(&self) -> usize {
+        self.mirrors.load(Ordering::Relaxed)
     }
 
     /// Whether an item is indexed or recorded as a mirror (#231: replaces the in-memory maps)
@@ -785,6 +739,38 @@ impl Drop for Store {
 
 #[cfg(test)]
 impl Store {
+    /// Every page, without keyword counts (those stay on disk)
+    pub(crate) fn load_all(&self) -> rusqlite::Result<Vec<(String, IndexResult, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT item, cid, title, excerpt, indexed_at FROM pages")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                IndexResult::new(r.get(1)?, r.get(2)?, r.get(3)?, HashMap::new()),
+                r.get(4)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Every mirror, as (item, the item of the page it has the same text as)
+    pub(crate) fn mirrors_load(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mirrors.item, pages.item FROM mirrors JOIN pages ON pages.id = mirrors.page",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// The frontier in the order it was added
+    pub(crate) fn queue_load(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT item FROM queue ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+
     pub(crate) fn segment_count(&self) -> usize {
         self.segments.segment_count()
     }

@@ -289,9 +289,9 @@ mod tests {
         let (admin, path) = admin_with("# takedowns"); // no trailing newline
         let queue = web::Data::new(IndexQueue::new());
         let item = format!("{}/x", BAD);
-        queue.map.insert(
-            item.clone(),
-            IndexResult::new(item.clone(), "t".into(), "e".into(), HashMap::new()),
+        queue.index_for_test(
+            &item,
+            &IndexResult::new(item.clone(), "t".into(), "e".into(), HashMap::new()),
         );
 
         let (status, body) = call(
@@ -344,9 +344,9 @@ mod tests {
         let (admin, _) = admin_with("");
         let queue = web::Data::new(IndexQueue::new());
         for item in [GOOD.to_string(), format!("{}/wiki/X", GOOD)] {
-            queue.map.insert(
-                item.clone(),
-                IndexResult::new(item, "t".into(), "e".into(), HashMap::new()),
+            queue.index_for_test(
+                &item,
+                &IndexResult::new(item.clone(), "t".into(), "e".into(), HashMap::new()),
             );
         }
         let post = |token: &'static str| {

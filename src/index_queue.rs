@@ -3,7 +3,7 @@ use crate::index_result::IndexResult;
 use crate::store::{self, now_secs, OpenError, Store, Upserted};
 use actix_web::body::MessageBody;
 use cid::Cid;
-use dashmap::{DashMap, Map};
+use dashmap::Map;
 use log::{error, info, trace, warn};
 use scraper::{Html, Selector};
 use sha2::Digest;
@@ -57,16 +57,6 @@ impl Throttle {
             std::thread::sleep(slot - now);
         }
     }
-}
-
-// The in-memory copy of a page: its keyword counts live in the store's postings (#220, #231).
-fn without_keywords(result: &IndexResult) -> IndexResult {
-    IndexResult::new(
-        result.cid.clone(),
-        result.title.clone(),
-        result.excerpt.clone(),
-        HashMap::new(),
-    )
 }
 
 // too common to be worth a posting per page; replaces the old "longer than 3 bytes" cutoff (#209)
@@ -221,13 +211,6 @@ pub enum Enqueued {
 }
 
 pub struct IndexQueue {
-    // index results (cid -> result)
-    pub map: DashMap<String, IndexResult>,
-
-    // items not indexed because their text is the same as an indexed page's (#253): item -> that
-    // page's item. Kept so links to them aren't queued again.
-    mirrors: DashMap<String, String>,
-
     // badbits and the hand-maintained local list, checked before every enqueue and fetch
     denylist: RwLock<Denylist>,
     local_denylist: RwLock<Denylist>,
@@ -239,9 +222,9 @@ pub struct IndexQueue {
     // attach_store, or an in-memory one on first use when DATA_DIR isn't configured.
     store: OnceLock<Store>,
 
-    // persist() holds this shared across its check + insert + upsert; denylist swaps and
-    // expire() hold it exclusively, so a page checked against an old list can't be written
-    // after the purge that should have removed it
+    // persist() holds this shared across its check + upsert; denylist swaps and each expiry
+    // batch hold it exclusively, so a page checked against an old list can't be written after
+    // the swap (the purge that follows could miss it)
     writes: RwLock<()>,
 
     // spaces out gateway requests; unset means no limit
@@ -251,8 +234,6 @@ pub struct IndexQueue {
 impl IndexQueue {
     pub fn new() -> Self {
         IndexQueue {
-            map: DashMap::new(),
-            mirrors: DashMap::new(),
             denylist: RwLock::new(Denylist::empty()),
             local_denylist: RwLock::new(Denylist::empty()),
             last_fetch: Mutex::new(None),
@@ -272,7 +253,6 @@ impl IndexQueue {
     #[cfg(test)]
     pub(crate) fn index_for_test(&self, item: &str, result: &IndexResult) {
         self.store().upsert(item, result, now_secs()).unwrap();
-        self.map.insert(item.to_string(), without_keywords(result));
     }
 
     #[cfg(test)]
@@ -331,22 +311,24 @@ impl IndexQueue {
     }
 
     /**
-     * Replace the denylist and drop anything already indexed that is now on it. Search only
-     * returns cids still in the map, so purged pages disappear from results.
+     * Replace the denylist, then erase anything stored that is now on it. Search checks each
+     * result against the lists, so blocked pages disappear from results at the swap (#231).
      */
     pub fn set_denylist(&self, denylist: Denylist) {
-        let _writes = self.writes.write().unwrap();
-        self.purge(&denylist);
-        *self.denylist.write().unwrap() = denylist;
+        {
+            let _writes = self.writes.write().unwrap();
+            *self.denylist.write().unwrap() = denylist;
+        }
+        self.purge_blocked();
     }
 
-    /// Same as set_denylist, for the local takedown list
-    /// returns how many pages it purged
+    /// Same as set_denylist, for the local takedown list; returns how many pages it purged
     pub fn set_local_denylist(&self, denylist: Denylist) -> usize {
-        let _writes = self.writes.write().unwrap();
-        let removed = self.purge(&denylist);
-        *self.local_denylist.write().unwrap() = denylist;
-        removed
+        {
+            let _writes = self.writes.write().unwrap();
+            *self.local_denylist.write().unwrap() = denylist;
+        }
+        self.purge_blocked()
     }
 
     /**
@@ -359,7 +341,7 @@ impl IndexQueue {
         dir: &std::path::Path,
         cache_mb: u32,
         max_age_secs: i64,
-    ) -> Result<(usize, usize, usize), OpenError> {
+    ) -> Result<(usize, usize), OpenError> {
         let open = || -> Result<_, OpenError> {
             let store = Store::open(dir, cache_mb)?;
             Ok(self.attach_store(store, max_age_secs)?)
@@ -372,9 +354,6 @@ impl IndexQueue {
                     err
                 );
                 store::wipe(dir)?;
-                // what attach_store loaded before it hit the damage
-                self.map.clear();
-                self.mirrors.clear();
                 open()
             }
             other => other,
@@ -382,95 +361,28 @@ impl IndexQueue {
     }
 
     /**
-     * Use `store` for this queue: drop rows that are denylisted or older than max_age_secs
-     * (deleting them from disk), then load the rest into the map and keyword index. Call after
-     * both denylists are loaded and before crawling or serving.
+     * Use `store` for this queue (call before crawling or serving). Nothing is loaded into memory
+     * (#231): pages, mirrors and the queue stay on disk. Pages a denylist blocked while the
+     * index was down are hidden by search's check and erased by the purge queued here; expiry
+     * runs from main. Returns the pages and queued items there are.
      */
     pub fn attach_store(
         &self,
         store: Store,
-        max_age_secs: i64,
-    ) -> rusqlite::Result<(usize, usize, usize)> {
-        let cutoff = now_secs() - max_age_secs;
-        let (mut to_delete, mut to_erase, mut blocked, mut expired) =
-            (Vec::new(), Vec::new(), 0, 0);
-        // canonical item -> result; rows stored before #218 can have paths like "wiki//../X",
-        // re-keyed here (item and cid, keeping their postings) or dropped as duplicates
-        let mut keep: HashMap<String, IndexResult> = HashMap::new();
-        let mut rekey = Vec::new();
-        for (item, result, indexed_at) in store.load_all()? {
-            if self.blocked_quietly(&item) || self.blocked_quietly(&result.cid) {
-                blocked += 1;
-                to_erase.push(item);
-            } else if indexed_at < cutoff {
-                expired += 1;
-                to_erase.push(item);
-            } else {
-                match normalize_item(&item) {
-                    // climbs out of its CID: can't be served correctly
-                    None => to_delete.push(item),
-                    Some(canonical) if canonical == item => {
-                        keep.insert(item, result);
-                    }
-                    Some(canonical) => rekey.push((item, canonical, result)),
-                }
-            }
-        }
-        // a row already under the canonical key wins over a re-keyed duplicate
-        for (item, canonical, mut result) in rekey {
-            result.cid = normalize_item(&result.cid).unwrap_or_else(|| canonical.clone());
-            if !keep.contains_key(&canonical) && store.rekey(&item, &canonical, &result.cid)? {
-                keep.insert(canonical, result);
-            } else {
-                to_delete.push(item);
-            }
-        }
-        store.delete(&to_erase, true)?;
-        store.delete(&to_delete, false)?;
-        for (item, result) in keep.iter() {
-            self.map.insert(item.clone(), without_keywords(result));
-        }
-        // mirrors of the pages just deleted went with them
-        let mut blocked_mirrors = Vec::new();
-        for (item, original) in store.mirrors_load()? {
-            if self.blocked_quietly(&item) {
-                blocked_mirrors.push(item);
-            } else {
-                self.mirrors.insert(item, original);
-            }
-        }
-        store.delete(&blocked_mirrors, false)?;
-        // resume the crawl (#224): pages blocked or indexed since they were queued are dropped
-        let (mut respelled, mut dropped) = (Vec::new(), Vec::new());
-        for item in store.queue_load()? {
-            match self.admit(item.clone()) {
-                (_, Some(admitted)) if admitted == item => {}
-                (_, admitted) => {
-                    dropped.push(item);
-                    respelled.extend(admitted); // re-spelled canonically
-                }
-            }
-        }
-        store.queue_remove(&dropped)?;
-        store.queue_add(&respelled)?;
-        info!(
-            "Resumed {} queued items ({} dropped)",
-            store.queue_len(),
-            dropped.len()
-        );
-        // versions blocked while the index was down, then the erasures, before serving (#249)
-        let blocked_versions: Vec<u64> = store
-            .dead_versions()?
-            .into_iter()
-            .filter(|(_, item, cid, _)| self.blocked_quietly(item) || self.blocked_quietly(cid))
-            .map(|(id, ..)| id)
-            .collect();
-        store.erase_ids(&blocked_versions)?;
+        _max_age_secs: i64,
+    ) -> rusqlite::Result<(usize, usize)> {
         store.maintain();
+        let counts = (store.page_count(), store.queue_len());
         if self.store.set(store).is_err() {
             panic!("attach_store must run before the store is first used");
         }
-        Ok((keep.len(), blocked, expired))
+        self.request_purge();
+        Ok(counts)
+    }
+
+    // Task 4 runs this on the purge thread; until then the purge is synchronous
+    fn request_purge(&self) {
+        self.purge_blocked();
     }
 
     /// the index file, if a store is attached
@@ -490,41 +402,64 @@ impl IndexQueue {
     /**
      * Queue every indexed page to be fetched again, so links to pages not indexed yet are followed
      * again (the crawl frontier was lost before it was saved, #225). Pages stay searchable while
-     * they wait. A restart drops what's left: the saved queue skips indexed pages on load.
+     * they wait, and what's left of it survives a restart. Streams `pages` in batches (#231).
      */
     pub fn recrawl(&self) -> usize {
-        let indexed: Vec<String> = self.map.iter().map(|e| e.key().clone()).collect();
-        let items: Vec<String> = indexed
-            .into_iter()
-            .filter(|item| !self.blocked_quietly(item))
-            .collect();
-        self.push_queued(items)
+        let store = self.store();
+        let (mut queued, mut after) = (0, 0);
+        loop {
+            let batch = match store.items_after(after, crate::store::WRITE_BATCH) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    warn!("Couldn't list pages to recrawl: {}", err);
+                    break;
+                }
+            };
+            let Some(last) = batch.last() else { break };
+            after = last.0;
+            let items = batch
+                .into_iter()
+                .map(|(_, item, _)| item)
+                .filter(|item| !self.blocked_quietly(item))
+                .collect();
+            queued += self.push_queued(items);
+        }
+        queued
     }
 
-    /// Drop pages indexed more than max_age_secs ago, from the store and the map
+    /// Drop pages indexed more than max_age_secs ago, a batch at a time under the writes lock,
+    /// so a page re-crawled meanwhile isn't listed with its old date
     pub fn expire(&self, max_age_secs: i64) -> usize {
-        let _writes = self.writes.write().unwrap();
         let Some(store) = self.store.get() else {
             return 0;
         };
-        let old = match store.older_than(now_secs() - max_age_secs, usize::MAX) {
-            Ok(old) => old,
-            Err(err) => {
-                warn!("Couldn't check for expired pages: {}", err);
-                return 0;
+        let cutoff = now_secs() - max_age_secs;
+        let mut expired = 0;
+        loop {
+            let _writes = self.writes.write().unwrap();
+            let old = match store.older_than(cutoff, crate::store::WRITE_BATCH) {
+                Ok(old) => old,
+                Err(err) => {
+                    warn!("Couldn't check for expired pages: {}", err);
+                    break;
+                }
+            };
+            if old.is_empty() {
+                break;
             }
-        };
-        // like a purge, they leave memory even if the store fails: it commits in batches, so
-        // some may be gone from disk already, and what's left is still old enough for the next
-        // expiry (or the next start) to retry
-        if let Err(err) = store.delete(&old, true) {
-            warn!(
-                "Couldn't delete every expired page; the next expiry retries: {}",
-                err
-            );
+            match store.delete(&old, true) {
+                Ok(_) => expired += old.len(),
+                Err(err) => {
+                    // what's left is still old enough for the next expiry to retry
+                    warn!(
+                        "Couldn't delete every expired page; the next expiry retries: {}",
+                        err
+                    );
+                    break;
+                }
+            }
         }
         // old versions of re-crawled pages don't outlive the retention window either
-        let cutoff = now_secs() - max_age_secs;
         match store.dead_versions() {
             Ok(versions) => {
                 let old_versions: Vec<u64> = versions
@@ -538,12 +473,7 @@ impl IndexQueue {
             }
             Err(err) => warn!("Couldn't check old page versions: {}", err),
         }
-        for item in &old {
-            self.map.remove(item);
-        }
-        let old: HashSet<&String> = old.iter().collect();
-        self.mirrors.retain(|_, original| !old.contains(original));
-        old.len()
+        expired
     }
 
     /**
@@ -558,76 +488,92 @@ impl IndexQueue {
             return false;
         }
         match self.store().upsert(item, result, now_secs()) {
-            Ok(Upserted::Mirror(original)) => {
-                // it may have been indexed itself, before its text matched another page's
-                self.map.remove(item);
-                for mut mirror in self.mirrors.iter_mut() {
-                    if mirror.value() == item {
-                        *mirror.value_mut() = original.clone();
-                    }
-                }
-                self.mirrors.insert(item.to_string(), original);
-                return false;
+            Ok(Upserted::Mirror(_)) => false,
+            Ok(Upserted::Indexed) => true,
+            Err(err) => {
+                warn!("Couldn't persist {}: {}", item, err);
+                // its links are still followed
+                true
             }
-            Ok(Upserted::Indexed) => {
-                self.mirrors.remove(item);
-            }
-            Err(err) => warn!("Couldn't persist {}: {}", item, err),
         }
-        self.map.insert(item.to_string(), without_keywords(result));
-        true
     }
 
-    fn purge(&self, denylist: &Denylist) -> usize {
-        let mut removed = Vec::new();
-        self.map.retain(|item, result| {
-            let keep = !denylist.is_blocked(item) && !denylist.is_blocked(&result.cid);
-            if !keep {
-                removed.push(item.clone());
-            }
-            keep
-        });
-        // blocked mirrors, and mirrors of the pages purged (the store drops those with the page)
-        let purged: HashSet<String> = removed.iter().cloned().collect();
-        let mut mirrors = Vec::new();
-        self.mirrors.retain(|item, original| {
-            if denylist.is_blocked(item) {
-                mirrors.push(item.clone());
-                return false;
-            }
-            !purged.contains(original)
-        });
-        if let Some(store) = self.store.get() {
-            if let Err(err) = store.delete(&[removed.as_slice(), &mirrors].concat(), true) {
-                warn!(
-                    "Couldn't delete {} purged pages from the store: {}",
-                    removed.len(),
-                    err
-                );
-            }
-            // superseded versions whose own item or cid is now blocked, e.g. one that redirected
-            // to a cid since taken down (#249)
-            match store.dead_versions() {
-                Ok(versions) => {
-                    let blocked: Vec<u64> = versions
-                        .into_iter()
-                        .filter(|(_, item, cid, _)| {
-                            denylist.is_blocked(item) || denylist.is_blocked(cid)
-                        })
-                        .map(|(id, ..)| id)
-                        .collect();
-                    if let Err(err) = store.erase_ids(&blocked) {
-                        warn!(
-                            "Couldn't mark {} blocked versions to erase: {}",
-                            blocked.len(),
-                            err
-                        );
-                    }
+    /**
+     * Deletes and erases (#249) every stored page, mirror and superseded version a denylist
+     * blocks now, scanning `pages` in batches on the store's scan connection (#231). No lock is
+     * held across batches: pages written meanwhile were checked against the lists already.
+     * Returns how many pages went.
+     */
+    pub fn purge_blocked(&self) -> usize {
+        let Some(store) = self.store.get() else {
+            return 0;
+        };
+        let blocked = |item: &str| self.blocked_quietly(item);
+        let mut removed = 0;
+        let mut after = 0;
+        loop {
+            let batch = match store.items_after(after, 10_000) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    warn!("Couldn't scan pages for denylisted ones: {}", err);
+                    break;
                 }
-                Err(err) => warn!("Couldn't check old page versions: {}", err),
+            };
+            let Some(last) = batch.last() else { break };
+            after = last.0;
+            let hits: Vec<String> = batch
+                .into_iter()
+                .filter(|(_, item, cid)| blocked(item) || blocked(cid))
+                .map(|(_, item, _)| item)
+                .collect();
+            match store.delete(&hits, true) {
+                Ok(n) => removed += n,
+                Err(err) => warn!("Couldn't delete {} denylisted pages: {}", hits.len(), err),
             }
         }
-        removed.len()
+        let mut after = 0;
+        loop {
+            let batch = match store.mirror_items_after(after, 10_000) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    warn!("Couldn't scan mirrors for denylisted ones: {}", err);
+                    break;
+                }
+            };
+            let Some(last) = batch.last() else { break };
+            after = last.0;
+            let hits: Vec<String> = batch
+                .into_iter()
+                .map(|(_, item)| item)
+                .filter(|item| blocked(item))
+                .collect();
+            if let Err(err) = store.delete(&hits, true) {
+                warn!("Couldn't delete {} denylisted mirrors: {}", hits.len(), err);
+            }
+        }
+        // superseded versions whose own item or cid is now blocked, e.g. one that redirected
+        // to a cid since taken down (#249)
+        match store.dead_versions() {
+            Ok(versions) => {
+                let ids: Vec<u64> = versions
+                    .into_iter()
+                    .filter(|(_, item, cid, _)| blocked(item) || blocked(cid))
+                    .map(|(id, ..)| id)
+                    .collect();
+                if let Err(err) = store.erase_ids(&ids) {
+                    warn!(
+                        "Couldn't mark {} blocked versions to erase: {}",
+                        ids.len(),
+                        err
+                    );
+                }
+            }
+            Err(err) => warn!("Couldn't check old page versions: {}", err),
+        }
+        if removed > 0 {
+            info!("Purged {} denylisted pages", removed);
+        }
+        removed
     }
 
     // is_blocked without the per-item warn!, for bulk checks
@@ -695,9 +641,14 @@ impl IndexQueue {
         if self.is_blocked(&item) {
             return (Enqueued::Blocked, None);
         }
-        if self.map.contains_key(&item) || self.mirrors.contains_key(&item) {
-            trace!("Already indexed {}", item);
-            return (Enqueued::Queued, None);
+        match self.store().known(&item) {
+            Ok(true) => {
+                trace!("Already indexed {}", item);
+                return (Enqueued::Queued, None);
+            }
+            Ok(false) => {}
+            // admitted: a wasted fetch at worst, where dropping it would lose the link
+            Err(err) => warn!("Couldn't check whether {} is indexed: {}", item, err),
         }
         (Enqueued::Queued, Some(item))
     }
@@ -707,7 +658,7 @@ impl IndexQueue {
     }
 
     pub fn index_length(&self) -> usize {
-        self.map.len()
+        self.store().page_count()
     }
 
     /// Indexed and queued counts per root CID (the first segment of "cid/path"), with the root
@@ -721,7 +672,7 @@ impl IndexQueue {
 
     /// how many crawled items weren't indexed, being the same text as an indexed page (#253)
     pub fn mirror_length(&self) -> usize {
-        self.mirrors.len()
+        self.store().mirror_count()
     }
 
     pub fn keyword_length(&self) -> usize {
@@ -748,7 +699,7 @@ impl IndexQueue {
      */
     pub fn search(&self, query: &str, offset: usize, limit: usize) -> (usize, Vec<IndexResult>) {
         let groups = parse_query(query);
-        let pages = self.map.len() as f64;
+        let pages = self.store().page_count() as f64;
         let average = self.store().average_length().max(1.0);
         // each distinct term's postings, read once: page id -> (count, page length)
         let mut postings: HashMap<&str, HashMap<u64, (u32, u32)>> = HashMap::new();
@@ -820,18 +771,22 @@ impl IndexQueue {
             .take(limit)
             .map(|(_, page)| page)
             .collect();
-        let items = match self.store().pages_by_id(&shown) {
-            Ok(items) => items,
+        let found = match self.store().pages_by_id(&shown) {
+            Ok(found) => found,
             Err(err) => {
                 warn!("Couldn't look up search results: {}", err);
                 return (0, Vec::new());
             }
         };
-        // only what's in the map is served (a page deleted since its postings were read isn't)
+        // a page deleted since its postings were read isn't found; one a denylist blocks isn't
+        // served even before the purge erases it (#231)
         let results = shown
             .iter()
-            .filter_map(|page| items.get(page))
-            .filter_map(|(item, _)| self.map.get(item).map(|r| r.clone()));
+            .filter_map(|page| found.get(page))
+            .filter(|(item, result)| {
+                !self.blocked_quietly(item) && !self.blocked_quietly(&result.cid)
+            })
+            .map(|(_, result)| result.clone());
         (total, results.collect())
     }
 
@@ -1093,7 +1048,7 @@ mod tests {
         for cid in [bad, good] {
             let item = format!("{}/page", cid);
             let result = IndexResult::new(item.clone(), "".into(), "".into(), HashMap::new());
-            queue.map.insert(item, result);
+            queue.index_for_test(&item, &result);
         }
 
         let hash: String = sha2::Sha256::digest(format!("{}/", bad).as_bytes())
@@ -1103,7 +1058,7 @@ mod tests {
         queue.set_denylist(Denylist::parse(&format!("//{}\n", hash)));
 
         assert_eq!(queue.index_length(), 1);
-        assert!(queue.map.contains_key(&format!("{}/page", good)));
+        assert!(queue.store().known(&format!("{}/page", good)).unwrap());
         assert!(queue.is_blocked(bad));
         assert!(!queue.is_blocked(good));
     }
@@ -1116,7 +1071,7 @@ mod tests {
         for cid in [bad, good] {
             let item = format!("{}/page", cid);
             let result = IndexResult::new(item.clone(), "".into(), "".into(), HashMap::new());
-            queue.map.insert(item, result);
+            queue.index_for_test(&item, &result);
         }
 
         queue.set_denylist(Denylist::parse(&format!("{}/badbits-page\n", good)));
@@ -1355,6 +1310,80 @@ mod tests {
         }
     }
 
+    fn hashed_page(item: &str, hash: &[u8]) -> IndexResult {
+        let mut result = page(item, "t", &[("w", 1)]);
+        result.text_hash = Some(hash.to_vec());
+        result
+    }
+
+    #[test]
+    fn search_hides_a_blocked_page_before_any_purge() {
+        let queue = IndexQueue::new();
+        queue.index_for_test(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
+        // swapped in without purging: what a takedown looks like before the scan reaches it
+        *queue.local_denylist.write().unwrap() = Denylist::parse(&format!("{}\n", GOOD));
+        assert!(queue.search("alpha", 0, 10).1.is_empty());
+        assert_eq!(queue.index_length(), 1, "still on disk until the purge");
+    }
+
+    #[test]
+    fn admit_skips_indexed_pages_and_mirrors_from_the_store() {
+        let queue = IndexQueue::new();
+        queue.persist(GOOD, &hashed_page(GOOD, b"h"));
+        let mirror = format!("{}/copy", GOOD);
+        queue.persist(&mirror, &hashed_page(&mirror, b"h"));
+        assert_eq!(queue.mirror_length(), 1);
+        assert_eq!(queue.admit(GOOD.to_string()).1, None);
+        assert_eq!(queue.admit(mirror).1, None);
+        assert!(queue.admit(format!("{}/new", GOOD)).1.is_some());
+    }
+
+    #[test]
+    fn attach_store_doesnt_load_pages_and_keeps_the_queue() {
+        let dir = temp_dir("attach-lazy");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert(GOOD, &page(GOOD, "t", &[("alpha", 1)]), now_secs())
+            .unwrap();
+        store.queue_add(&[format!("{}/next", GOOD)]).unwrap();
+        drop(store);
+        let queue = IndexQueue::new();
+        assert_eq!(
+            queue
+                .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+                .unwrap(),
+            (1, 1)
+        );
+        assert_eq!(queue.search("alpha", 0, 10).1.len(), 1);
+    }
+
+    #[test]
+    fn expiry_keeps_a_page_recrawled_since_it_was_listed() {
+        let queue = IndexQueue::new();
+        queue
+            .store()
+            .upsert(GOOD, &page(GOOD, "old", &[("alpha", 1)]), 1)
+            .unwrap();
+        // re-crawled: a fresh date under the same item
+        queue
+            .store()
+            .upsert(GOOD, &page(GOOD, "new", &[("alpha", 1)]), now_secs())
+            .unwrap();
+        assert_eq!(queue.expire(DAY), 0);
+        assert_eq!(queue.search("alpha", 0, 10).1[0].title, "new");
+    }
+
+    #[test]
+    fn recrawl_streams_more_pages_than_a_batch() {
+        let queue = IndexQueue::new();
+        for i in 0..(crate::store::WRITE_BATCH + 5) {
+            let item = format!("{}/p{}", GOOD, i);
+            queue.index_for_test(&item, &page(&item, "t", &[]));
+        }
+        assert_eq!(queue.recrawl(), crate::store::WRITE_BATCH + 5);
+        assert_eq!(queue.queue_length(), crate::store::WRITE_BATCH + 5);
+    }
+
     // overwrites part of a file, the way an interrupted write leaves it
     fn damage(path: &std::path::Path, from: usize) {
         let mut bytes = std::fs::read(path).unwrap();
@@ -1385,7 +1414,7 @@ mod tests {
         )
         .unwrap();
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0, 0));
+        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "garbagetext");
     }
 
@@ -1416,7 +1445,7 @@ mod tests {
         assert!(store::is_corrupt(&*err), "{}", err);
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0, 0));
+        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "damagedtitle");
     }
 
@@ -1436,7 +1465,7 @@ mod tests {
         damage(&segment, 16);
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0, 0));
+        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "segmenttext77");
     }
 
@@ -1470,16 +1499,16 @@ mod tests {
         let dir = temp_dir("attach");
         seed(&dir, &[(GOOD, "goodtitle", now_secs())]);
         let queue = IndexQueue::new();
-        let (loaded, blocked, expired) = queue
+        let (pages, queued) = queue
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
-        assert_eq!((loaded, blocked, expired), (1, 0, 0));
+        assert_eq!((pages, queued), (1, 0));
         assert_eq!(queue.search("goodtitle", 0, usize::MAX).1.len(), 1);
         assert_eq!(queue.search("shared", 0, usize::MAX).1.len(), 1);
     }
 
     #[test]
-    fn attach_drops_denylisted_and_expired_rows_from_disk() {
+    fn the_purge_and_expiry_after_attach_drop_denylisted_and_expired_rows_from_disk() {
         let dir = temp_dir("recheck");
         seed(
             &dir,
@@ -1496,10 +1525,11 @@ mod tests {
         let queue = IndexQueue::new();
         // local takedown list loaded before attach, as main.rs does
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
-        let (loaded, blocked, expired) = queue
+        queue
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
-        assert_eq!((loaded, blocked, expired), (1, 1, 1));
+        queue.purge_blocked();
+        assert_eq!(queue.expire(30 * DAY), 1);
         assert_eq!(queue.index_length(), 1);
         assert!(!file_has(&dir, "blockedtitle"));
         assert!(!file_has(&dir, "expiredtitle"));
@@ -1529,7 +1559,7 @@ mod tests {
     }
 
     #[test]
-    fn expire_removes_old_pages_from_memory_and_disk() {
+    fn expire_removes_old_pages_from_disk() {
         let dir = temp_dir("expire");
         seed(&dir, &[(GOOD, "agingtitle", now_secs() - 10 * DAY)]);
         let queue = IndexQueue::new();
@@ -1637,54 +1667,6 @@ mod tests {
     }
 
     #[test]
-    fn attach_rekeys_non_canonical_rows_and_drops_duplicates() {
-        let dir = temp_dir("rekey");
-        let store = Store::open(&dir, 0).unwrap();
-        for (item, title) in [
-            (format!("{}/wiki//../Tech", GOOD), "techtitle"),
-            (format!("{}/wiki/Tech", GOOD), "techdup"),
-            (format!("{}/wiki//Llull", GOOD), "llulltitle"),
-            (format!("{}/..", GOOD), "escapetitle"),
-        ] {
-            store
-                .upsert(&item, &page(&item, title, &[(title, 1)]), now_secs())
-                .unwrap();
-        }
-        drop(store);
-
-        let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
-        let mut keys: Vec<String> = queue.map.iter().map(|e| e.key().clone()).collect();
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec![
-                format!("{}/wiki/Llull", GOOD),
-                format!("{}/wiki/Tech", GOOD)
-            ]
-        );
-        // the result's cid is re-keyed too, so search (which looks pages up by it) still finds them
-        assert_eq!(queue.search("llulltitle", 0, usize::MAX).1.len(), 1);
-        assert_eq!(
-            queue.search("techtitle", 0, usize::MAX).1.len()
-                + queue.search("techdup", 0, usize::MAX).1.len(),
-            1
-        );
-
-        let rows: Vec<String> = Store::open(&dir, 0)
-            .unwrap()
-            .load_all()
-            .unwrap()
-            .into_iter()
-            .map(|r| r.0)
-            .collect();
-        assert_eq!(rows.len(), 2, "disk matches memory: {:?}", rows);
-        assert!(!file_has(&dir, "escapetitle"));
-    }
-
-    #[test]
     fn keywords_rank_by_number_of_pages_and_search_finds_each_page() {
         let queue = IndexQueue::new();
         let pages = [
@@ -1693,11 +1675,12 @@ mod tests {
             ("bafyP3", &["common", "middle"][..]),
             ("bafyP4", &["middle"][..]),
         ];
-        for (item, words) in pages {
+        for (name, words) in pages {
             let counts: HashMap<String, u32> = words.iter().map(|w| (w.to_string(), 5)).collect();
+            let item = format!("{}/{}", GOOD, name);
             queue.index_for_test(
-                item,
-                &IndexResult::new(item.to_string(), "t".into(), "e".into(), counts),
+                &item,
+                &IndexResult::new(item.clone(), "t".into(), "e".into(), counts),
             );
         }
         assert_eq!(queue.keyword_length(), 3);
@@ -1705,16 +1688,11 @@ mod tests {
             queue.top_keywords(2),
             vec![("common".to_string(), 3), ("middle".to_string(), 2)]
         );
-        let mut found: Vec<String> = queue
-            .search("common", 0, usize::MAX)
-            .1
-            .into_iter()
-            .map(|r| r.cid)
-            .collect();
-        found.sort();
-        assert_eq!(found, vec!["bafyP1", "bafyP2", "bafyP3"]);
+        let mut common = found(&queue, "common");
+        common.sort();
+        assert_eq!(common, vec!["bafyP1", "bafyP2", "bafyP3"]);
         // re-indexing a page replaces its postings: no double count, and terms it lost go
-        queue.index_for_test("bafyP1", &page("bafyP1", "t", &[("common", 1)]));
+        index_text(&queue, "bafyP1", "common");
         assert_eq!(queue.top_keywords(1), vec![("common".to_string(), 3)]);
         assert!(queue.search("rare", 0, usize::MAX).1.is_empty());
         assert_eq!(queue.keyword_length(), 2);
@@ -1722,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn keyword_counts_live_on_disk_not_in_the_in_memory_records() {
+    fn keyword_counts_live_on_disk_not_in_search_results() {
         // #220: per-page counts duplicated the inverted index in RAM and bloated /search output
         let dir = temp_dir("counts");
         let queue = IndexQueue::new();
@@ -1730,15 +1708,9 @@ mod tests {
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
         queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 3)]));
-        assert!(
-            queue.map.get(GOOD).unwrap().keywords.is_empty(),
-            "in-memory record carries no counts"
-        );
-        assert_eq!(
-            queue.search("alpha", 0, usize::MAX).1.len(),
-            1,
-            "still searchable"
-        );
+        let (_, results) = queue.search("alpha", 0, usize::MAX);
+        assert_eq!(results.len(), 1, "still searchable");
+        assert!(results[0].keywords.is_empty(), "results carry no counts");
         queue.flush_for_test(); // a second Store would treat the buffered page as lost
         assert_eq!(
             crate::store::tests::postings_by_item(&Store::open(&dir, 0).unwrap(), "alpha"),
@@ -1746,13 +1718,12 @@ mod tests {
             "counts kept on disk"
         );
 
-        // and after a reload: searchable, counts dropped from memory again
+        // and after a reload: searchable
         let reloaded = IndexQueue::new();
         reloaded
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
         assert_eq!(reloaded.search("alpha", 0, usize::MAX).1.len(), 1);
-        assert!(reloaded.map.get(GOOD).unwrap().keywords.is_empty());
     }
 
     fn url(s: &str) -> reqwest::Url {
@@ -1908,15 +1879,21 @@ mod tests {
         second
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
-        assert_eq!(
-            second.queue_length(),
-            1,
-            "only the still-pending, allowed item resumes"
-        );
+        // all of it, in order (#231): an indexed item is fetched again, as a recrawl would
         assert_eq!(
             Store::open(&dir, 0).unwrap().queue_load().unwrap(),
-            vec![format!("{}/wiki/B", GOOD)]
+            vec![
+                format!("{}/wiki/A", GOOD),
+                format!("{}/wiki/B", GOOD),
+                format!("{}/x", BAD)
+            ]
         );
+        // a blocked one is skipped when popped, never fetched
+        second.store().queue_pop().unwrap();
+        second.store().queue_pop().unwrap();
+        assert!(second.process_next("127.0.0.1:1"));
+        assert_eq!(second.gateway_health(), "no fetches yet");
+        assert_eq!(second.queue_length(), 0);
     }
 
     #[test]
@@ -1978,7 +1955,7 @@ mod tests {
         );
         assert!(links.is_empty(), "the mirror's links aren't followed");
         assert_eq!((queue.index_length(), queue.mirror_length()), (1, 1));
-        assert_eq!(found(&queue, "words"), vec![original.clone()]);
+        assert_eq!(found(&queue, "words"), vec!["wiki/A"]);
         queue.enqueue(mirror.clone());
         assert_eq!(queue.queue_length(), 0, "nor is it queued again");
         // pages without text aren't mirrors of each other
@@ -2043,7 +2020,8 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        // and a blocked mirror is dropped on restart (blocked while the index was down)
+        // and a blocked mirror is dropped by the purge after a restart (blocked while the index
+        // was down)
         let dir = temp_dir("mirrorrestart");
         {
             let store = Store::open(&dir, 0).unwrap();
@@ -2055,6 +2033,7 @@ mod tests {
         queue
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
+        queue.purge_blocked();
         assert_eq!((queue.index_length(), queue.mirror_length()), (1, 0));
         assert!(!file_has(&dir, &bad_b));
     }
@@ -2067,15 +2046,15 @@ mod tests {
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
         queue.store.get().unwrap().break_for_test(); // e.g. disk full / read-only remount
-        queue.persist(GOOD, &page(GOOD, "t", &[])); // upsert fails: logs, doesn't panic
-        assert_eq!(queue.index_length(), 1, "still indexed in memory");
+                                                     // upsert fails: logs, doesn't panic, and its links are still followed
+        assert!(queue.persist(GOOD, &page(GOOD, "t", &[])));
         assert_eq!(queue.expire(0), 0, "expire tolerates the broken store too");
-        queue.set_denylist(Denylist::parse(&format!("{}\n", GOOD))); // purge's delete fails: logs only
-        assert_eq!(queue.index_length(), 0);
+        queue.set_denylist(Denylist::parse(&format!("{}\n", GOOD))); // purge's scan fails: logs only
+        assert!(queue.search("t", 0, 10).1.is_empty(), "search too");
     }
 
     #[test]
-    fn expiry_drops_pages_from_memory_even_if_the_store_fails_part_way() {
+    fn expiry_that_fails_leaves_pages_for_the_next_run() {
         let dir = temp_dir("expire-fails");
         seed(&dir, &[(GOOD, "agingtitle", now_secs() - 10 * DAY)]);
         let queue = IndexQueue::new();
@@ -2084,18 +2063,13 @@ mod tests {
             .unwrap();
         // finding the old pages works, deleting them doesn't
         queue.store.get().unwrap().drop_table_for_test("mirrors");
-        assert_eq!(queue.expire(5 * DAY), 1);
-        assert_eq!(
-            queue.index_length(),
-            0,
-            "memory doesn't keep what disk may have lost"
-        );
+        assert_eq!(queue.expire(5 * DAY), 0);
         assert_eq!(
             queue
                 .store
                 .get()
                 .unwrap()
-                .older_than(now_secs(), usize::MAX)
+                .older_than(now_secs(), 10)
                 .unwrap(),
             vec![GOOD.to_string()],
             "still on disk, for the next expiry"
@@ -2103,15 +2077,22 @@ mod tests {
     }
 
     // index a page's text the way process_content does
-    fn index_text(queue: &IndexQueue, item: &str, text: &str) {
+    // under GOOD, and found() by `name`: search serves only real CIDs (it can't check a list
+    // against anything else, so it counts as blocked)
+    fn index_text(queue: &IndexQueue, name: &str, text: &str) {
         let mut counts = HashMap::new();
         for word in normalize(text) {
             *counts.entry(word).or_insert(0) += 1;
         }
+        let item = format!("{}/{}", GOOD, name);
         queue.index_for_test(
-            item,
-            &IndexResult::new(item.into(), "t".into(), "e".into(), counts),
+            &item,
+            &IndexResult::new(item.clone(), "t".into(), "e".into(), counts),
         );
+    }
+
+    fn name_of(result: IndexResult) -> String {
+        result.cid[GOOD.len() + 1..].to_string()
     }
 
     fn found(queue: &IndexQueue, query: &str) -> Vec<String> {
@@ -2119,7 +2100,7 @@ mod tests {
             .search(query, 0, usize::MAX)
             .1
             .into_iter()
-            .map(|r| r.cid)
+            .map(name_of)
             .collect()
     }
 
@@ -2213,7 +2194,7 @@ mod tests {
         let (total, page) = queue.search("rust", 1, 1);
         assert_eq!(total, 3);
         assert_eq!(
-            page.into_iter().map(|r| r.cid).collect::<Vec<_>>(),
+            page.into_iter().map(name_of).collect::<Vec<_>>(),
             vec!["bafyOnce"]
         );
         let (total, page) = queue.search("rust", 5, 10);
