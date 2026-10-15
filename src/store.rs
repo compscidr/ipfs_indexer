@@ -32,6 +32,11 @@ pub struct Store {
     // search's own read-only connection, so it doesn't wait behind the crawl's writes for the
     // connection lock: it only waits out a commit. None in memory, where conn is used instead.
     reader: Option<Mutex<Connection>>,
+    // "already indexed?" checks for every link the crawl finds (#231), on their own connection so
+    // they don't wait behind a search on `reader`
+    lookup: Option<Mutex<Connection>>,
+    // long reads (the denylist purge's scan, /admin/recrawl), so they don't hold up either
+    scan: Option<Mutex<Connection>>,
     // None for an in-memory store (no DATA_DIR)
     path: Option<PathBuf>,
     // the inverted index (#247)
@@ -117,9 +122,14 @@ impl Store {
         let mut store = Store::init(conn, Some(path.clone()), cache_mb, segments)?;
         // default cache_size, not cache_mb: SQLite drops a connection's cache whenever another
         // one commits, which the crawl does constantly, so a big one here would rarely be warm
-        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        reader.busy_timeout(BUSY_TIMEOUT)?;
-        store.reader = Some(Mutex::new(reader));
+        let read_only = || -> rusqlite::Result<Mutex<Connection>> {
+            let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            conn.busy_timeout(BUSY_TIMEOUT)?;
+            Ok(Mutex::new(conn))
+        };
+        store.reader = Some(read_only()?);
+        store.lookup = Some(read_only()?);
+        store.scan = Some(read_only()?);
         // erasures a crash interrupted finish before anything is crawled or served (#249)
         store.maintain();
         Ok(store)
@@ -211,6 +221,8 @@ impl Store {
         Ok(Store {
             conn: Mutex::new(conn),
             reader: None,
+            lookup: None,
+            scan: None,
             path,
             segments,
             queued: AtomicUsize::new(queued as usize),
@@ -222,6 +234,14 @@ impl Store {
 
     fn read_conn(&self) -> MutexGuard<'_, Connection> {
         self.reader.as_ref().unwrap_or(&self.conn).lock().unwrap()
+    }
+
+    fn lookup_conn(&self) -> MutexGuard<'_, Connection> {
+        self.lookup.as_ref().unwrap_or(&self.conn).lock().unwrap()
+    }
+
+    fn scan_conn(&self) -> MutexGuard<'_, Connection> {
+        self.scan.as_ref().unwrap_or(&self.conn).lock().unwrap()
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -445,6 +465,7 @@ impl Store {
     }
 
     /// Every page, without keyword counts (those stay on disk)
+    // #231: removed with the maps (Task 3)
     pub fn load_all(&self) -> rusqlite::Result<Vec<(String, IndexResult, i64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT item, cid, title, excerpt, indexed_at FROM pages")?;
@@ -459,6 +480,7 @@ impl Store {
     }
 
     /// Every mirror, as (item, the item of the page it has the same text as)
+    // #231: removed with the maps (Task 3)
     pub fn mirrors_load(&self) -> rusqlite::Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -471,19 +493,6 @@ impl Store {
     /// The live pages a term is on, as (page id, how often it appears there, the page's length)
     pub fn postings(&self, term: &str) -> std::io::Result<Vec<(u64, u32, u32)>> {
         self.segments.postings(term)
-    }
-
-    /// The items of page ids; ids no longer in `pages` are left out
-    pub fn items(&self, ids: &[u64]) -> rusqlite::Result<HashMap<u64, String>> {
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached("SELECT item FROM pages WHERE id = ?1")?;
-        let mut items = HashMap::new();
-        for &id in ids {
-            if let Some(item) = stmt.query_row([id as i64], |r| r.get(0)).optional()? {
-                items.insert(id, item);
-            }
-        }
-        Ok(items)
     }
 
     /// The mean page length in terms, for BM25; 0 with no pages
@@ -677,6 +686,7 @@ impl Store {
     }
 
     /// The frontier in the order it was added
+    // #231: removed with the maps (Task 3)
     pub fn queue_load(&self) -> rusqlite::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT item FROM queue ORDER BY rowid")?;
@@ -684,10 +694,82 @@ impl Store {
         rows.collect()
     }
 
-    pub fn items_older_than(&self, cutoff: i64) -> rusqlite::Result<Vec<String>> {
+    /// Whether an item is indexed or recorded as a mirror (#231: replaces the in-memory maps)
+    pub fn known(&self, item: &str) -> rusqlite::Result<bool> {
+        let conn = self.lookup_conn();
+        let found = conn
+            .prepare_cached(
+                "SELECT 1 FROM pages WHERE item = ?1 UNION ALL SELECT 1 FROM mirrors WHERE item = ?1",
+            )?
+            .exists([item])?;
+        Ok(found)
+    }
+
+    /// The item and page (without keyword counts) of page ids; ids no longer in `pages` are
+    /// left out
+    pub fn pages_by_id(
+        &self,
+        ids: &[u64],
+    ) -> rusqlite::Result<HashMap<u64, (String, IndexResult)>> {
+        let conn = self.read_conn();
+        let mut stmt =
+            conn.prepare_cached("SELECT item, cid, title, excerpt FROM pages WHERE id = ?1")?;
+        let mut found = HashMap::new();
+        for &id in ids {
+            let row = stmt
+                .query_row([id as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        IndexResult::new(r.get(1)?, r.get(2)?, r.get(3)?, HashMap::new()),
+                    ))
+                })
+                .optional()?;
+            if let Some(row) = row {
+                found.insert(id, row);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Up to n pages after id `after`, as (id, item, cid), in id order: for walking every page
+    /// in batches without holding a connection for the whole walk
+    pub fn items_after(
+        &self,
+        after: u64,
+        n: usize,
+    ) -> rusqlite::Result<Vec<(u64, String, String)>> {
+        let conn = self.scan_conn();
+        let mut stmt = conn
+            .prepare_cached("SELECT id, item, cid FROM pages WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+        let rows = stmt.query_map(
+            params![after as i64, n.min(i64::MAX as usize) as i64],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?)),
+        )?;
+        rows.collect()
+    }
+
+    /// Up to n mirrors after rowid `after`, as (rowid, item), in rowid order
+    pub fn mirror_items_after(&self, after: i64, n: usize) -> rusqlite::Result<Vec<(i64, String)>> {
+        let conn = self.scan_conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT rowid, item FROM mirrors WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after, n.min(i64::MAX as usize) as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Up to n items indexed before `cutoff` (by the indexed_at index). On the write
+    /// connection: expiry lists and deletes a batch under the writes lock, so a page re-crawled
+    /// meanwhile isn't listed with its old date.
+    pub fn older_than(&self, cutoff: i64, n: usize) -> rusqlite::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT item FROM pages WHERE indexed_at < ?1")?;
-        let rows = stmt.query_map([cutoff], |r| r.get(0))?;
+        let mut stmt =
+            conn.prepare_cached("SELECT item FROM pages WHERE indexed_at < ?1 LIMIT ?2")?;
+        let rows = stmt.query_map(params![cutoff, n.min(i64::MAX as usize) as i64], |r| {
+            r.get(0)
+        })?;
         rows.collect()
     }
 }
@@ -968,7 +1050,12 @@ pub(crate) mod tests {
     pub(crate) fn postings_by_item(store: &Store, term: &str) -> Vec<(String, u32, u32)> {
         let found = store.postings(term).unwrap();
         let ids: Vec<u64> = found.iter().map(|p| p.0).collect();
-        let items = store.items(&ids).unwrap();
+        let items = store
+            .pages_by_id(&ids)
+            .unwrap()
+            .into_iter()
+            .map(|(id, (item, _))| (id, item))
+            .collect::<HashMap<_, _>>();
         let mut out: Vec<_> = found
             .into_iter()
             .map(|(id, count, length)| (items[&id].clone(), count, length))
@@ -1134,12 +1221,81 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn known_finds_pages_and_mirrors_only() {
+        let dir = temp_dir("known");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("a/1", &hashed("a/1", &[("x", 1)], b"h"), 1)
+            .unwrap();
+        store
+            .upsert("b/1", &hashed("b/1", &[("x", 1)], b"h"), 1)
+            .unwrap(); // mirror
+        store.queue_add(&["c/1".into()]).unwrap();
+        assert!(store.known("a/1").unwrap());
+        assert!(store.known("b/1").unwrap());
+        assert!(!store.known("c/1").unwrap(), "queued isn't known");
+        assert!(!store.known("zzz").unwrap());
+    }
+
+    #[test]
+    fn pages_by_id_returns_rows_still_there() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert("a/1", &page("a/1", "Title A", &[("x", 1)]), 1)
+            .unwrap();
+        store
+            .upsert("a/2", &page("a/2", "Title B", &[("x", 1)]), 1)
+            .unwrap();
+        let ids: Vec<u64> = store
+            .items_after(0, 10)
+            .unwrap()
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        store.delete(&["a/2".to_string()], false).unwrap();
+        let found = store.pages_by_id(&ids).unwrap();
+        assert_eq!(found.len(), 1);
+        let (item, result) = &found[&ids[0]];
+        assert_eq!((item.as_str(), result.title.as_str()), ("a/1", "Title A"));
+        assert!(result.keywords.is_empty());
+    }
+
+    #[test]
+    fn items_after_pages_through_in_id_order() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5 {
+            let item = format!("a/{}", i);
+            store
+                .upsert(&item, &page(&item, "t", &[("x", 1)]), 1)
+                .unwrap();
+        }
+        let first = store.items_after(0, 2).unwrap();
+        let rest = store.items_after(first[1].0, 10).unwrap();
+        let items: Vec<String> = first.iter().chain(&rest).map(|r| r.1.clone()).collect();
+        assert_eq!(items, vec!["a/0", "a/1", "a/2", "a/3", "a/4"]);
+    }
+
+    #[test]
+    fn older_than_lists_at_most_n() {
+        let store = Store::open_in_memory().unwrap();
+        for (item, at) in [("a/1", 1), ("a/2", 2), ("a/3", 9)] {
+            store
+                .upsert(item, &page(item, "t", &[("x", 1)]), at)
+                .unwrap();
+        }
+        assert_eq!(store.older_than(5, 1).unwrap().len(), 1);
+        let mut all = store.older_than(5, 10).unwrap();
+        all.sort();
+        assert_eq!(all, vec!["a/1", "a/2"]);
+    }
+
+    #[test]
     fn finds_items_older_than_a_cutoff() {
         let store = Store::open(&temp_dir("age"), 0).unwrap();
         store.upsert("old", &page("old", "o", &[]), 10).unwrap();
         store.upsert("new", &page("new", "n", &[]), 1000).unwrap();
         assert_eq!(
-            store.items_older_than(500).unwrap(),
+            store.older_than(500, usize::MAX).unwrap(),
             vec!["old".to_string()]
         );
     }
@@ -1570,7 +1726,7 @@ pub(crate) mod tests {
             vec![("new".into(), 1, 1)]
         );
         assert!(
-            store.items(&[old]).unwrap().is_empty(),
+            store.pages_by_id(&[old]).unwrap().is_empty(),
             "no item has the old id"
         );
     }

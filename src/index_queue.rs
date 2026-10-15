@@ -507,7 +507,7 @@ impl IndexQueue {
         let Some(store) = self.store.get() else {
             return 0;
         };
-        let old = match store.items_older_than(now_secs() - max_age_secs) {
+        let old = match store.older_than(now_secs() - max_age_secs, usize::MAX) {
             Ok(old) => old,
             Err(err) => {
                 warn!("Couldn't check for expired pages: {}", err);
@@ -820,7 +820,7 @@ impl IndexQueue {
             .take(limit)
             .map(|(_, page)| page)
             .collect();
-        let items = match self.store().items(&shown) {
+        let items = match self.store().pages_by_id(&shown) {
             Ok(items) => items,
             Err(err) => {
                 warn!("Couldn't look up search results: {}", err);
@@ -831,7 +831,7 @@ impl IndexQueue {
         let results = shown
             .iter()
             .filter_map(|page| items.get(page))
-            .filter_map(|item| self.map.get(item).map(|r| r.clone()));
+            .filter_map(|(item, _)| self.map.get(item).map(|r| r.clone()));
         (total, results.collect())
     }
 
@@ -2095,7 +2095,7 @@ mod tests {
                 .store
                 .get()
                 .unwrap()
-                .items_older_than(now_secs())
+                .older_than(now_secs(), usize::MAX)
                 .unwrap(),
             vec![GOOD.to_string()],
             "still on disk, for the next expiry"
