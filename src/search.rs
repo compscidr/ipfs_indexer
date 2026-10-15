@@ -46,7 +46,8 @@ impl std::fmt::Display for Total {
     }
 }
 
-/// A query's distinct terms, in order of first appearance, and its AND-ed groups of OR-ed terms
+/// A query's distinct terms, in order of first appearance, and its AND-ed groups of OR-ed terms;
+/// a term repeated within a group is kept once
 pub struct Query {
     pub terms: Vec<String>,
     pub groups: Vec<Vec<usize>>,
@@ -58,16 +59,20 @@ impl Query {
         let groups = groups
             .iter()
             .map(|group| {
-                group
-                    .iter()
-                    .map(|term| match terms.iter().position(|t| t == term) {
+                let mut indices: Vec<usize> = Vec::new();
+                for term in group {
+                    let i = match terms.iter().position(|t| t == term) {
                         Some(i) => i,
                         None => {
                             terms.push(term.clone());
                             terms.len() - 1
                         }
-                    })
-                    .collect()
+                    };
+                    if !indices.contains(&i) {
+                        indices.push(i);
+                    }
+                }
+                indices
             })
             .collect();
         Query { terms, groups }
@@ -266,6 +271,17 @@ impl Group<'_> {
         }
         Ok(first)
     }
+
+    // how many of the cursors sit on `id`: its postings in this group
+    fn on(&mut self, id: u64) -> io::Result<u64> {
+        let mut n = 0;
+        for c in self.cursors.iter_mut() {
+            if c.cursor.current()?.is_some_and(|(at, _)| at == id) {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
 }
 
 // the query's groups as cursors over one segment; none if a group has no term in it
@@ -430,7 +446,8 @@ fn buffered(view: &View, query: &Query, scorer: &Scorer) -> Vec<(u64, f64)> {
 }
 
 // walks a segment's smallest group from the start, checking the others, for at most `limit`
-// of its pages: (live matches, pages walked, the group's postings, whether it walked them all)
+// of its pages: (live matches, the group's postings those pages hold, all its postings, whether
+// it walked them all). An OR group's terms can share pages, so its postings outnumber its pages
 fn count(
     segment: &Segment,
     query: &Query,
@@ -442,12 +459,13 @@ fn count(
     };
     let lead = lead(&groups);
     let lead_df = groups[lead].df();
-    let (mut matches, mut walked, mut target) = (0, 0, 0u64);
+    let (mut matches, mut walked, mut consumed, mut target) = (0, 0, 0, 0u64);
     while walked < limit {
         let Some(candidate) = groups[lead].seek(target)? else {
-            return Ok((matches, walked, lead_df, true));
+            return Ok((matches, consumed, lead_df, true));
         };
         walked += 1;
+        consumed += groups[lead].on(candidate)?;
         let mut all = true;
         for (g, group) in groups.iter_mut().enumerate() {
             if g != lead && group.seek(candidate)? != Some(candidate) {
@@ -461,7 +479,7 @@ fn count(
         target = candidate + 1;
     }
     let complete = groups[lead].seek(target)?.is_none();
-    Ok((matches, walked, lead_df, complete))
+    Ok((matches, consumed, lead_df, complete))
 }
 
 // the smallest group's postings in one segment
@@ -511,11 +529,12 @@ fn total(view: &View, query: &Query) -> io::Result<Total> {
     };
     let (mut n, mut about) = (buffered, false);
     for segment in &view.segments {
-        let (matches, walked, lead_df, complete) = count(segment, query, view, limit)?;
+        let (matches, consumed, lead_df, complete) = count(segment, query, view, limit)?;
         if complete {
             n += matches as f64;
-        } else {
-            n += matches as f64 / walked as f64 * lead_df as f64;
+        } else if consumed > 0 {
+            // matches per posting sampled, times the postings
+            n += matches as f64 / consumed as f64 * lead_df as f64;
             about = true;
         }
     }
@@ -654,8 +673,13 @@ mod tests {
             let parsed = Query::new(&query);
             let view = segments.view(&terms(&parsed));
             let scorer = Scorer::new(pages, 120.0, &dfs(&view, &parsed).unwrap());
+            let every = exhaustive(&view, &parsed, &scorer, usize::MAX).len();
             for k in [1, 3, 10, 100, 1000] {
-                let (_, found) = search(&view, &parsed, &scorer, k).unwrap();
+                let (total, found) = search(&view, &parsed, &scorer, k).unwrap();
+                // one word's total is its df, which counts dead pages not yet merged out
+                if !total.about && parsed.terms.len() > 1 {
+                    assert_eq!(total, every, "total of {:?} k={}", query, k);
+                }
                 assert_eq!(
                     found,
                     exhaustive(&view, &parsed, &scorer, k),
@@ -757,6 +781,40 @@ mod tests {
         assert_eq!(Total { n: 8, about: false }.to_string(), "8");
         assert_eq!(round2(6_666.0), 6_700);
         assert_eq!(round2(40.4), 40);
+    }
+
+    #[test]
+    fn an_or_group_is_estimated_by_its_pages_not_its_postings() {
+        let segments = Segments::open(&temp_dir("search-total-or")).unwrap();
+        for id in 1..=40_000u64 {
+            let mut pairs = vec![("all", 1)];
+            for (word, every) in [("half", 2), ("third", 3)] {
+                if id % every == 0 {
+                    pairs.push((word, 1));
+                }
+            }
+            segments.add(id, 10, &words(&pairs));
+        }
+        segments.flush().unwrap();
+        let total = |query: &[&[&str]]| {
+            let parsed = Query::new(&groups(query));
+            let view = segments.view(&terms(&parsed));
+            let scorer = Scorer::new(40_000, 10.0, &dfs(&view, &parsed).unwrap());
+            search(&view, &parsed, &scorer, 10).unwrap().0
+        };
+        // the lead is "half OR third": 33,333 postings on 26,667 pages, every one a match; counted
+        // by postings it came out about 33,000
+        let estimate = total(&[&["half", "third"], &["all"]]);
+        assert!(estimate.about, "{:?}", estimate);
+        assert!((24_000..=29_333).contains(&estimate.n), "{:?}", estimate);
+        // "half OR half" is "half": it leads with 20,000 pages, not 40,000 postings
+        let estimate = total(&[&["half", "half"], &["all"]]);
+        assert!((18_000..=22_000).contains(&estimate.n), "{:?}", estimate);
+        assert_eq!(total(&[&["half", "half"]]), total(&[&["half"]]));
+        assert_eq!(
+            total(&[&["half", "half"], &["third"]]),
+            total(&[&["half"], &["third"]])
+        );
     }
 
     #[test]
