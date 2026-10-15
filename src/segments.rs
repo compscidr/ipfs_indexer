@@ -7,7 +7,7 @@
  * its output in the segment set as it is at that moment.
  *
  * Lock order: merging, writes, install, retiring, then dead, buffer, state, retired.
- * term_stats takes computing, then buffer and state (released), then stats. erase and
+ * term_stats and refresh_stats take computing, then buffer and state (released), then stats. erase and
  * upgrades_after are only taken on their own. The wake signals are leaves: install raises
  * merge_due holding the install lock. The Store's connection lock comes before buffer (add), and
  * is never held across a call that waits on merging, writes, install or retiring.
@@ -31,9 +31,9 @@ const TIER_FANOUT: usize = 10;
 const MAX_MERGE_TIER: u32 = 3;
 // rewrite a segment on its own once this share of its pages is dead
 const DEAD_PERCENT: u64 = 20;
-// /status and /keywords read a cached top STATS_TOP for up to STATS_TTL
+// /status and /keywords read a cached top STATS_TOP, recounted by the merge thread at most every STATS_TTL
 const STATS_TOP: usize = 100;
-const STATS_TTL: Duration = Duration::from_secs(60);
+pub const STATS_TTL: Duration = Duration::from_secs(60);
 // a retired file whose erase fails this often is given up on; its ids stay dead
 const ERASE_TRIES: u32 = 3;
 // a running rewrite checks this often (pages, terms) whether its inputs were replaced
@@ -207,7 +207,7 @@ pub struct Segments {
     stats_gen: AtomicU64,
     // a full dictionary merge is too slow for every /status; held only to read or swap the value
     stats: Mutex<Option<Arc<Stats>>>,
-    // one computation at a time, which nothing else waits on unless there's no value yet
+    // one count at a time; only the merge thread and a first call with no value yet take it
     computing: Mutex<()>,
     // upgrades of older format files are skipped until then, after one failed
     upgrades_after: Mutex<Option<Instant>>,
@@ -1241,34 +1241,47 @@ impl Segments {
     /**
      * Distinct terms, and the n on the most pages (df descending, then term), over the segments
      * and the buffer. Like Lucene's docFreq this counts dead pages not merged away yet, so it's
-     * for /status and /keywords, not ranking. On disk it's cached (see STATS_TTL).
+     * for /status and /keywords, not ranking. On disk it's the cached value, however stale:
+     * counting takes seconds on a big index, so the merge thread refreshes it (refresh_stats)
+     * and only the first call after startup waits for a count.
      */
     pub fn term_stats(&self, n: usize) -> io::Result<(usize, Vec<(String, u32)>)> {
         if self.dir.is_none() || n > STATS_TOP {
             return self.compute_term_stats(n);
         }
         let take = |stats: &Stats| (stats.count, stats.top.iter().take(n).cloned().collect());
-        let fresh = |stats: &Arc<Stats>| {
-            stats.generation == self.stats_gen.load(Ordering::SeqCst)
-                && stats.at.elapsed() < STATS_TTL
-        };
-        let cached = lock(&self.stats).clone();
-        if let Some(stats) = cached.as_ref().filter(|stats| fresh(stats)) {
-            return Ok(take(stats));
-        }
-        // one computation at a time: meanwhile others take the stale value, if there is one
-        let _computing = match self.computing.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => match &cached {
-                Some(stats) => return Ok(take(stats)),
-                None => lock(&self.computing),
-            },
-        };
-        // computed while this caller waited
-        if let Some(stats) = lock(&self.stats).clone().filter(fresh) {
+        if let Some(stats) = lock(&self.stats).clone() {
             return Ok(take(&stats));
         }
+        // no value yet: one caller counts, the others wait for it
+        let _computing = lock(&self.computing);
+        if let Some(stats) = lock(&self.stats).clone() {
+            return Ok(take(&stats));
+        }
+        let stats = self.compute_stats()?;
+        Ok(take(&stats))
+    }
+
+    /// Recounts the cached term stats if they're at least min_age old and the segment set has
+    /// changed since, or they're over STATS_TTL old (the buffer has changed). For the merge
+    /// thread, with min_age STATS_TTL, so a busy crawl costs one count a minute.
+    pub fn refresh_stats(&self, min_age: Duration) -> io::Result<()> {
+        if self.dir.is_none() {
+            return Ok(());
+        }
+        let _computing = lock(&self.computing);
+        if let Some(stats) = lock(&self.stats).clone() {
+            let age = stats.at.elapsed();
+            let changed = stats.generation != self.stats_gen.load(Ordering::SeqCst);
+            if age < min_age || !(changed || age >= STATS_TTL) {
+                return Ok(());
+            }
+        }
+        self.compute_stats().map(|_| ())
+    }
+
+    // counts and caches the stats; the caller holds computing
+    fn compute_stats(&self) -> io::Result<Arc<Stats>> {
         // read before the snapshot: an install after it leaves this value stale
         let generation = self.stats_gen.load(Ordering::SeqCst);
         let (count, top) = self.compute_term_stats(STATS_TOP)?;
@@ -1279,7 +1292,7 @@ impl Segments {
             top,
         });
         *lock(&self.stats) = Some(stats.clone());
-        Ok(take(&stats))
+        Ok(stats)
     }
 
     fn compute_term_stats(&self, n: usize) -> io::Result<(usize, Vec<(String, u32)>)> {
@@ -1795,7 +1808,12 @@ pub(crate) mod tests {
         // cached until the next manifest swap
         segments.add(4, 1, &words(&[("fresh", 1)]));
         assert_eq!(segments.term_stats(0).unwrap().0, 3);
+        // a manifest swap doesn't recount on the caller's time (/status), only a refresh does
         segments.flush().unwrap();
+        assert_eq!(segments.term_stats(0).unwrap().0, 3);
+        segments.refresh_stats(STATS_TTL).unwrap(); // too soon
+        assert_eq!(segments.term_stats(0).unwrap().0, 3);
+        segments.refresh_stats(Duration::ZERO).unwrap();
         assert_eq!(segments.term_stats(0).unwrap().0, 4);
     }
 
@@ -1845,7 +1863,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_install_never_waits_for_term_stats_and_callers_get_the_stale_value() {
+    fn an_install_never_waits_for_a_stats_refresh_and_callers_get_the_stale_value() {
         use std::sync::mpsc::channel;
         let wait = Duration::from_secs(2);
         let segments = Arc::new(Segments::open(&temp_dir("segments-stats-wait")).unwrap());
@@ -1866,7 +1884,7 @@ pub(crate) mod tests {
             }
         });
         let computing = segments.clone();
-        let first = std::thread::spawn(move || computing.term_stats(1).unwrap());
+        let first = std::thread::spawn(move || computing.refresh_stats(Duration::ZERO).unwrap());
         in_compute.recv_timeout(wait).unwrap();
 
         let (done, flushed_in_time) = channel();
@@ -1890,7 +1908,9 @@ pub(crate) mod tests {
         );
         release.send(()).unwrap();
         first.join().unwrap();
-        // invalidated during that computation: the next call computes again
+        // invalidated during that computation: the next refresh counts again
+        assert_eq!(segments.term_stats(0).unwrap().0, 2);
+        segments.refresh_stats(Duration::ZERO).unwrap();
         assert_eq!(segments.term_stats(0).unwrap().0, 3);
     }
 
