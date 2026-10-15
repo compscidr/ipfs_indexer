@@ -1,5 +1,6 @@
 use crate::denylist::{normalize_item, Denylist};
 use crate::index_result::IndexResult;
+use crate::rate::Rate;
 use crate::search::{self, Query, Scorer, Total, MAX_RANKED};
 use crate::store::{self, now_secs, OpenError, Store, Upserted};
 use actix_web::body::MessageBody;
@@ -256,6 +257,9 @@ pub struct IndexQueue {
 
     // spaces out gateway requests; unset means no limit
     throttle: OnceLock<Throttle>,
+
+    // pages written per minute, for /status (#264)
+    indexed: Rate,
 }
 
 impl IndexQueue {
@@ -269,6 +273,7 @@ impl IndexQueue {
             purge_due: Mutex::new(false),
             purge_wake: Condvar::new(),
             throttle: OnceLock::new(),
+            indexed: Rate::new(),
         }
     }
 
@@ -539,6 +544,11 @@ impl IndexQueue {
         expired
     }
 
+    /// Pages written per minute, averaged over the last ten full minutes (#264)
+    pub fn indexed_per_minute(&self) -> u64 {
+        self.indexed.per_minute()
+    }
+
     /**
      * Add a crawled page to the index and the store. Re-checks the denylists first: a takedown
      * that landed while this page was being fetched must not be written back to disk. A page with
@@ -552,7 +562,10 @@ impl IndexQueue {
         }
         match self.store().upsert(item, result, now_secs()) {
             Ok(Upserted::Mirror(_)) => false,
-            Ok(Upserted::Indexed) => true,
+            Ok(Upserted::Indexed) => {
+                self.indexed.add();
+                true
+            }
             Err(err) => {
                 warn!("Couldn't persist {}: {}", item, err);
                 // its links are still followed
@@ -2059,6 +2072,25 @@ mod tests {
         assert_eq!(queue.mirror_length(), 0);
         queue.enqueue(mirror);
         assert_eq!(queue.queue_length(), 1, "crawlable again");
+    }
+
+    #[test]
+    fn the_indexing_rate_counts_pages_written_not_mirrors_or_blocked_ones() {
+        let queue = IndexQueue::new();
+        let hashed = |item: &str| page(item, "t", &[]).with_text_hash(b"h".to_vec());
+        assert!(queue.persist(GOOD, &hashed(GOOD)));
+        let mirror = format!("{}/mirror", GOOD);
+        assert!(!queue.persist(&mirror, &hashed(&mirror)), "a mirror");
+        let blocked = format!("{}/page", BAD);
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        assert!(
+            !queue.persist(&blocked, &page(&blocked, "t", &[])),
+            "blocked"
+        );
+        let other = format!("{}/other", GOOD);
+        assert!(queue.persist(&other, &page(&other, "t", &[("alpha", 1)])));
+        assert_eq!(queue.indexed.counted(), 2);
+        assert_eq!(queue.indexed_per_minute(), 0, "no full minute yet");
     }
 
     #[test]
