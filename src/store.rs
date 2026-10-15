@@ -508,6 +508,10 @@ impl Store {
         if let Err(err) = self.segments.merge() {
             log::warn!("Segment merge failed: {}", err);
         }
+        // here rather than on /status, which a count of a big index would hold up for seconds
+        if let Err(err) = self.segments.refresh_stats(crate::segments::STATS_TTL) {
+            log::warn!("Couldn't count terms: {}", err);
+        }
     }
 
     // the dead ids pruned go from dead_pages even if a step failed
@@ -795,6 +799,11 @@ impl Store {
 
     pub(crate) fn segment_count(&self) -> usize {
         self.segments.segment_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_stats_for_test(&self) {
+        self.segments.refresh_stats(Duration::ZERO).unwrap();
     }
 
     // makes every following read/write fail, to exercise callers' error handling

@@ -2326,12 +2326,14 @@ mod tests {
             crate::store::tests::postings_by_item(&store, "shared"),
             vec![(BAD.to_string(), 1, 1)]
         );
+        store.refresh_stats_for_test();
         assert_eq!(queue.keyword_length(), 1);
         assert!(
             !file_has(&dir, "takedownword"),
             "secure_delete covers postings too"
         );
         assert_eq!(queue.expire(-DAY), 1);
+        store.refresh_stats_for_test();
         assert_eq!(queue.keyword_length(), 0);
     }
 
