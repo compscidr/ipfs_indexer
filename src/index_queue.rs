@@ -113,6 +113,31 @@ fn parse_query(query: &str) -> Vec<Vec<String>> {
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
 
+// a purge scan batch that fails to read is tried this many times, this far apart (#231)
+const PURGE_READ_TRIES: u32 = 3;
+const PURGE_READ_PAUSE: Duration = Duration::from_millis(100);
+// and a purge round that didn't finish runs again after this
+const PURGE_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+// a purge scan's read, tried PURGE_READ_TRIES times; None if every try failed
+fn read_retrying<T>(what: &str, read: impl Fn() -> rusqlite::Result<T>) -> Option<T> {
+    for attempt in 1..=PURGE_READ_TRIES {
+        match read() {
+            Ok(rows) => return Some(rows),
+            Err(err) => {
+                warn!(
+                    "Couldn't scan {} for denylisted ones (try {} of {}): {}",
+                    what, attempt, PURGE_READ_TRIES, err
+                );
+                if attempt < PURGE_READ_TRIES {
+                    std::thread::sleep(PURGE_READ_PAUSE);
+                }
+            }
+        }
+    }
+    None
+}
+
 // skip anything bigger than this rather than pulling it all into memory
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -406,20 +431,23 @@ impl IndexQueue {
         std::mem::replace(&mut *self.purge_due.lock().unwrap(), false)
     }
 
-    /// Waits until a purge is due, then runs one (#231). For a thread of its own.
+    /// Waits until a purge is due, then runs one (#231). For a thread of its own. A round the
+    /// store failed part-way is run again after PURGE_RETRY_AFTER.
     pub fn run_purges(&self) {
         let due = self.purge_due.lock().unwrap();
         drop(self.purge_wake.wait_while(due, |due| !*due).unwrap());
         // only this thread clears the flag, so it's still set
-        if self.take_purge_due() {
-            self.purge_blocked();
+        if self.take_purge_due() && !self.purge_blocked() {
+            // not at once: a store that keeps failing would have this spin
+            std::thread::sleep(PURGE_RETRY_AFTER);
+            self.request_purge();
         }
     }
 
     #[cfg(test)]
     pub(crate) fn purge_for_test(&self) {
-        if self.take_purge_due() {
-            self.purge_blocked();
+        if self.take_purge_due() && !self.purge_blocked() {
+            self.request_purge();
         }
     }
 
@@ -539,23 +567,21 @@ impl IndexQueue {
     /**
      * Deletes and erases (#249) every stored page, mirror and superseded version a denylist
      * blocks now, scanning `pages` in batches on the store's scan connection (#231). No lock is
-     * held across batches: pages written meanwhile were checked against the lists already.
-     * Returns how many pages went.
+     * held across batches: pages written meanwhile were checked against the lists already. A
+     * batch that fails to read is tried again a few times; if it still fails, or a delete
+     * fails, the rest of the round goes on and false is returned, for another round later.
      */
-    pub fn purge_blocked(&self) -> usize {
+    pub fn purge_blocked(&self) -> bool {
         let Some(store) = self.store.get() else {
-            return 0;
+            return true;
         };
         let blocked = |item: &str| self.blocked_quietly(item);
-        let mut removed = 0;
+        let (mut removed, mut complete) = (0, true);
         let mut after = 0;
         loop {
-            let batch = match store.items_after(after, 10_000) {
-                Ok(batch) => batch,
-                Err(err) => {
-                    warn!("Couldn't scan pages for denylisted ones: {}", err);
-                    break;
-                }
+            let Some(batch) = read_retrying("pages", || store.items_after(after, 10_000)) else {
+                complete = false;
+                break;
             };
             let Some(last) = batch.last() else { break };
             after = last.0;
@@ -566,17 +592,18 @@ impl IndexQueue {
                 .collect();
             match store.delete(&hits, true) {
                 Ok(n) => removed += n,
-                Err(err) => warn!("Couldn't delete {} denylisted pages: {}", hits.len(), err),
+                Err(err) => {
+                    warn!("Couldn't delete {} denylisted pages: {}", hits.len(), err);
+                    complete = false;
+                }
             }
         }
         let mut after = 0;
         loop {
-            let batch = match store.mirror_items_after(after, 10_000) {
-                Ok(batch) => batch,
-                Err(err) => {
-                    warn!("Couldn't scan mirrors for denylisted ones: {}", err);
-                    break;
-                }
+            let Some(batch) = read_retrying("mirrors", || store.mirror_items_after(after, 10_000))
+            else {
+                complete = false;
+                break;
             };
             let Some(last) = batch.last() else { break };
             after = last.0;
@@ -587,6 +614,7 @@ impl IndexQueue {
                 .collect();
             if let Err(err) = store.delete(&hits, true) {
                 warn!("Couldn't delete {} denylisted mirrors: {}", hits.len(), err);
+                complete = false;
             }
         }
         // superseded versions whose own item or cid is now blocked, e.g. one that redirected
@@ -611,7 +639,10 @@ impl IndexQueue {
         if removed > 0 {
             info!("Purged {} denylisted pages", removed);
         }
-        removed
+        if !complete {
+            warn!("The denylist purge didn't finish; another round runs later");
+        }
+        complete
     }
 
     // is_blocked without the per-item warn!, for bulk checks
@@ -2475,6 +2506,44 @@ mod tests {
             *queue.purge_due.lock().unwrap(),
             "the next round scans again"
         );
+    }
+
+    #[test]
+    fn a_purge_the_store_fails_queues_another_round() {
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .unwrap();
+        queue.purge_for_test(); // the one attach_store queued
+        queue.persist(BAD, &page(BAD, "t", &[("alpha", 1)]));
+        queue.store.get().unwrap().drop_table_for_test("mirrors");
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue.purge_for_test(); // the mirrors scan fails every try
+        assert!(
+            *queue.purge_due.lock().unwrap(),
+            "another round is due rather than the takedown being dropped"
+        );
+    }
+
+    #[test]
+    fn read_retrying_tries_again_then_gives_up() {
+        let tries = std::cell::Cell::new(0);
+        let flaky = || {
+            tries.set(tries.get() + 1);
+            if tries.get() < 2 {
+                Err(rusqlite::Error::InvalidQuery)
+            } else {
+                Ok(tries.get())
+            }
+        };
+        assert_eq!(read_retrying("pages", flaky), Some(2), "a second try reads");
+        tries.set(0);
+        let broken = || -> rusqlite::Result<()> {
+            tries.set(tries.get() + 1);
+            Err(rusqlite::Error::InvalidQuery)
+        };
+        assert_eq!(read_retrying("pages", broken), None);
+        assert_eq!(tries.get(), PURGE_READ_TRIES);
     }
 
     #[test]
