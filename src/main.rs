@@ -246,7 +246,7 @@ async fn main() -> std::io::Result<()> {
     // optional hand-maintained takedown list (plain CIDs / cid/path lines). Loaded once now, so
     // the store's startup check below sees it, then re-read every 5 min.
     let local_denylist = std::env::var("LOCAL_DENYLIST").ok();
-    // fail closed like badbits: starting without the takedown list would load and serve
+    // fail closed like badbits: starting without the takedown list would serve
     // stored pages that are on it
     if let Some(path) = &local_denylist {
         match Denylist::load_file(path) {
@@ -279,8 +279,8 @@ async fn main() -> std::io::Result<()> {
         }
     );
 
-    // the persisted index (#106): only pages that aren't denylisted or expired are loaded, and
-    // nothing is crawled or served until that's done. A configured but unusable DATA_DIR is fatal.
+    // the persisted index (#106): nothing is loaded from it (#231); blocked and expired pages
+    // are erased by the purge and expiry threads below. A configured but unusable DATA_DIR is fatal.
     let max_age_secs = std::env::var("INDEX_MAX_AGE_DAYS")
         .ok()
         .and_then(|d| d.parse::<i64>().ok())
@@ -331,6 +331,23 @@ async fn main() -> std::io::Result<()> {
             error!("Index merge panicked; carrying on");
         }
     });
+    // erases pages a denylist change blocks (#231): search hides them at once, this takes them
+    // off disk; started after attach_store, which queues one full purge
+    let purge_queue = Arc::clone(&index_queue);
+    std::thread::spawn(move || loop {
+        let round = std::panic::catch_unwind(AssertUnwindSafe(|| purge_queue.run_purges()));
+        if round.is_err() {
+            error!("Denylist purge panicked; carrying on");
+        }
+    });
+    // pages that expired while the indexer was down; the refresh thread does it daily after
+    let expire_queue = Arc::clone(&index_queue);
+    std::thread::spawn(move || {
+        let expired = expire_queue.expire(max_age_secs);
+        if expired > 0 {
+            info!("Expired {} pages older than the max age", expired);
+        }
+    });
 
     let refresh_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
@@ -346,7 +363,7 @@ async fn main() -> std::io::Result<()> {
         if expired > 0 {
             info!("Expired {} pages older than the max age", expired);
         }
-        // expired pages aren't in the map any more, so the crawl from the seed reaches them again
+        // expired pages aren't known any more, so the crawl from the seed reaches them again
         refresh_queue.reseed();
     });
 

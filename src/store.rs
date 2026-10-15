@@ -376,7 +376,8 @@ impl Store {
      * returns how many pages went. They leave search at once. With `erase` (takedowns, expiry),
      * the segment files holding them or any earlier version of them are rewritten without them
      * promptly (#249). Commits every WRITE_BATCH items, so an error part-way leaves the earlier
-     * batches deleted: callers retry the whole list (expiry and startup pick up what's left).
+     * batches deleted: callers retry the whole list (the next expiry or purge, daily, on a
+     * list change or at startup, picks up what's left).
      */
     pub fn delete(&self, items: &[String], erase: bool) -> rusqlite::Result<usize> {
         let mut deleted = 0;

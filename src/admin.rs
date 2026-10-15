@@ -25,15 +25,16 @@ fn file_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Re-read the local denylist and purge what it blocks; returns how many pages were removed
-pub fn reload_local(queue: &IndexQueue, path: &Path) -> std::io::Result<usize> {
+/// Re-read the local denylist; the purge thread erases what it newly blocks
+pub fn reload_local(queue: &IndexQueue, path: &Path) -> std::io::Result<()> {
     let _file = file_lock();
     apply(queue, path)
 }
 
-fn apply(queue: &IndexQueue, path: &Path) -> std::io::Result<usize> {
+fn apply(queue: &IndexQueue, path: &Path) -> std::io::Result<()> {
     let text = std::fs::read_to_string(path)?;
-    Ok(queue.set_local_denylist(Denylist::parse(&text)))
+    queue.set_local_denylist(Denylist::parse(&text));
+    Ok(())
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig, admin: Option<web::Data<Admin>>) {
@@ -75,7 +76,7 @@ fn edit_local(
     queue: &IndexQueue,
     admin: &Admin,
     edit: impl FnOnce(&str, &str) -> String,
-    describe: impl FnOnce(&str, &str, usize) -> String,
+    describe: impl FnOnce(&str, &str) -> String,
 ) -> HttpResponse {
     if !authorized(req, admin) {
         return HttpResponse::Unauthorized().body("Unauthorized");
@@ -86,12 +87,13 @@ fn edit_local(
     let Some(path) = &admin.local_denylist else {
         return HttpResponse::BadRequest().body("LOCAL_DENYLIST is not set");
     };
-    // ponytail: file IO and the purge run on the actix worker; fine for occasional admin calls
+    // ponytail: file IO runs on the actix worker; fine for occasional admin calls
     let _file = file_lock();
     let result = std::fs::read_to_string(path).and_then(|old| {
         let new = edit(&old, &item);
         write_replacing(path, &new)?;
-        Ok(describe(&old, &new, apply(queue, path)?))
+        apply(queue, path)?;
+        Ok(describe(&old, &new))
     });
     match result {
         Ok(message) => HttpResponse::Ok().body(message),
@@ -145,12 +147,7 @@ async fn deny(
             };
             format!("{}{}{}\n", text, sep, item)
         },
-        |_, _, pages| {
-            format!(
-                "Blocked; {}",
-                plural(pages, "page removed", "pages removed")
-            )
-        },
+        |_, _| "Blocked; removal from disk queued".to_string(),
     )
 }
 
@@ -172,7 +169,7 @@ async fn undeny(
                 .map(|line| format!("{}\n", line))
                 .collect()
         },
-        |old, new, _| {
+        |old, new| {
             // shrinking the list never purges pages, so report the lines that were taken out
             let lines = old.lines().count() - new.lines().count();
             format!(
@@ -302,11 +299,15 @@ mod tests {
             &format!("/ipfs/{}/x\n", BAD),
         )
         .await;
-        assert_eq!((status, body.as_str()), (200, "Blocked; 1 page removed"));
+        assert_eq!(
+            (status, body.as_str()),
+            (200, "Blocked; removal from disk queued")
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             format!("# takedowns\n{}\n", item)
         );
+        queue.purge_for_test();
         assert_eq!(queue.index_length(), 0);
 
         // the 5-minute re-read takes the same lock and keeps it blocked

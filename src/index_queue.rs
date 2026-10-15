@@ -10,7 +10,7 @@ use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::ops::Not;
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -227,6 +227,11 @@ pub struct IndexQueue {
     // the swap (the purge that follows could miss it)
     writes: RwLock<()>,
 
+    // set when a list gains entries (or a store is attached); the purge thread waits on the
+    // condvar, takes the flag and scans (#231)
+    purge_due: Mutex<bool>,
+    purge_wake: Condvar,
+
     // spaces out gateway requests; unset means no limit
     throttle: OnceLock<Throttle>,
 }
@@ -239,6 +244,8 @@ impl IndexQueue {
             last_fetch: Mutex::new(None),
             store: OnceLock::new(),
             writes: RwLock::new(()),
+            purge_due: Mutex::new(false),
+            purge_wake: Condvar::new(),
             throttle: OnceLock::new(),
         }
     }
@@ -310,25 +317,33 @@ impl IndexQueue {
         }
     }
 
-    /**
-     * Replace the denylist, then erase anything stored that is now on it. Search checks each
-     * result against the lists, so blocked pages disappear from results at the swap (#231).
-     */
+    /// Swaps in a new badbits list. Pages it blocks are hidden from search at once and erased
+    /// by the purge thread, which only runs if the list gained entries (#231).
     pub fn set_denylist(&self, denylist: Denylist) {
-        {
+        let added = {
             let _writes = self.writes.write().unwrap();
-            *self.denylist.write().unwrap() = denylist;
+            let mut current = self.denylist.write().unwrap();
+            let added = denylist.adds_to(&current);
+            *current = denylist;
+            added
+        };
+        if added && self.store.get().is_some() {
+            self.request_purge();
         }
-        self.purge_blocked();
     }
 
-    /// Same as set_denylist, for the local takedown list; returns how many pages it purged
-    pub fn set_local_denylist(&self, denylist: Denylist) -> usize {
-        {
+    /// Same as set_denylist, for the local takedown list
+    pub fn set_local_denylist(&self, denylist: Denylist) {
+        let added = {
             let _writes = self.writes.write().unwrap();
-            *self.local_denylist.write().unwrap() = denylist;
+            let mut current = self.local_denylist.write().unwrap();
+            let added = denylist.adds_to(&current);
+            *current = denylist;
+            added
+        };
+        if added && self.store.get().is_some() {
+            self.request_purge();
         }
-        self.purge_blocked()
     }
 
     /**
@@ -380,9 +395,32 @@ impl IndexQueue {
         Ok(counts)
     }
 
-    // Task 4 runs this on the purge thread; until then the purge is synchronous
+    // marks a purge as due and wakes the purge thread; one round covers every change before it
     fn request_purge(&self) {
-        self.purge_blocked();
+        *self.purge_due.lock().unwrap() = true;
+        self.purge_wake.notify_one();
+    }
+
+    // takes the due flag: a change after this sets it again, so it gets a round of its own
+    fn take_purge_due(&self) -> bool {
+        std::mem::replace(&mut *self.purge_due.lock().unwrap(), false)
+    }
+
+    /// Waits until a purge is due, then runs one (#231). For a thread of its own.
+    pub fn run_purges(&self) {
+        let due = self.purge_due.lock().unwrap();
+        drop(self.purge_wake.wait_while(due, |due| !*due).unwrap());
+        // only this thread clears the flag, so it's still set
+        if self.take_purge_due() {
+            self.purge_blocked();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn purge_for_test(&self) {
+        if self.take_purge_due() {
+            self.purge_blocked();
+        }
     }
 
     /// the index file, if a store is attached
@@ -1056,6 +1094,7 @@ mod tests {
             .map(|b| format!("{:02x}", b))
             .collect();
         queue.set_denylist(Denylist::parse(&format!("//{}\n", hash)));
+        queue.purge_for_test();
 
         assert_eq!(queue.index_length(), 1);
         assert!(queue.store().known(&format!("{}/page", good)).unwrap());
@@ -1076,6 +1115,7 @@ mod tests {
 
         queue.set_denylist(Denylist::parse(&format!("{}/badbits-page\n", good)));
         queue.set_local_denylist(Denylist::parse(&format!("{}/page\n", bad)));
+        queue.purge_for_test();
 
         assert_eq!(queue.index_length(), 1);
         assert_eq!(queue.enqueue(format!("{}/page", bad)), Enqueued::Blocked);
@@ -1226,6 +1266,7 @@ mod tests {
             queue.search("zzqxsegmentterm91", 0, 10).1.is_empty(),
             "gone at once"
         );
+        queue.purge_for_test(); // what the purge thread does
         queue.maintain_for_test(); // what the upkeep thread does next
         assert!(!dir_has(&dir, "zzqxsegmentterm91"));
         assert_eq!(queue.search("alpha", 0, 10).1.len(), 1);
@@ -1252,6 +1293,7 @@ mod tests {
         assert!(dir_has(&dir, "zzqxredirectterm"), "only in the old version");
 
         queue.set_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue.purge_for_test();
         queue.maintain_for_test();
         assert!(!dir_has(&dir, "zzqxredirectterm"));
         assert_eq!(
@@ -1528,7 +1570,7 @@ mod tests {
         queue
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
-        queue.purge_blocked();
+        queue.purge_for_test(); // the one attach_store queued
         assert_eq!(queue.expire(30 * DAY), 1);
         assert_eq!(queue.index_length(), 1);
         assert!(!file_has(&dir, "blockedtitle"));
@@ -1553,6 +1595,7 @@ mod tests {
         assert!(file_has(&dir, "purgetitle"));
 
         queue.set_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue.purge_for_test();
         assert_eq!(queue.index_length(), 1);
         assert!(!file_has(&dir, "purgetitle"), "takedown reaches the disk");
         assert!(file_has(&dir, "stays"));
@@ -2009,10 +2052,12 @@ mod tests {
 
         // a blocked mirror goes, from disk too
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue.purge_for_test();
         assert_eq!(queue.mirror_length(), 1);
         assert!(!file_has(&dir, &bad_b));
         // so do the mirrors of a blocked original, which can then be crawled themselves
         queue.set_denylist(Denylist::parse(&format!("{}\n", GOOD)));
+        queue.purge_for_test();
         assert_eq!((queue.index_length(), queue.mirror_length()), (0, 0));
         assert!(Store::open(&dir, 0)
             .unwrap()
@@ -2033,7 +2078,7 @@ mod tests {
         queue
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
-        queue.purge_blocked();
+        queue.purge_for_test(); // the one attach_store queued
         assert_eq!((queue.index_length(), queue.mirror_length()), (1, 0));
         assert!(!file_has(&dir, &bad_b));
     }
@@ -2045,11 +2090,13 @@ mod tests {
         queue
             .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
             .unwrap();
-        queue.store.get().unwrap().break_for_test(); // e.g. disk full / read-only remount
-                                                     // upsert fails: logs, doesn't panic, and its links are still followed
+        // e.g. disk full / read-only remount
+        queue.store.get().unwrap().break_for_test();
+        // upsert fails: logs, doesn't panic, and its links are still followed
         assert!(queue.persist(GOOD, &page(GOOD, "t", &[])));
         assert_eq!(queue.expire(0), 0, "expire tolerates the broken store too");
-        queue.set_denylist(Denylist::parse(&format!("{}\n", GOOD))); // purge's scan fails: logs only
+        queue.set_denylist(Denylist::parse(&format!("{}\n", GOOD)));
+        queue.purge_for_test(); // its scan fails: logs only
         assert!(queue.search("t", 0, 10).1.is_empty(), "search too");
     }
 
@@ -2229,6 +2276,7 @@ mod tests {
         );
         queue.persist(BAD, &page(BAD, "t", &[("shared", 1)]));
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", GOOD)));
+        queue.purge_for_test();
         let store = queue.store.get().unwrap();
         assert!(store.postings("takedownword").unwrap().is_empty());
         assert_eq!(
@@ -2313,5 +2361,88 @@ mod tests {
         assert_eq!(flushed, buffered, "after a flush");
         assert_eq!(merged, buffered, "after a merge");
         assert_eq!(reopened, buffered, "after a reopen");
+    }
+
+    #[test]
+    fn an_unchanged_local_list_queues_no_purge() {
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .unwrap();
+        queue.purge_for_test(); // the one attach_store queued
+        let list = format!("{}\n", BAD);
+        queue.set_local_denylist(Denylist::parse(&list));
+        assert!(*queue.purge_due.lock().unwrap());
+        queue.purge_for_test();
+        queue.set_local_denylist(Denylist::parse(&list));
+        assert!(
+            !*queue.purge_due.lock().unwrap(),
+            "same list: nothing to scan"
+        );
+    }
+
+    #[test]
+    fn a_takedown_is_hidden_at_once_and_erased_by_the_purge() {
+        let dir = temp_dir("purge-erases");
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        queue.purge_for_test();
+        queue.persist(BAD, &page(BAD, "t", &[("zzqxpurgeterm", 1)]));
+        queue.flush_for_test();
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        assert!(
+            queue.search("zzqxpurgeterm", 0, 10).1.is_empty(),
+            "hidden at once"
+        );
+        assert!(
+            dir_has(&dir, "zzqxpurgeterm"),
+            "not erased until the purge runs"
+        );
+        queue.purge_for_test();
+        queue.maintain_for_test();
+        assert!(!dir_has(&dir, "zzqxpurgeterm"));
+        assert_eq!(queue.index_length(), 0);
+    }
+
+    #[test]
+    fn undeny_before_the_purge_keeps_the_page() {
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .unwrap();
+        queue.purge_for_test();
+        queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", GOOD)));
+        queue.set_local_denylist(Denylist::empty()); // undone before the scan
+        queue.purge_for_test();
+        assert_eq!(queue.index_length(), 1);
+        assert_eq!(queue.search("alpha", 0, 10).1.len(), 1);
+    }
+
+    #[test]
+    fn a_denylist_change_during_a_purge_runs_another() {
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .unwrap();
+        // the purge thread has taken the due flag and is scanning...
+        assert!(queue.take_purge_due());
+        // ...when a takedown lands
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        assert!(
+            *queue.purge_due.lock().unwrap(),
+            "the next round scans again"
+        );
+    }
+
+    #[test]
+    fn purge_works_without_a_data_dir() {
+        let queue = IndexQueue::new(); // in-memory store on first use
+        queue.persist(BAD, &page(BAD, "t", &[("alpha", 1)]));
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue.purge_for_test();
+        assert_eq!(queue.index_length(), 0);
     }
 }
