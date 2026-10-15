@@ -411,7 +411,7 @@ impl IndexQueue {
         store: Store,
         _max_age_secs: i64,
     ) -> rusqlite::Result<(usize, usize)> {
-        store.maintain();
+        // the startup upkeep (erasures a crash cut short, #249) ran in Store::open
         let counts = (store.page_count(), store.queue_len());
         if self.store.set(store).is_err() {
             panic!("attach_store must run before the store is first used");
