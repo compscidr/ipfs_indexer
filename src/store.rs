@@ -457,7 +457,13 @@ impl Store {
         Ok(())
     }
 
+    /// What a search reads (#248); see Segments::view
+    pub fn view(&self, terms: &[&str]) -> crate::segments::View<'_> {
+        self.segments.view(terms)
+    }
+
     /// The live pages a term is on, as (page id, how often it appears there, the page's length)
+    #[cfg(test)]
     pub fn postings(&self, term: &str) -> std::io::Result<Vec<(u64, u32, u32)>> {
         self.segments.postings(term)
     }
@@ -1122,6 +1128,32 @@ pub(crate) mod tests {
             "replaced, not merged"
         );
         assert_eq!(store.term_count(), 1, "counted again on open");
+    }
+
+    #[test]
+    fn opening_leaves_older_format_segments_to_the_merge_thread() {
+        let dir = temp_dir("open-v1");
+        let store = Store::open(&dir, 0).unwrap();
+        store.segments.set_write_version(1);
+        store
+            .upsert("bafyA/x", &page("bafyA/x", "Title A", &[("alpha", 2)]), 100)
+            .unwrap();
+        store.flush().unwrap();
+        drop(store);
+
+        // a start upgrades nothing, so it isn't held up rewriting every file (#248)
+        let store = Store::open(&dir, 0).unwrap();
+        let old = store.segments.snapshot()[0].path().to_path_buf();
+        assert_eq!(store.segments.snapshot()[0].version(), 1);
+        let found = vec![("bafyA/x".to_string(), 2, 2)];
+        assert_eq!(postings_by_item(&store, "alpha"), found, "still searchable");
+
+        store.merge();
+        let live = store.segments.snapshot();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].version(), crate::segment::VERSION);
+        assert_ne!(live[0].path(), old);
+        assert_eq!(postings_by_item(&store, "alpha"), found);
     }
 
     #[test]

@@ -1,11 +1,14 @@
 /*!
- * One immutable segment file of the inverted index (#247). Version 1 layout, integers as LEB128
+ * One immutable segment file of the inverted index (#247). Version 2 layout, integers as LEB128
  * varints unless marked:
  *
  *   header    "ipxseg", version u8
  *   docs      (id delta, length) per page, ascending by id
- *   postings  per term, blocks of up to BLOCK postings: n, last id, body bytes, max count (for
- *             #248's block-max pruning, unused so far); then the id deltas, then the counts
+ *   postings  per term, blocks of up to BLOCK postings: n, last id, body bytes, then (v2) its
+ *             impacts: k, and k (count, page length) pairs, count and length each ascending,
+ *             such that every posting has at most one's count on a page at least as long; the
+ *             most a block's pages can score, for #248's pruning. Then the id deltas, then the
+ *             counts. A v1 block has max count where the impacts are, and no lengths.
  *   dict      per term, ascending bytewise: shared prefix, suffix length, suffix, df, offset of
  *             its first block; prefixes restart every SPARSE terms
  *   sparse    every SPARSE-th term: length, term, its dict entry's offset within dict
@@ -23,7 +26,21 @@ pub type Posting = (u64, u32);
 const BLOCK: usize = 128;
 const SPARSE: u64 = 64;
 const MAGIC: &[u8] = b"ipxseg";
-const VERSION: u8 = 1;
+pub(crate) const VERSION: u8 = 2;
+// a v2 block's (count, length) pairs at most: the rest are merged into these
+const IMPACTS_MAX: usize = 8;
+// a block header is at most this many bytes: four varints, then two per impact
+const HEAD_MAX: u64 = (4 + 2 * IMPACTS_MAX as u64) * 10;
+// how much a cursor reads at once
+const WINDOW: u64 = 64 * 1024;
+
+// blocks decoded by cursors on this thread, so tests can see what pruning skipped
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // window reads for a range that began inside the window but ran past its end
+    pub(crate) static STRADDLED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 const END: &[u8] = b"ipxend";
 const FOOTER: u64 = 7 * 8 + 8 + 6;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -98,6 +115,69 @@ fn read_at(file: &File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/**
+ * A block's impacts (#248): its postings' (count, page length) pairs that no other beats on both
+ * (a count at least as high on a page at most as long), count and length ascending. Past
+ * IMPACTS_MAX, runs of neighbours are merged into (their highest count, their shortest page):
+ * looser, but still at least every posting it stands for.
+ */
+fn impacts(mut pairs: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    // highest count first, then shortest page: each pair kept is shorter than all before it
+    pairs.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut frontier: Vec<(u32, u32)> = Vec::new();
+    for pair in pairs {
+        if frontier.last().is_none_or(|last| pair.1 < last.1) {
+            frontier.push(pair);
+        }
+    }
+    frontier.reverse();
+    if frontier.len() <= IMPACTS_MAX {
+        return frontier;
+    }
+    // IMPACTS_MAX runs, as even as can be; in each run, the last count is the highest and the
+    // first length the shortest
+    let (n, runs) = (frontier.len(), IMPACTS_MAX);
+    (0..runs)
+        .map(|r| {
+            let (start, end) = (r * n / runs, (r + 1) * n / runs);
+            (frontier[end - 1].0, frontier[start].1)
+        })
+        .collect()
+}
+
+// a block's impacts from its header; a v1 block's one: (max count, the segment's shortest page)
+fn read_impacts(head: &[u8], pos: &mut usize, version: u8, shortest: u32) -> io::Result<Impacts> {
+    let mut impacts = Impacts {
+        k: 1,
+        pairs: [(0, 0); IMPACTS_MAX],
+    };
+    if version == 1 {
+        impacts.pairs[0] = (get_varint(head, pos)? as u32, shortest);
+        return Ok(impacts);
+    }
+    impacts.k = get_varint(head, pos)? as usize;
+    if impacts.k == 0 || impacts.k > IMPACTS_MAX {
+        return Err(corrupt());
+    }
+    for pair in impacts.pairs[..impacts.k].iter_mut() {
+        *pair = (get_varint(head, pos)? as u32, get_varint(head, pos)? as u32);
+    }
+    Ok(impacts)
+}
+
+// a block's (count, page length) pairs, the first k used
+#[derive(Clone, Copy)]
+struct Impacts {
+    k: usize,
+    pairs: [(u32, u32); IMPACTS_MAX],
+}
+
+impl Impacts {
+    fn pairs(&self) -> &[(u32, u32)] {
+        &self.pairs[..self.k]
+    }
+}
+
 pub struct SegmentWriter {
     out: BufWriter<File>,
     pos: u64,
@@ -110,11 +190,20 @@ pub struct SegmentWriter {
     sparse: Vec<u8>,
     terms: u64,
     last_term: Vec<u8>,
+    version: u8,
+    // the pages written so far and their lengths, for each block's impacts (v2)
+    ids: Vec<u64>,
+    lengths: Vec<u32>,
 }
 
 impl SegmentWriter {
     /// Starts a new segment file; fails if `path` exists
     pub fn create(path: &Path) -> io::Result<SegmentWriter> {
+        SegmentWriter::create_version(path, VERSION)
+    }
+
+    /// Starts a segment file of an older format version; for tests of reading old files
+    pub(crate) fn create_version(path: &Path, version: u8) -> io::Result<SegmentWriter> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = SegmentWriter {
             out: BufWriter::new(file),
@@ -128,9 +217,12 @@ impl SegmentWriter {
             sparse: Vec::new(),
             terms: 0,
             last_term: Vec::new(),
+            version,
+            ids: Vec::new(),
+            lengths: Vec::new(),
         };
         writer.write(MAGIC)?;
-        writer.write(&[VERSION])?;
+        writer.write(&[version])?;
         Ok(writer)
     }
 
@@ -149,6 +241,8 @@ impl SegmentWriter {
         put_varint(&mut buf, id - if self.docs == 0 { 0 } else { self.max_id });
         put_varint(&mut buf, length as u64);
         self.write(&buf)?;
+        self.ids.push(id);
+        self.lengths.push(length);
         if self.docs == 0 {
             self.min_id = id;
         }
@@ -182,7 +276,24 @@ impl SegmentWriter {
             put_varint(&mut head, block.len() as u64);
             put_varint(&mut head, prev);
             put_varint(&mut head, body.len() as u64);
-            put_varint(&mut head, block.iter().map(|p| p.1).max().unwrap() as u64);
+            if self.version >= 2 {
+                // a posting whose page wasn't added gets 0: the loosest bound, never a wrong one
+                let pairs: Vec<(u32, u32)> = block
+                    .iter()
+                    .map(|&(id, count)| match self.ids.binary_search(&id) {
+                        Ok(i) => (count, self.lengths[i]),
+                        Err(_) => (count, 0),
+                    })
+                    .collect();
+                let impacts = impacts(pairs);
+                put_varint(&mut head, impacts.len() as u64);
+                for (count, length) in impacts {
+                    put_varint(&mut head, count as u64);
+                    put_varint(&mut head, length as u64);
+                }
+            } else {
+                put_varint(&mut head, block.iter().map(|p| p.1).max().unwrap() as u64);
+            }
             self.write(&head)?;
             self.write(&body)?;
         }
@@ -258,6 +369,9 @@ pub struct Segment {
     sparse: Vec<(Vec<u8>, u64)>,
     ids: Vec<u64>,
     lengths: Vec<u32>,
+    version: u8,
+    // the shortest page: a v1 block's bound's length, having no impacts
+    shortest: u32,
 }
 
 impl Segment {
@@ -302,7 +416,8 @@ impl Segment {
         if &header[..MAGIC.len()] != MAGIC {
             return Err(corrupt());
         }
-        if header[MAGIC.len()] != VERSION {
+        let version = header[MAGIC.len()];
+        if version != 1 && version != VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "unsupported segment version",
@@ -336,6 +451,8 @@ impl Segment {
             return Err(corrupt());
         }
 
+        let shortest = lengths.iter().copied().min().unwrap_or(0);
+
         let raw = read_at(&file, sparse_off, bytes - FOOTER - sparse_off)?;
         let mut sparse = Vec::new();
         let mut pos = 0;
@@ -354,7 +471,27 @@ impl Segment {
             sparse,
             ids,
             lengths,
+            version,
+            shortest,
         })
+    }
+
+    /// The format version it was written in
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// How many pages a term is on here (dead ones included), or 0
+    pub fn df(&self, term: &[u8]) -> io::Result<u64> {
+        Ok(self.find(term)?.map_or(0, |(df, _)| df))
+    }
+
+    /// A cursor over a term's postings (#248), or none if it isn't in this segment
+    pub fn cursor(&self, term: &[u8]) -> io::Result<Option<Cursor<'_>>> {
+        match self.find(term)? {
+            Some((df, offset)) => Cursor::new(self, df, offset).map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn info(&self) -> SegmentInfo {
@@ -395,6 +532,7 @@ impl Segment {
     }
 
     /// The postings for a term, or none if it isn't in this segment
+    #[cfg(test)]
     pub fn postings(&self, term: &[u8]) -> io::Result<Vec<Posting>> {
         match self.find(term)? {
             Some((df, offset)) => self.postings_at(df, offset),
@@ -441,17 +579,16 @@ impl Segment {
         let mut out = Vec::with_capacity(df as usize);
         let mut prev = 0u64;
         while (out.len() as u64) < df {
-            // a block header is four varints, at most 40 bytes
             let head = read_at(
                 &self.file,
                 offset,
-                40.min(self.dict_off.saturating_sub(offset)),
+                HEAD_MAX.min(self.dict_off.saturating_sub(offset)),
             )?;
             let mut pos = 0;
             let n = get_varint(&head, &mut pos)? as usize;
             let _last = get_varint(&head, &mut pos)?;
             let body_len = get_varint(&head, &mut pos)?;
-            let _max_count = get_varint(&head, &mut pos)?;
+            read_impacts(&head, &mut pos, self.version, self.shortest)?;
             if n == 0 || n > BLOCK {
                 return Err(corrupt());
             }
@@ -479,6 +616,223 @@ impl Segment {
             reader: BufReader::new(file).take(self.sparse_off - self.dict_off),
             term: Vec::new(),
         })
+    }
+}
+
+/**
+ * Reads one term's postings in one segment block by block (#248). Block headers can be read
+ * and skipped without decoding the postings behind them, so a search can pass over blocks
+ * whose pages can't make its results. Moves only forward.
+ */
+pub struct Cursor<'a> {
+    segment: &'a Segment,
+    df: u64,
+    // postings in the blocks before the current one
+    passed: u64,
+    // where the next block's header starts
+    next: u64,
+    // the current block; none once every posting is passed
+    block: Option<Block>,
+    // read-ahead: `window` holds the file from `window_at`
+    window: Vec<u8>,
+    window_at: u64,
+}
+
+struct Block {
+    n: usize,
+    // the block before's last id: the base of this one's first delta
+    base: u64,
+    last: u64,
+    impacts: Impacts,
+    body_at: u64,
+    body_len: u64,
+    // decoded on first use
+    postings: Option<Vec<Posting>>,
+    // the current posting within it
+    i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(segment: &'a Segment, df: u64, offset: u64) -> io::Result<Cursor<'a>> {
+        let mut cursor = Cursor {
+            segment,
+            df,
+            passed: 0,
+            next: offset,
+            block: None,
+            window: Vec::new(),
+            window_at: 0,
+        };
+        cursor.load_block(0)?;
+        Ok(cursor)
+    }
+
+    // up to `len` bytes at `offset`, within the postings section, through the read-ahead window
+    fn bytes(&mut self, offset: u64, len: u64) -> io::Result<&[u8]> {
+        let end = self.segment.dict_off;
+        let len = len.min(end.saturating_sub(offset));
+        let held = self.window_at + self.window.len() as u64;
+        if offset < self.window_at || offset + len > held {
+            #[cfg(test)]
+            if offset >= self.window_at && offset < held {
+                STRADDLED.with(|s| s.set(s.get() + 1));
+            }
+            let size = len.max(WINDOW).min(end.saturating_sub(offset));
+            self.window = read_at(&self.segment.file, offset, size)?;
+            self.window_at = offset;
+        }
+        let start = (offset - self.window_at) as usize;
+        Ok(&self.window[start..start + len as usize])
+    }
+
+    // makes the block whose header starts at `next` current, or none once all are passed
+    fn load_block(&mut self, base: u64) -> io::Result<()> {
+        if self.passed >= self.df {
+            self.block = None;
+            return Ok(());
+        }
+        let (version, segment_shortest, at) =
+            (self.segment.version, self.segment.shortest, self.next);
+        let head = self.bytes(at, HEAD_MAX)?;
+        let mut pos = 0;
+        let n = get_varint(head, &mut pos)? as usize;
+        let last = get_varint(head, &mut pos)?;
+        let body_len = get_varint(head, &mut pos)?;
+        let impacts = read_impacts(head, &mut pos, version, segment_shortest)?;
+        if n == 0 || n > BLOCK || last < base || (self.passed > 0 && last == base) {
+            return Err(corrupt());
+        }
+        let body_at = at.checked_add(pos as u64).ok_or_else(corrupt)?;
+        self.next = body_at.checked_add(body_len).ok_or_else(corrupt)?;
+        self.block = Some(Block {
+            n,
+            base,
+            last,
+            impacts,
+            body_at,
+            body_len,
+            postings: None,
+            i: 0,
+        });
+        Ok(())
+    }
+
+    fn advance_block(&mut self) -> io::Result<()> {
+        let Some(block) = self.block.take() else {
+            return Ok(());
+        };
+        self.passed += block.n as u64;
+        self.load_block(block.last)
+    }
+
+    // decodes the current block's postings, once
+    fn decode(&mut self) -> io::Result<()> {
+        let (at, len, n, base) = match &self.block {
+            Some(b) if b.postings.is_none() => (b.body_at, b.body_len, b.n, b.base),
+            _ => return Ok(()),
+        };
+        let body = self.bytes(at, len)?;
+        if body.len() as u64 != len {
+            return Err(corrupt());
+        }
+        let (mut pos, mut prev) = (0, base);
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            prev = prev
+                .checked_add(get_varint(body, &mut pos)?)
+                .ok_or_else(corrupt)?;
+            ids.push(prev);
+        }
+        let mut postings = Vec::with_capacity(n);
+        for id in ids {
+            postings.push((id, get_varint(body, &mut pos)? as u32));
+        }
+        let block = self.block.as_mut().unwrap();
+        if postings.last().map(|p| p.0) != Some(block.last) {
+            return Err(corrupt());
+        }
+        block.postings = Some(postings);
+        #[cfg(test)]
+        DECODED.with(|d| d.set(d.get() + 1));
+        Ok(())
+    }
+
+    /// How many pages the term is on in this segment
+    pub fn df(&self) -> u64 {
+        self.df
+    }
+
+    /// Whether every posting is passed
+    pub fn done(&self) -> bool {
+        self.block.is_none()
+    }
+
+    /// The current block's last id; none once done
+    pub fn block_last(&self) -> Option<u64> {
+        self.block.as_ref().map(|b| b.last)
+    }
+
+    /**
+     * The most `weight` comes to for any posting in the current block, given a weight that
+     * grows with count and falls with page length: its highest over the block's impacts. 0 once
+     * done.
+     */
+    pub fn block_bound(&self, weight: impl Fn(u32, u32) -> f64) -> f64 {
+        self.block.as_ref().map_or(0.0, |b| {
+            b.impacts
+                .pairs()
+                .iter()
+                .map(|&(count, length)| weight(count, length))
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+    }
+
+    /// The current block's (count, page length) impacts; none once done
+    #[cfg(test)]
+    pub fn block_impacts(&self) -> Option<Vec<(u32, u32)>> {
+        self.block.as_ref().map(|b| b.impacts.pairs().to_vec())
+    }
+
+    /// Moves to the first block whose last id is at least `target`, reading only headers
+    pub fn seek_block(&mut self, target: u64) -> io::Result<()> {
+        while self.block.as_ref().is_some_and(|b| b.last < target) {
+            self.advance_block()?;
+        }
+        Ok(())
+    }
+
+    /// The current posting, decoding its block if it isn't yet; none once done
+    pub fn current(&mut self) -> io::Result<Option<Posting>> {
+        self.decode()?;
+        Ok(self
+            .block
+            .as_ref()
+            .map(|b| b.postings.as_ref().unwrap()[b.i]))
+    }
+
+    /// Moves to the first posting whose id is at least `target` (never back); none once done
+    pub fn seek(&mut self, target: u64) -> io::Result<Option<Posting>> {
+        self.seek_block(target)?;
+        self.decode()?;
+        if let Some(b) = self.block.as_mut() {
+            let postings = b.postings.as_ref().unwrap();
+            // the block's last id is at least target, so this stops inside it
+            b.i += postings[b.i..].partition_point(|p| p.0 < target);
+        }
+        self.current()
+    }
+
+    /// Moves past the current posting; the one after it, none once done
+    #[cfg(test)]
+    pub fn next(&mut self) -> io::Result<Option<Posting>> {
+        self.decode()?;
+        if let Some(b) = self.block.as_mut() {
+            b.i += 1;
+            if b.i == b.n {
+                self.advance_block()?;
+            }
+        }
+        self.current()
     }
 }
 
@@ -619,5 +973,213 @@ mod tests {
         assert!(Segment::open(&path).is_err(), "truncated");
         std::fs::write(&path, b"").unwrap();
         assert!(Segment::open(&path).is_err(), "empty");
+    }
+
+    // the (count, length) pairs no other beats on both, by brute force, ascending
+    fn frontier(pairs: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = pairs
+            .iter()
+            .copied()
+            .filter(|&p| !pairs.iter().any(|&q| q != p && q.0 >= p.0 && q.1 <= p.1))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn every_posting_is_within_its_blocks_bounds_in_v1_and_v2() {
+        for version in [1u8, 2] {
+            let path = temp_dir(&format!("segment-bounds-v{}", version)).join("1.seg");
+            // lengths 1..=500, each once in every 500 pages
+            let docs: Vec<(u64, u32)> = (1..=1000)
+                .map(|id| (id, (id * 37 % 500 + 1) as u32))
+                .collect();
+            let postings: Vec<Posting> = (1..=1000u64)
+                .filter(|id| id % 3 != 0)
+                .map(|id| (id, (id * 7 % 9 + 1) as u32))
+                .collect();
+            // one block of 128 whose counts rise with page length: all 128 on the frontier
+            let mut by_length: Vec<(u64, u32)> = docs[..128].to_vec();
+            by_length.sort_by_key(|d| d.1);
+            let mut climb: Vec<Posting> = by_length
+                .iter()
+                .enumerate()
+                .map(|(rank, &(id, _))| (id, rank as u32 + 1))
+                .collect();
+            climb.sort();
+            let mut writer = SegmentWriter::create_version(&path, version).unwrap();
+            for &(id, length) in &docs {
+                writer.add_doc(id, length).unwrap();
+            }
+            writer.add_term(b"climb", &climb).unwrap();
+            writer.add_term(b"word", &postings).unwrap();
+            writer.finish().unwrap();
+
+            let segment = Segment::open(&path).unwrap();
+            assert_eq!(segment.version(), version);
+            assert_eq!(segment.df(b"word").unwrap(), postings.len() as u64);
+            assert_eq!(segment.df(b"absent").unwrap(), 0);
+            for (term, list) in [("word", &postings), ("climb", &climb)] {
+                let mut cursor = segment.cursor(term.as_bytes()).unwrap().unwrap();
+                // per block: (last id, its impacts, its postings' (count, length))
+                let mut blocks: Vec<(u64, Vec<(u32, u32)>, Vec<(u32, u32)>)> = Vec::new();
+                let mut seen = Vec::new();
+                let mut at = cursor.current().unwrap();
+                while let Some((id, count)) = at {
+                    let last = cursor.block_last().unwrap();
+                    let impacts = cursor.block_impacts().unwrap();
+                    let length = segment.length(id).unwrap();
+                    assert!(id <= last, "{} v{}", id, version);
+                    assert!(
+                        impacts.iter().any(|&(c, l)| count <= c && length >= l),
+                        "{} ({}, {}) not under {:?} v{}",
+                        id,
+                        count,
+                        length,
+                        impacts,
+                        version
+                    );
+                    if blocks.last().map(|b| b.0) != Some(last) {
+                        blocks.push((last, impacts, Vec::new()));
+                    }
+                    blocks.last_mut().unwrap().2.push((count, length));
+                    seen.push((id, count));
+                    at = cursor.next().unwrap();
+                }
+                assert!(cursor.done());
+                assert_eq!(cursor.block_bound(|_, _| 1.0), 0.0, "none once done");
+                assert_eq!(&seen, list);
+                for (_, impacts, pairs) in &blocks {
+                    if version == 1 {
+                        let max = pairs.iter().map(|p| p.0).max().unwrap();
+                        assert_eq!(impacts, &vec![(max, 1)], "the segment's shortest page");
+                        continue;
+                    }
+                    assert!(impacts
+                        .windows(2)
+                        .all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+                    let exact = frontier(pairs);
+                    if exact.len() <= IMPACTS_MAX {
+                        // tight: each is a posting's own
+                        assert_eq!(impacts, &exact);
+                    } else {
+                        assert_eq!(impacts.len(), IMPACTS_MAX, "coarsened to fit");
+                    }
+                }
+            }
+            if version == 2 {
+                let mut cursor = segment.cursor(b"climb").unwrap().unwrap();
+                assert_eq!(cursor.block_impacts().unwrap().len(), IMPACTS_MAX);
+                // the bound is the highest weight over the impacts
+                let weight = |count: u32, length: u32| count as f64 / (length as f64 + 10.0);
+                let best = climb
+                    .iter()
+                    .map(|&(id, count)| weight(count, segment.length(id).unwrap()))
+                    .fold(0.0, f64::max);
+                assert!(cursor.block_bound(weight) >= best);
+                assert!(cursor.current().unwrap().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_seeks_forward_to_exact_ids_gaps_block_edges_and_the_end() {
+        let path = temp_dir("segment-cursor").join("1.seg");
+        let docs: Vec<(u64, u32)> = (1..=1000).map(|id| (id, 5)).collect();
+        // 500 postings: blocks 2..=256, 258..=512, 514..=768, 770..=1000
+        let even: Vec<Posting> = (1..=1000u64)
+            .filter(|id| id % 2 == 0)
+            .map(|id| (id, 1))
+            .collect();
+        write(&path, &docs, &[("even", even)]);
+        let segment = Segment::open(&path).unwrap();
+        assert!(segment.cursor(b"odd").unwrap().is_none());
+
+        let mut c = segment.cursor(b"even").unwrap().unwrap();
+        assert_eq!(c.df(), 500);
+        assert_eq!(c.seek(10).unwrap(), Some((10, 1)), "exact");
+        assert_eq!(c.seek(11).unwrap(), Some((12, 1)), "between postings");
+        assert_eq!(c.seek(5).unwrap(), Some((12, 1)), "never backwards");
+        assert_eq!(
+            c.seek(256).unwrap(),
+            Some((256, 1)),
+            "last of the first block"
+        );
+        assert_eq!(c.seek(257).unwrap(), Some((258, 1)), "first of the second");
+        assert_eq!(c.next().unwrap(), Some((260, 1)));
+
+        let mut skipping = segment.cursor(b"even").unwrap().unwrap();
+        let before = DECODED.with(|d| d.get());
+        skipping.seek_block(900).unwrap();
+        assert_eq!(DECODED.with(|d| d.get()), before, "headers only");
+        assert_eq!(skipping.block_last(), Some(1000));
+        assert_eq!(skipping.seek(1001).unwrap(), None);
+        assert!(skipping.done());
+        assert_eq!(skipping.block_last(), None);
+    }
+
+    #[test]
+    fn a_list_over_the_read_ahead_window_reads_the_same_by_next_and_by_seek() {
+        let path = temp_dir("segment-window").join("1.seg");
+        // 40,000 postings at scattered ids, with two-byte counts: several windows' worth
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let mut id = 0;
+        let postings: Vec<Posting> = (0..40_000)
+            .map(|_| {
+                id += 1 + random(300);
+                (id, 128 + random(10_000) as u32)
+            })
+            .collect();
+        let docs: Vec<(u64, u32)> = postings.iter().map(|&(id, _)| (id, 7)).collect();
+        write(&path, &docs, &[("big", postings.clone())]);
+        let segment = Segment::open(&path).unwrap();
+        assert!(segment.dict_off > 3 * WINDOW, "{} bytes", segment.dict_off);
+        assert_eq!(segment.postings(b"big").unwrap(), postings);
+
+        let straddled = STRADDLED.with(|s| s.get());
+        let mut cursor = segment.cursor(b"big").unwrap().unwrap();
+        let mut walked = Vec::new();
+        let mut at = cursor.current().unwrap();
+        while let Some(posting) = at {
+            walked.push(posting);
+            at = cursor.next().unwrap();
+        }
+        assert_eq!(walked, postings);
+        assert!(
+            STRADDLED.with(|s| s.get()) > straddled,
+            "a header or body ran past the window's end"
+        );
+
+        // seeks to ids on, between and past postings, in steps of up to several blocks
+        let mut cursor = segment.cursor(b"big").unwrap().unwrap();
+        let mut target = 0;
+        while target <= id + 1 {
+            let i = postings.partition_point(|p| p.0 < target);
+            assert_eq!(cursor.seek(target).unwrap(), postings.get(i).copied());
+            target += 1 + random(2_000);
+        }
+        assert_eq!(cursor.seek(id + 1).unwrap(), None);
+        assert!(cursor.done());
+    }
+
+    #[test]
+    fn a_garbled_block_header_is_an_error_not_a_panic() {
+        let path = temp_dir("segment-garbled").join("1.seg");
+        write(&path, &[(1, 1)], &[("word", vec![(1, 1)])]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // header (7 bytes), docs (id 1, length 1: 2 bytes), then the first block's n
+        assert_eq!(bytes[9], 1);
+        bytes[9] = 0;
+        std::fs::write(&path, &bytes).unwrap();
+        // open_written skips the checksum, as for a file this process just wrote
+        let segment = Segment::open_written(&path).unwrap();
+        assert!(segment.cursor(b"word").is_err());
     }
 }

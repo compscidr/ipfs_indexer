@@ -7,10 +7,10 @@
  * its output in the segment set as it is at that moment.
  *
  * Lock order: merging, writes, install, retiring, then dead, buffer, state, retired.
- * term_stats takes computing, then buffer and state (released), then stats. erase is only
- * taken on its own. The wake signals are leaves: install raises merge_due holding the install
- * lock. The Store's connection lock comes before buffer (add), and is never held across a call
- * that waits on merging, writes, install or retiring.
+ * term_stats takes computing, then buffer and state (released), then stats. erase and
+ * upgrades_after are only taken on their own. The wake signals are leaves: install raises
+ * merge_due holding the install lock. The Store's connection lock comes before buffer (add), and
+ * is never held across a call that waits on merging, writes, install or retiring.
  */
 use crate::segment::{Posting, Segment, SegmentWriter};
 use std::cmp::Reverse;
@@ -40,6 +40,8 @@ const ERASE_TRIES: u32 = 3;
 const CHECK_EVERY: usize = 4096;
 // prune takes the dead lock for this many candidate ids at a time
 const PRUNE_CHUNK: usize = 4096;
+// after a failed upgrade to format v2 (#248), upgrades wait this long; merges go on meanwhile
+const UPGRADE_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Default)]
 struct Buffer {
@@ -207,8 +209,27 @@ pub struct Segments {
     stats: Mutex<Option<Arc<Stats>>>,
     // one computation at a time, which nothing else waits on unless there's no value yet
     computing: Mutex<()>,
+    // upgrades of older format files are skipped until then, after one failed
+    upgrades_after: Mutex<Option<Instant>>,
     #[cfg(test)]
     hook: Mutex<Option<HookFn>>,
+    // the format version new files are written in; tests write v1 files to upgrade
+    #[cfg(test)]
+    write_version: std::sync::atomic::AtomicU8,
+}
+
+/// A search's snapshot of the index (#248); see Segments::view
+pub struct View<'a> {
+    pub segments: Vec<Arc<Segment>>,
+    pub buffered: HashMap<String, Vec<(u64, u32, u32)>>,
+    owner: &'a Segments,
+}
+
+impl View<'_> {
+    /// Whether a page was deleted after its postings were written
+    pub fn is_dead(&self, id: u64) -> bool {
+        self.owner.dead.read().unwrap().ids.contains(&id)
+    }
 }
 
 // test seams: where a hook set by set_hook runs
@@ -385,8 +406,11 @@ impl Segments {
             stats_gen: AtomicU64::new(0),
             stats: Mutex::new(None),
             computing: Mutex::new(()),
+            upgrades_after: Mutex::new(None),
             #[cfg(test)]
             hook: Mutex::new(None),
+            #[cfg(test)]
+            write_version: std::sync::atomic::AtomicU8::new(crate::segment::VERSION),
         }
     }
 
@@ -444,7 +468,54 @@ impl Segments {
         }
     }
 
+    /**
+     * What a search reads (#248): the live segments, most pages first, and each term's postings
+     * in the buffer and in one being flushed, as (id, count, page length), dead ids dropped.
+     * Holding it keeps the segments' files from being erased.
+     */
+    pub fn view(&self, terms: &[&str]) -> View<'_> {
+        let in_buffer = |buffer: &Buffer, term: &str, out: &mut Vec<(u64, u32, u32)>| {
+            if let Some(list) = buffer.postings.get(term) {
+                out.extend(
+                    list.iter()
+                        .map(|&(id, count)| (id, count, buffer.lengths[&id])),
+                );
+            }
+        };
+        // the buffer and state together, so a flush moving postings between them isn't missed
+        let (state, mut buffered) = {
+            let buffer = self.buffer.read().unwrap();
+            let state = self.state.read().unwrap().clone();
+            let mut buffered: HashMap<String, Vec<(u64, u32, u32)>> = HashMap::new();
+            for &term in terms {
+                let list = buffered.entry(term.to_string()).or_default();
+                if list.is_empty() {
+                    in_buffer(&buffer, term, list);
+                }
+            }
+            (state, buffered)
+        };
+        if let Some(frozen) = &state.frozen {
+            for (term, list) in buffered.iter_mut() {
+                in_buffer(frozen, term, list);
+            }
+        }
+        let dead = self.dead.read().unwrap();
+        for list in buffered.values_mut() {
+            list.retain(|(id, _, _)| !dead.ids.contains(id));
+        }
+        drop(dead);
+        let mut segments: Vec<Arc<Segment>> = state.segments.iter().cloned().collect();
+        segments.sort_by_key(|s| std::cmp::Reverse(s.info().docs));
+        View {
+            segments,
+            buffered,
+            owner: self,
+        }
+    }
+
     /// The live pages a term is on, as (id, count, page length)
+    #[cfg(test)]
     pub fn postings(&self, term: &str) -> io::Result<Vec<(u64, u32, u32)>> {
         let in_buffer = |buffer: &Buffer| -> Vec<(u64, u32, u32)> {
             buffer.postings.get(term).map_or(Vec::new(), |list| {
@@ -587,10 +658,14 @@ impl Segments {
         }
     }
 
-    /// upkeep() with merge() in between, in one call: at startup, and in tests
+    /**
+     * upkeep() with merge() in between, in one call: at startup, and in tests. Files of an older
+     * format aren't upgraded here: that's merge()'s, in the background, so a start isn't held up
+     * rewriting them all (#248).
+     */
     pub fn maintain(&self) -> Maintained {
         let mut error = self.upkeep_round();
-        if let Err(err) = self.merge() {
+        if let Err(err) = self.cascade(false) {
             error.get_or_insert(err);
         }
         // the merges' inputs, if no search holds them
@@ -644,11 +719,16 @@ impl Segments {
     }
 
     /**
-     * Merges segments until none are due; for the merge thread. Between merges, erasures, a due
-     * flush and retired files go first (unless the upkeep thread is already on them), so a long
-     * cascade doesn't starve them.
+     * Merges segments until none are due, and upgrades files of an older format one at a time
+     * (#248); for the merge thread. Between merges, erasures, a due flush and retired files go
+     * first (unless the upkeep thread is already on them), so a long cascade doesn't starve them.
      */
     pub fn merge(&self) -> io::Result<()> {
+        self.cascade(true)
+    }
+
+    // merge(), upgrading older files too if `upgrade`
+    fn cascade(&self, upgrade: bool) -> io::Result<()> {
         if self.dir.is_none() {
             return Ok(());
         }
@@ -678,13 +758,27 @@ impl Segments {
                 }
             }
             first = false;
-            let Some(inputs) = self.pick_merge() else {
+            let Some((inputs, upgrading)) = self.pick_merge(upgrade) else {
                 return Ok(());
             };
             #[cfg(test)]
             self.hook(Hook::BeforeMerge);
             // false: another install took an input first; the next pick starts from what's live
-            self.rewrite(&inputs)?;
+            match self.rewrite(&inputs) {
+                // a failed upgrade (a full disk, say) mustn't hold up the merges behind it
+                Err(err) if upgrading => {
+                    log::warn!(
+                        "Upgrading segment {} failed, retrying in {} minutes: {}",
+                        inputs[0].path().display(),
+                        UPGRADE_BACKOFF.as_secs() / 60,
+                        err
+                    );
+                    *lock(&self.upgrades_after) = Some(Instant::now() + UPGRADE_BACKOFF);
+                }
+                rewritten => {
+                    rewritten?;
+                }
+            }
         }
     }
 
@@ -747,7 +841,12 @@ impl Segments {
         let dir = self.dir.as_ref().expect("segment files need a directory");
         let generation = self.next_gen.fetch_add(1, Ordering::SeqCst);
         let path = dir.join(format!("{:016x}.seg", generation));
-        let written = SegmentWriter::create(&path).and_then(|mut writer| {
+        #[cfg(test)]
+        let created =
+            SegmentWriter::create_version(&path, self.write_version.load(Ordering::SeqCst));
+        #[cfg(not(test))]
+        let created = SegmentWriter::create(&path);
+        let written = created.and_then(|mut writer| {
             fill(&mut writer)?;
             writer.finish()
         });
@@ -961,20 +1060,38 @@ impl Segments {
         }
     }
 
-    // a mostly-dead segment on its own, else TIER_FANOUT segments of one size tier
-    fn pick_merge(&self) -> Option<Vec<Arc<Segment>>> {
+    // a mostly-dead segment on its own, else (if `upgrade`, and none failed lately) an older
+    // format file on its own, else TIER_FANOUT segments of one size tier; and whether it's an
+    // upgrade
+    fn pick_merge(&self, upgrade: bool) -> Option<(Vec<Arc<Segment>>, bool)> {
         let live = self.state.read().unwrap().segments.clone();
         {
             let dead = self.dead.read().unwrap();
             for segment in live.iter() {
                 let n = dead.held.get(segment.path()).map_or(0, Vec::len) as u64;
                 if n > 0 && n * 100 >= segment.info().docs * DEAD_PERCENT {
-                    return Some(vec![segment.clone()]);
+                    return Some((vec![segment.clone()], false));
                 }
             }
         }
+        // a file from before format v2 (#248), rewritten alone so its blocks get tight bounds;
+        // merges never reach one of a gibibyte or more, so it'd stay v1 otherwise
+        let backing_off = lock(&self.upgrades_after).is_some_and(|after| Instant::now() < after);
+        let old = match upgrade && !backing_off {
+            true => live.iter().find(|s| s.version() < crate::segment::VERSION),
+            false => None,
+        };
+        if let Some(old) = old {
+            log::info!(
+                "Upgrading segment {} to format v{}",
+                old.path().display(),
+                crate::segment::VERSION
+            );
+            return Some((vec![old.clone()], true));
+        }
         let sizes: Vec<u64> = live.iter().map(|s| s.info().bytes).collect();
-        pick_tier(&sizes).map(|picked| picked.into_iter().map(|i| live[i].clone()).collect())
+        pick_tier(&sizes)
+            .map(|picked| (picked.into_iter().map(|i| live[i].clone()).collect(), false))
     }
 
     /**
@@ -1239,6 +1356,10 @@ fn pick_tier(sizes: &[u64]) -> Option<Vec<usize>> {
 
 #[cfg(test)]
 impl Segments {
+    pub(crate) fn set_write_version(&self, version: u8) {
+        self.write_version.store(version, Ordering::SeqCst);
+    }
+
     pub(crate) fn segment_count(&self) -> usize {
         self.state.read().unwrap().segments.len()
     }
@@ -1433,6 +1554,124 @@ pub(crate) mod tests {
         maintained(&segments);
         assert_eq!(segments.segment_count(), 0);
         assert_eq!(segments.postings("a").unwrap(), vec![(1, 1, 1)]);
+    }
+
+    #[test]
+    fn a_view_has_live_segments_largest_first_and_live_buffered_postings() {
+        let dir = temp_dir("segments-view");
+        let segments = Segments::open(&dir).unwrap();
+        flushed(&segments, &[(1, &[("alpha", 1)])]);
+        for id in 2..=4 {
+            segments.add(id, 2, &words(&[("alpha", 2)]));
+        }
+        segments.flush().unwrap();
+        segments.add(5, 3, &words(&[("alpha", 3), ("beta", 1)]));
+        segments.add(6, 3, &words(&[("alpha", 1)]));
+        segments.set_dead(&[6]);
+
+        let view = segments.view(&["alpha", "beta", "absent", "alpha"]);
+        let docs: Vec<u64> = view.segments.iter().map(|s| s.info().docs).collect();
+        assert_eq!(docs, vec![3, 1]);
+        assert_eq!(view.buffered["alpha"], vec![(5, 3, 3)]);
+        assert_eq!(view.buffered["beta"], vec![(5, 1, 3)]);
+        assert!(view.buffered["absent"].is_empty());
+        assert!(view.is_dead(6) && !view.is_dead(5));
+    }
+
+    #[test]
+    fn a_view_keeps_reading_its_segments_across_a_merge() {
+        let dir = temp_dir("segments-view-merge");
+        let segments = Segments::open(&dir).unwrap();
+        for id in 1..=10 {
+            flushed(&segments, &[(id, &[("common", 1)])]);
+        }
+        let view = segments.view(&["common"]);
+        maintained(&segments);
+        assert_eq!(segments.segment_count(), 1, "merged meanwhile");
+        let total: u64 = view.segments.iter().map(|s| s.df(b"common").unwrap()).sum();
+        assert_eq!(total, 10, "the retired files are still readable");
+        let mut cursor = view.segments[0].cursor(b"common").unwrap().unwrap();
+        assert!(cursor.current().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_v1_segment_is_upgraded_alone_and_its_file_erased() {
+        let dir = temp_dir("segments-upgrade");
+        let segments = Segments::open(&dir).unwrap();
+        segments.set_write_version(1);
+        for id in 1..=3 {
+            segments.add(id, 4, &words(&[("alpha", 1), ("zzqxupgradeterm", 3)]));
+        }
+        segments.flush().unwrap();
+        segments.set_write_version(crate::segment::VERSION);
+        let old = segments.snapshot()[0].path().to_path_buf();
+        assert_eq!(segments.snapshot()[0].version(), 1);
+        let before = segments.postings("alpha").unwrap();
+
+        // startup's maintain leaves it to the merge thread
+        maintained(&segments);
+        assert_eq!(
+            segments.snapshot()[0].path(),
+            old,
+            "not upgraded at startup"
+        );
+        assert_eq!(segments.postings("alpha").unwrap(), before);
+
+        segments.merge().unwrap();
+        maintained(&segments); // the v1 file, retired, is erased
+        let live = segments.snapshot();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].version(), crate::segment::VERSION);
+        assert!(!old.exists(), "the v1 file was retired and erased");
+        assert_eq!(segments.postings("alpha").unwrap(), before);
+        segments.merge().unwrap();
+        assert_eq!(
+            segments.snapshot()[0].path(),
+            live[0].path(),
+            "upgraded once"
+        );
+    }
+
+    #[test]
+    fn a_failed_upgrade_doesnt_hold_up_a_tier_merge() {
+        let dir = temp_dir("segments-upgrade-fails");
+        let segments = Segments::open(&dir).unwrap();
+        // ten v2 segments of a tier, then a v1 one the tier merge won't take
+        for id in 1..=10 {
+            flushed(&segments, &[(id, &[("alpha", 1)])]);
+        }
+        segments.set_write_version(1);
+        flushed(&segments, &[(11, &[("alpha", 1)])]);
+        segments.set_write_version(crate::segment::VERSION);
+        let old = segments.snapshot()[10].path().to_path_buf();
+        // the upgrade, picked first, would write the next file name: taken, so it fails
+        let next = segments.next_gen.load(Ordering::SeqCst);
+        fs::write(dir.join(format!("{:016x}.seg", next)), b"taken").unwrap();
+        let mut before = segments.postings("alpha").unwrap();
+        before.sort();
+        let paths = |segments: &Segments| -> Vec<PathBuf> {
+            let live = segments.snapshot();
+            live.iter().map(|s| s.path().to_path_buf()).collect()
+        };
+
+        segments.merge().unwrap();
+        let live = paths(&segments);
+        assert_eq!(live.len(), 2, "the ten v2 segments merged anyway");
+        assert!(live.contains(&old), "the v1 file is still live");
+        assert!(lock(&segments.upgrades_after).is_some(), "backing off");
+        segments.merge().unwrap();
+        assert_eq!(paths(&segments), live, "not retried at once");
+        let mut after = segments.postings("alpha").unwrap();
+        after.sort();
+        assert_eq!(after, before);
+
+        // once the backoff passes, it's retried
+        *lock(&segments.upgrades_after) = Some(Instant::now());
+        segments.merge().unwrap();
+        assert!(segments
+            .snapshot()
+            .iter()
+            .all(|s| s.version() == crate::segment::VERSION));
     }
 
     // one segment per page, flushed one at a time
@@ -1671,7 +1910,10 @@ pub(crate) mod tests {
         let start = Instant::now();
         for _ in 0..10 {
             assert!(segments.prune_dead().is_empty());
-            assert_eq!(segments.pick_merge().map(|picked| picked.len()), Some(1));
+            assert_eq!(
+                segments.pick_merge(true).map(|picked| picked.0.len()),
+                Some(1)
+            );
         }
         let took = start.elapsed();
         println!(
