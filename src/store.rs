@@ -41,6 +41,8 @@ pub struct Store {
     // rows in `pages` and the sum of their lengths, for BM25's average page length (#251)
     pages: AtomicUsize,
     lengths: AtomicU64,
+    // rows in `mirrors`, for /status (#253)
+    mirrors: AtomicUsize,
 }
 
 /**
@@ -98,6 +100,12 @@ const SCHEMA: &str = "
     -- the crawl frontier (#224): items waiting to be fetched, in insertion order
     CREATE TABLE IF NOT EXISTS queue (
         item TEXT PRIMARY KEY
+    );
+    -- indexed pages and queued items per root CID, kept in step with them for /roots (#231)
+    CREATE TABLE IF NOT EXISTS roots (
+        root   TEXT PRIMARY KEY,
+        pages  INTEGER NOT NULL,
+        queued INTEGER NOT NULL
     );";
 
 impl Store {
@@ -149,9 +157,19 @@ impl Store {
             conn.pragma_update(None, "cache_size", -(cache_mb as i64) * 1024)?;
         }
         refuse_old_format(&conn)?;
+        let has_roots: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'roots'")?
+            .exists([])?;
+        let has_pages: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pages'")?
+            .exists([])?;
         conn.execute_batch(SCHEMA)?;
+        if has_pages && !has_roots {
+            fill_roots(&mut conn)?;
+        }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS pages_text_hash ON pages (text_hash);
+             CREATE INDEX IF NOT EXISTS pages_indexed_at ON pages (indexed_at);
              CREATE INDEX IF NOT EXISTS mirrors_page ON mirrors (page);
              CREATE INDEX IF NOT EXISTS dead_pages_item ON dead_pages (item);",
         )?;
@@ -184,6 +202,7 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
         segments.mark_erase(&erase);
         let queued: i64 = conn.query_row("SELECT count(*) FROM queue", [], |r| r.get(0))?;
+        let mirrors: i64 = conn.query_row("SELECT count(*) FROM mirrors", [], |r| r.get(0))?;
         let (pages, lengths): (i64, i64) = conn.query_row(
             "SELECT count(*), coalesce(sum(length), 0) FROM pages",
             [],
@@ -197,6 +216,7 @@ impl Store {
             queued: AtomicUsize::new(queued as usize),
             pages: AtomicUsize::new(pages as usize),
             lengths: AtomicU64::new(lengths as u64),
+            mirrors: AtomicUsize::new(mirrors as usize),
         })
     }
 
@@ -239,13 +259,14 @@ impl Store {
                     tx.prepare_cached("UPDATE mirrors SET page = ?2 WHERE page = ?1")?
                         .execute(params![old, page])?;
                 }
-                tx.prepare_cached(
-                    "INSERT INTO mirrors (item, page) VALUES (?1, ?2)
-                     ON CONFLICT (item) DO UPDATE SET page = excluded.page",
-                )?
-                .execute(params![item, page])?;
+                let replaced = tx
+                    .prepare_cached("DELETE FROM mirrors WHERE item = ?1")?
+                    .execute([item])?;
+                tx.prepare_cached("INSERT INTO mirrors (item, page) VALUES (?1, ?2)")?
+                    .execute(params![item, page])?;
                 tx.commit()?;
                 drop(conn);
+                self.mirrors.fetch_add(1 - replaced, Ordering::Relaxed);
                 if let Some((old, length)) = removed {
                     self.segments.set_dead(&[old as u64]);
                     self.adjust_lengths(1, length);
@@ -260,7 +281,8 @@ impl Store {
                 return Ok(Upserted::Mirror(original));
             }
         }
-        tx.prepare_cached("DELETE FROM mirrors WHERE item = ?1")?
+        let unmirrored = tx
+            .prepare_cached("DELETE FROM mirrors WHERE item = ?1")?
             .execute([item])?;
         let length: i64 = result.keywords.values().map(|&count| count as i64).sum();
         // a re-crawl gets a new id: the old version's postings are in a segment, which can't change
@@ -279,6 +301,7 @@ impl Store {
             ],
             |r| r.get(0),
         )?;
+        bump_root(&tx, item, 1, 0)?;
         if let Some((old, _)) = old {
             tx.prepare_cached("UPDATE mirrors SET page = ?2 WHERE page = ?1")?
                 .execute(params![old, id])?;
@@ -292,6 +315,7 @@ impl Store {
             self.segments.set_dead(&[old as u64]);
             self.adjust_lengths(1, old_length);
         }
+        self.mirrors.fetch_sub(unmirrored, Ordering::Relaxed);
         self.pages.fetch_add(1, Ordering::Relaxed);
         self.lengths.fetch_add(length as u64, Ordering::Relaxed);
         info!(
@@ -317,6 +341,7 @@ impl Store {
             "INSERT INTO dead_pages (id, item, cid, died_at, erase) VALUES (?1, ?2, ?3, ?4, 0)",
         )?
         .execute(params![id, item, cid, now_secs()])?;
+        bump_root(tx, item, -1, 0)?;
         Ok(Some((id, length as u64)))
     }
 
@@ -345,17 +370,18 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let (mut dead, mut erased, mut length) = (Vec::new(), Vec::new(), 0);
+        let mut unmirrored = 0;
         {
             let mut mirror = tx.prepare("DELETE FROM mirrors WHERE item = ?1")?;
             let mut mirrors_of = tx.prepare("DELETE FROM mirrors WHERE page = ?1")?;
             let mut versions =
                 tx.prepare("UPDATE dead_pages SET erase = 1 WHERE item = ?1 RETURNING id")?;
             for item in items {
-                mirror.execute([item])?;
+                unmirrored += mirror.execute([item])?;
                 if let Some((id, page_length)) = self.remove_page(&tx, item)? {
                     dead.push(id as u64);
                     length += page_length;
-                    mirrors_of.execute([id])?;
+                    unmirrored += mirrors_of.execute([id])?;
                 }
                 if erase {
                     // this page and every superseded version of it
@@ -367,6 +393,7 @@ impl Store {
         }
         tx.commit()?;
         drop(conn);
+        self.mirrors.fetch_sub(unmirrored, Ordering::Relaxed);
         self.segments.set_dead(&dead);
         self.segments.mark_erase(&erased);
         self.adjust_lengths(dead.len(), length);
@@ -555,7 +582,9 @@ impl Store {
                 let mut stmt =
                     tx.prepare_cached("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
                 for item in batch {
-                    batch_added += stmt.execute([item])?;
+                    let n = stmt.execute([item])?;
+                    bump_root(&tx, item, 0, n as i64)?;
+                    batch_added += n;
                 }
             }
             tx.commit()?;
@@ -580,7 +609,9 @@ impl Store {
             {
                 let mut stmt = tx.prepare_cached("DELETE FROM queue WHERE item = ?1")?;
                 for item in batch {
-                    removed += stmt.execute([item])?;
+                    let n = stmt.execute([item])?;
+                    bump_root(&tx, item, 0, -(n as i64))?;
+                    removed += n;
                 }
             }
             tx.commit()?;
@@ -592,14 +623,19 @@ impl Store {
     /// Takes the oldest item off the frontier, or None if it's empty
     pub fn queue_pop(&self) -> rusqlite::Result<Option<String>> {
         let start = Instant::now();
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let waited = start.elapsed();
-        let item = conn
+        let tx = conn.transaction()?;
+        let item: Option<String> = tx
             .prepare_cached(
                 "DELETE FROM queue WHERE rowid = (SELECT min(rowid) FROM queue) RETURNING item",
             )?
             .query_row([], |r| r.get(0))
             .optional()?;
+        if let Some(item) = &item {
+            bump_root(&tx, item, 0, -1)?;
+        }
+        tx.commit()?;
         // not on empty polls: idle workers poll every 200ms
         if item.is_some() {
             self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -616,16 +652,28 @@ impl Store {
         self.queued.load(Ordering::Relaxed)
     }
 
-    /// Queued items per root CID (the first segment of "cid/path"). On the reader: a full scan
-    /// that would otherwise hold up the crawl
-    pub fn queue_roots(&self) -> rusqlite::Result<Vec<(String, usize)>> {
+    /// Indexed and queued counts per root CID with the root page's title ("" if it isn't
+    /// indexed), most indexed first (#232); from `roots`, no scan (#231)
+    pub fn root_counts(&self) -> rusqlite::Result<Vec<(String, usize, usize, String)>> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(
-            "SELECT substr(item, 1, instr(item || '/', '/') - 1) AS root, count(*)
-             FROM queue GROUP BY root",
+        let mut stmt = conn.prepare_cached(
+            "SELECT roots.root, roots.pages, roots.queued, coalesce(pages.title, '')
+             FROM roots LEFT JOIN pages ON pages.item = roots.root
+             ORDER BY roots.pages DESC, roots.queued DESC, roots.root",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, i64>(1)? as usize,
+                r.get::<_, i64>(2)? as usize,
+                r.get(3)?,
+            ))
+        })?;
         rows.collect()
+    }
+
+    pub fn mirror_count(&self) -> usize {
+        self.mirrors.load(Ordering::Relaxed)
     }
 
     /// The frontier in the order it was added
@@ -756,6 +804,47 @@ fn refuse_old_format(conn: &Connection) -> Result<(), OpenError> {
     Ok(())
 }
 
+// a "cid/path" item's root CID
+fn root_of(item: &str) -> &str {
+    item.split('/').next().unwrap_or(item)
+}
+
+// adds to a root's page and queued counts, dropping the row once both are 0
+fn bump_root(tx: &Connection, item: &str, pages: i64, queued: i64) -> rusqlite::Result<()> {
+    if pages == 0 && queued == 0 {
+        return Ok(());
+    }
+    let root = root_of(item);
+    tx.prepare_cached(
+        "INSERT INTO roots (root, pages, queued) VALUES (?1, ?2, ?3)
+         ON CONFLICT (root) DO UPDATE SET pages = pages + ?2, queued = queued + ?3",
+    )?
+    .execute(params![root, pages, queued])?;
+    tx.prepare_cached("DELETE FROM roots WHERE root = ?1 AND pages <= 0 AND queued <= 0")?
+        .execute([root])?;
+    Ok(())
+}
+
+/**
+ * Fills `roots` from `pages` and `queue`, once, for an index from before it (v0.2.9). Two
+ * GROUP BYs in one transaction: it inserts one row per root (a few hundred), so the in-memory
+ * journal and the sorter stay small however many pages there are.
+ */
+fn fill_roots(conn: &mut Connection) -> rusqlite::Result<()> {
+    log::info!("Counting pages and queued items per root (one-time, #231)");
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "INSERT INTO roots (root, pages, queued)
+           SELECT substr(item, 1, instr(item || '/', '/') - 1) AS r, count(*), 0
+           FROM pages GROUP BY r;
+         INSERT INTO roots (root, pages, queued)
+           SELECT substr(item, 1, instr(item || '/', '/') - 1) AS r, 0, count(*)
+           FROM queue GROUP BY r
+           ON CONFLICT (root) DO UPDATE SET queued = excluded.queued;",
+    )?;
+    tx.commit()
+}
+
 /**
  * Pages whose postings were still in the write buffer when the process stopped (ids past the
  * last flush) aren't searchable: their rows go, and they're queued to be crawled again.
@@ -774,19 +863,23 @@ fn recover_unflushed(conn: &mut Connection, flushed_through: u64) -> rusqlite::R
         items.len()
     );
     // their mirrors are crawled again too: the page they point at is going
+    let mirrored: Vec<String> = tx
+        .prepare("SELECT item FROM mirrors WHERE page > ?1")?
+        .query_map([flushed_through as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     tx.execute(
-        "INSERT OR IGNORE INTO queue (item) SELECT item FROM mirrors WHERE page > ?1",
-        [flushed_through as i64],
-    )?;
-    tx.execute(
-        "DELETE FROM mirrors WHERE page IN (SELECT id FROM pages WHERE id > ?1)",
+        "DELETE FROM mirrors WHERE page > ?1",
         [flushed_through as i64],
     )?;
     tx.execute("DELETE FROM pages WHERE id > ?1", [flushed_through as i64])?;
     {
         let mut queue = tx.prepare("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
         for item in &items {
-            queue.execute([item])?;
+            bump_root(&tx, item, -1, 0)?;
+        }
+        for item in items.iter().chain(&mirrored) {
+            let n = queue.execute([item])?;
+            bump_root(&tx, item, 0, n as i64)?;
         }
     }
     tx.commit()
@@ -1583,5 +1676,149 @@ pub(crate) mod tests {
             .query_row("SELECT count(*) FROM dead_pages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0, "erased, so their records went too");
+    }
+
+    // roots as a GROUP BY over pages and queue would count them
+    fn roots_by_scan(store: &Store) -> Vec<(String, usize, usize)> {
+        let conn = store.conn.lock().unwrap();
+        let mut counts: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        for (table, col) in [("pages", 0), ("queue", 1)] {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT substr(item, 1, instr(item || '/', '/') - 1), count(*) FROM {} GROUP BY 1",
+                    table
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+                })
+                .unwrap();
+            for row in rows {
+                let (root, n) = row.unwrap();
+                let entry = counts.entry(root).or_default();
+                if col == 0 {
+                    entry.0 = n
+                } else {
+                    entry.1 = n
+                }
+            }
+        }
+        counts.into_iter().map(|(r, (p, q))| (r, p, q)).collect()
+    }
+
+    fn roots_table(store: &Store) -> Vec<(String, usize, usize)> {
+        let mut rows: Vec<_> = store
+            .root_counts()
+            .unwrap()
+            .into_iter()
+            .map(|(root, pages, queued, _)| (root, pages, queued))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn roots_track_pages_mirrors_deletes_and_the_queue() {
+        let dir = temp_dir("roots");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("a", &page("a", "A root", &[("x", 1)]), 1)
+            .unwrap();
+        store
+            .upsert("a/1", &page("a/1", "t", &[("x", 1)]), 1)
+            .unwrap();
+        store
+            .upsert("a/1", &page("a/1", "t", &[("y", 1)]), 2)
+            .unwrap(); // re-crawl: new id
+        store
+            .upsert("b/1", &hashed("b/1", &[("z", 1)], b"same"), 1)
+            .unwrap();
+        store
+            .upsert("c/1", &hashed("c/1", &[("z", 1)], b"same"), 1)
+            .unwrap(); // mirror of b/1
+        store
+            .queue_add(&["a/2".into(), "a/3".into(), "d/1".into(), "a/2".into()])
+            .unwrap();
+        store.queue_pop().unwrap(); // a/2
+        store.queue_remove(&["d/1".into(), "nope".into()]).unwrap();
+        store.delete(&["b/1".to_string()], true).unwrap(); // takes its mirror c/1 too
+        assert_eq!(roots_table(&store), roots_by_scan(&store));
+        assert_eq!(
+            store.root_counts().unwrap()[0],
+            ("a".to_string(), 2, 1, "A root".to_string())
+        );
+        assert_eq!(store.mirror_count(), 0);
+        drop(store);
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(roots_table(&store), roots_by_scan(&store));
+    }
+
+    #[test]
+    fn roots_match_a_group_by_after_crash_recovery() {
+        let dir = temp_dir("roots-recover");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("a/1", &page("a/1", "t", &[("x", 1)]), 1)
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .upsert("a/2", &page("a/2", "t", &[("x", 1)]), 1)
+            .unwrap(); // never flushed
+        store
+            .upsert("b/1", &hashed("b/1", &[("z", 1)], b"h"), 1)
+            .unwrap();
+        store
+            .upsert("c/1", &hashed("c/1", &[("z", 1)], b"h"), 1)
+            .unwrap(); // mirror of b/1
+        std::mem::forget(store); // a crash: no flush on drop
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(roots_table(&store), roots_by_scan(&store));
+        assert_eq!(
+            store.queue_len(),
+            3,
+            "a/2, b/1 and its mirror c/1 queued again"
+        );
+    }
+
+    #[test]
+    fn roots_are_filled_once_from_an_index_without_them() {
+        let dir = temp_dir("roots-fill");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("a/1", &page("a/1", "t", &[("x", 1)]), 1)
+            .unwrap();
+        store
+            .upsert("a", &page("a", "Root", &[("x", 1)]), 1)
+            .unwrap();
+        store.queue_add(&["a/2".into(), "b/1".into()]).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE roots")
+            .unwrap(); // a v0.2.9 index
+        drop(store);
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(
+            roots_table(&store),
+            vec![("a".to_string(), 2, 1), ("b".to_string(), 0, 1)]
+        );
+    }
+
+    #[test]
+    fn expiry_query_uses_the_indexed_at_index() {
+        let store = Store::open_in_memory().unwrap();
+        let plan: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT item FROM pages WHERE indexed_at < 5",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("pages_indexed_at"), "{}", plan);
     }
 }

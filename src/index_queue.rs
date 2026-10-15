@@ -713,36 +713,10 @@ impl IndexQueue {
     /// Indexed and queued counts per root CID (the first segment of "cid/path"), with the root
     /// page's title if it's indexed, most indexed first (#232)
     pub fn root_counts(&self) -> Vec<(String, usize, usize, String)> {
-        let root = |item: &str| item.split('/').next().unwrap_or(item).to_string();
-        let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
-        for entry in self.map.iter() {
-            counts.entry(root(entry.key())).or_default().0 += 1;
-        }
-        match self.store().queue_roots() {
-            Ok(queued) => {
-                for (cid, n) in queued {
-                    counts.entry(cid).or_default().1 += n;
-                }
-            }
-            Err(err) => warn!("Couldn't count the queue by root: {}", err),
-        }
-        let mut roots: Vec<_> = counts
-            .into_iter()
-            .map(|(cid, (indexed, queued))| {
-                let title = self
-                    .map
-                    .get(&cid)
-                    .map(|r| r.title.clone())
-                    .unwrap_or_default();
-                (cid, indexed, queued, title)
-            })
-            .collect();
-        roots.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then(b.2.cmp(&a.2))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        roots
+        self.store().root_counts().unwrap_or_else(|err| {
+            warn!("Couldn't count pages by root: {}", err);
+            Vec::new()
+        })
     }
 
     /// how many crawled items weren't indexed, being the same text as an indexed page (#253)
@@ -1098,7 +1072,7 @@ mod tests {
     fn root_counts_group_items_by_their_root_cid() {
         let queue = IndexQueue::new();
         for item in ["wiki", "wiki/wiki/A", "wiki/wiki/B", "other/x"] {
-            queue.map.insert(item.to_string(), page(item, item, &[]));
+            queue.index_for_test(item, &page(item, item, &[]));
         }
         queue.push_queued(vec!["wiki/wiki/C".to_string(), "lone/y".to_string()]);
         assert_eq!(
