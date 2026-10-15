@@ -4,7 +4,7 @@ use log::debug;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,8 @@ pub struct Store {
     lengths: AtomicU64,
     // rows in `mirrors`, for /status (#253)
     mirrors: AtomicUsize,
+    // set once a store error says the index is damaged, so it's marked (and logged) once (#266)
+    damaged: AtomicBool,
 }
 
 /**
@@ -234,6 +236,7 @@ impl Store {
             pages: AtomicUsize::new(pages as usize),
             lengths: AtomicU64::new(lengths as u64),
             mirrors: AtomicUsize::new(mirrors as usize),
+            damaged: AtomicBool::new(false),
         })
     }
 
@@ -468,6 +471,37 @@ impl Store {
         self.segments.postings(term)
     }
 
+    /**
+     * For a store error that says the index is damaged (see is_corrupt), as the next open won't
+     * notice damage outside what it reads (#266): marks DATA_DIR so the next start checks the
+     * whole file, and erases it if the check fails. Other errors are left alone. Crawling and
+     * search carry on meanwhile.
+     */
+    pub fn note_error(&self, err: &(dyn std::error::Error + 'static)) {
+        if !is_corrupt(err) || self.damaged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let Some(path) = &self.path else {
+            log::error!("The index is damaged ({})", err);
+            return;
+        };
+        let marker = damage_marker(path.parent().unwrap_or(Path::new(".")));
+        match write_synced(&marker, &err.to_string()) {
+            Ok(()) => log::error!(
+                "The index looks damaged ({}); the next start checks it, and erases it and starts \
+                 again empty if it is",
+                err
+            ),
+            Err(write_err) => log::error!(
+                "The index looks damaged ({}), but {} couldn't be written ({}): stop the \
+                 indexer and wipe it by hand",
+                err,
+                marker.display(),
+                write_err
+            ),
+        }
+    }
+
     /// The mean page length in terms, for BM25; 0 with no pages
     pub fn average_length(&self) -> f64 {
         let pages = self.pages.load(Ordering::Relaxed);
@@ -481,6 +515,7 @@ impl Store {
         self.segments.term_stats(0).map_or_else(
             |err| {
                 log::warn!("Couldn't count terms: {}", err);
+                self.note_error(&err);
                 0
             },
             |(count, _)| count,
@@ -507,10 +542,12 @@ impl Store {
     pub fn merge(&self) {
         if let Err(err) = self.segments.merge() {
             log::warn!("Segment merge failed: {}", err);
+            self.note_error(&err);
         }
         // here rather than on /status, which a count of a big index would hold up for seconds
         if let Err(err) = self.segments.refresh_stats(crate::segments::STATS_TTL) {
             log::warn!("Couldn't count terms: {}", err);
+            self.note_error(&err);
         }
     }
 
@@ -518,6 +555,7 @@ impl Store {
     fn maintained(&self, done: Maintained) {
         if let Some(err) = &done.error {
             log::warn!("Segment upkeep failed: {}", err);
+            self.note_error(err);
         }
         let dropped = done.pruned;
         if dropped.is_empty() {
@@ -537,6 +575,7 @@ impl Store {
             });
             if let Err(err) = deleted {
                 log::warn!("Couldn't drop {} dead page ids: {}", batch.len(), err);
+                self.note_error(&err);
                 return;
             }
         }
@@ -759,6 +798,7 @@ impl Drop for Store {
     fn drop(&mut self) {
         if let Err(err) = self.segments.flush() {
             log::warn!("Couldn't flush the index on close: {}", err);
+            self.note_error(&err);
         }
     }
 }
@@ -856,6 +896,34 @@ pub fn is_corrupt(err: &(dyn std::error::Error + 'static)) -> bool {
         );
     }
     matches!(err.downcast_ref::<std::io::Error>(), Some(io) if io.kind() == std::io::ErrorKind::InvalidData)
+}
+
+/// Left in DATA_DIR when a store error says the index is damaged (Store::note_error, #266). Its
+/// name starts with index.sqlite, so wipe() erases it with the index.
+pub fn damage_marker(dir: &Path) -> PathBuf {
+    dir.join("index.sqlite.damaged")
+}
+
+fn write_synced(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+/// What's wrong with DATA_DIR's index.sqlite, from SQLite's full check ("ok" means nothing): it
+/// reads the whole file, so it's only run when a damage marker asks for it (#266)
+pub fn integrity_problems(dir: &Path) -> Result<Vec<String>, OpenError> {
+    let path = dir.join("index.sqlite");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let rows: Vec<String> = conn
+        .prepare("PRAGMA integrity_check(20)")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows.into_iter().filter(|row| row != "ok").collect())
 }
 
 /**
@@ -1082,6 +1150,57 @@ pub(crate) mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    fn sqlite_error(code: std::os::raw::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("from the test".into()),
+        )
+    }
+
+    #[test]
+    fn a_damage_error_marks_the_data_dir_once_and_others_dont() {
+        let dir = temp_dir("note-error");
+        let store = Store::open(&dir, 0).unwrap();
+        let marker = damage_marker(&dir);
+        store.note_error(&sqlite_error(rusqlite::ffi::SQLITE_BUSY));
+        store.note_error(&std::io::Error::other("disk full"));
+        assert!(!marker.exists(), "only damage marks it");
+
+        store.note_error(&sqlite_error(rusqlite::ffi::SQLITE_CORRUPT));
+        assert!(fs::read_to_string(&marker)
+            .unwrap()
+            .contains("from the test"));
+        fs::remove_file(&marker).unwrap();
+        store.note_error(&sqlite_error(rusqlite::ffi::SQLITE_CORRUPT));
+        assert!(!marker.exists(), "marked once per run");
+
+        // a segment failing its checks counts too
+        let dir = temp_dir("note-error-segment");
+        let store = Store::open(&dir, 0).unwrap();
+        store.note_error(&std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt segment file",
+        ));
+        assert!(damage_marker(&dir).exists());
+
+        // nothing to mark without DATA_DIR
+        Store::open_in_memory()
+            .unwrap()
+            .note_error(&sqlite_error(rusqlite::ffi::SQLITE_CORRUPT));
+    }
+
+    #[test]
+    fn integrity_problems_is_empty_for_a_sound_index_or_none() {
+        let dir = temp_dir("integrity");
+        assert!(integrity_problems(&dir).unwrap().is_empty(), "no index yet");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("bafyA", &page("bafyA", "t", &[("w", 1)]), 1)
+            .unwrap();
+        drop(store);
+        assert!(integrity_problems(&dir).unwrap().is_empty());
     }
 
     fn dir_has_table(dir: &Path, table: &str) -> bool {

@@ -118,7 +118,11 @@ const PURGE_READ_PAUSE: Duration = Duration::from_millis(100);
 const PURGE_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 // a purge scan's read, tried PURGE_READ_TRIES times; None if every try failed
-fn read_retrying<T>(what: &str, read: impl Fn() -> rusqlite::Result<T>) -> Option<T> {
+fn read_retrying<T>(
+    store: &Store,
+    what: &str,
+    read: impl Fn() -> rusqlite::Result<T>,
+) -> Option<T> {
     for attempt in 1..=PURGE_READ_TRIES {
         match read() {
             Ok(rows) => return Some(rows),
@@ -127,6 +131,7 @@ fn read_retrying<T>(what: &str, read: impl Fn() -> rusqlite::Result<T>) -> Optio
                     "Couldn't scan {} for denylisted ones (try {} of {}): {}",
                     what, attempt, PURGE_READ_TRIES, err
                 );
+                store.note_error(&err);
                 if attempt < PURGE_READ_TRIES {
                     std::thread::sleep(PURGE_READ_PAUSE);
                 }
@@ -134,6 +139,45 @@ fn read_retrying<T>(what: &str, read: impl Fn() -> rusqlite::Result<T>) -> Optio
         }
     }
     None
+}
+
+/**
+ * If a store error marked the index as damaged while it ran (#266), checks all of index.sqlite:
+ * erases the index if the check finds damage (open then starts it empty), else keeps it and
+ * drops the marker. Damaged segments needn't be checked here: opening checks every one.
+ */
+fn check_marked_damage(dir: &std::path::Path) -> Result<(), OpenError> {
+    let marker = store::damage_marker(dir);
+    if !marker.exists() {
+        return Ok(());
+    }
+    let reason = std::fs::read_to_string(&marker).unwrap_or_default();
+    warn!(
+        "The index in {} looked damaged when it last ran ({}); checking it",
+        dir.display(),
+        reason.trim()
+    );
+    let start = Instant::now();
+    let problems = match store::integrity_problems(dir) {
+        Ok(problems) => problems,
+        Err(err) if store::is_corrupt(&*err) => vec![err.to_string()],
+        Err(err) => return Err(err),
+    };
+    if problems.is_empty() {
+        info!(
+            "The index checked out ok in {:?}; keeping it",
+            start.elapsed()
+        );
+        std::fs::remove_file(&marker)?;
+    } else {
+        error!(
+            "The index in {} is damaged ({}); erasing it and starting again empty",
+            dir.display(),
+            problems.join("; ")
+        );
+        store::wipe(dir)?;
+    }
+    Ok(())
 }
 
 // skip anything bigger than this rather than pulling it all into memory
@@ -320,6 +364,7 @@ impl IndexQueue {
         if let Some(store) = self.store.get() {
             if let Err(err) = store.flush() {
                 warn!("Couldn't flush the index: {}", err);
+                store.note_error(&err);
             }
         }
     }
@@ -376,7 +421,8 @@ impl IndexQueue {
     /**
      * Opens DATA_DIR's index and attaches it (see attach_store). A damaged index is erased and
      * started again empty, once, rather than refusing to start until someone wipes it by hand:
-     * it's rebuilt by crawling either way.
+     * it's rebuilt by crawling either way. Opening only reads part of index.sqlite, so damage a
+     * store error found while running (marked by Store::note_error, #266) is checked here first.
      */
     pub fn open_store(
         &self,
@@ -388,6 +434,7 @@ impl IndexQueue {
             let store = Store::open(dir, cache_mb)?;
             Ok(self.attach_store(store, max_age_secs)?)
         };
+        check_marked_damage(dir)?;
         match open() {
             Err(err) if store::is_corrupt(&*err) => {
                 error!(
@@ -480,6 +527,7 @@ impl IndexQueue {
                 Ok(batch) => batch,
                 Err(err) => {
                     warn!("Couldn't list pages to recrawl: {}", err);
+                    store.note_error(&err);
                     break;
                 }
             };
@@ -509,6 +557,7 @@ impl IndexQueue {
                 Ok(old) => old,
                 Err(err) => {
                     warn!("Couldn't check for expired pages: {}", err);
+                    store.note_error(&err);
                     break;
                 }
             };
@@ -523,6 +572,7 @@ impl IndexQueue {
                         "Couldn't delete every expired page; the next expiry retries: {}",
                         err
                     );
+                    store.note_error(&err);
                     break;
                 }
             }
@@ -537,9 +587,13 @@ impl IndexQueue {
                     .collect();
                 if let Err(err) = store.erase_ids(&old_versions) {
                     warn!("Couldn't mark expired versions to erase: {}", err);
+                    store.note_error(&err);
                 }
             }
-            Err(err) => warn!("Couldn't check old page versions: {}", err),
+            Err(err) => {
+                warn!("Couldn't check old page versions: {}", err);
+                store.note_error(&err);
+            }
         }
         expired
     }
@@ -568,6 +622,7 @@ impl IndexQueue {
             }
             Err(err) => {
                 warn!("Couldn't persist {}: {}", item, err);
+                self.store().note_error(&err);
                 // its links are still followed
                 true
             }
@@ -590,7 +645,8 @@ impl IndexQueue {
         let (mut removed, mut complete) = (0, true);
         let mut after = 0;
         loop {
-            let Some(batch) = read_retrying("pages", || store.items_after(after, 10_000)) else {
+            let Some(batch) = read_retrying(store, "pages", || store.items_after(after, 10_000))
+            else {
                 complete = false;
                 break;
             };
@@ -605,13 +661,15 @@ impl IndexQueue {
                 Ok(n) => removed += n,
                 Err(err) => {
                     warn!("Couldn't delete {} denylisted pages: {}", hits.len(), err);
+                    store.note_error(&err);
                     complete = false;
                 }
             }
         }
         let mut after = 0;
         loop {
-            let Some(batch) = read_retrying("mirrors", || store.mirror_items_after(after, 10_000))
+            let Some(batch) =
+                read_retrying(store, "mirrors", || store.mirror_items_after(after, 10_000))
             else {
                 complete = false;
                 break;
@@ -625,12 +683,13 @@ impl IndexQueue {
                 .collect();
             if let Err(err) = store.delete(&hits, true) {
                 warn!("Couldn't delete {} denylisted mirrors: {}", hits.len(), err);
+                store.note_error(&err);
                 complete = false;
             }
         }
         // superseded versions whose own item or cid is now blocked, e.g. one that redirected
         // to a cid since taken down (#249)
-        match read_retrying("old page versions", || store.dead_versions()) {
+        match read_retrying(store, "old page versions", || store.dead_versions()) {
             Some(versions) => {
                 let ids: Vec<u64> = versions
                     .into_iter()
@@ -643,6 +702,7 @@ impl IndexQueue {
                         ids.len(),
                         err
                     );
+                    store.note_error(&err);
                     complete = false;
                 }
             }
@@ -702,6 +762,7 @@ impl IndexQueue {
             }
             Err(err) => {
                 warn!("Couldn't queue {} items: {}", items.len(), err);
+                self.store().note_error(&err);
                 0
             }
         }
@@ -729,7 +790,10 @@ impl IndexQueue {
             }
             Ok(false) => {}
             // admitted: a wasted fetch at worst, where dropping it would lose the link
-            Err(err) => warn!("Couldn't check whether {} is indexed: {}", item, err),
+            Err(err) => {
+                warn!("Couldn't check whether {} is indexed: {}", item, err);
+                self.store().note_error(&err);
+            }
         }
         (Enqueued::Queued, Some(item))
     }
@@ -748,6 +812,7 @@ impl IndexQueue {
     pub fn root_counts(&self) -> Vec<(String, usize, usize, String)> {
         let rows = self.store().root_counts().unwrap_or_else(|err| {
             warn!("Couldn't count pages by root: {}", err);
+            self.store().note_error(&err);
             Vec::new()
         });
         rows.into_iter()
@@ -779,6 +844,7 @@ impl IndexQueue {
     pub fn top_keywords(&self, n: usize) -> Vec<(String, u32)> {
         self.store().top_terms(n).unwrap_or_else(|err| {
             warn!("Couldn't read the top keywords: {}", err);
+            self.store().note_error(&err);
             Vec::new()
         })
     }
@@ -797,6 +863,7 @@ impl IndexQueue {
             Ok(dfs) => dfs,
             Err(err) => {
                 warn!("Couldn't search for {:?}: {}", query.terms, err);
+                self.store().note_error(&err);
                 return none;
             }
         };
@@ -814,6 +881,7 @@ impl IndexQueue {
             Ok(found) => found,
             Err(err) => {
                 warn!("Couldn't search for {:?}: {}", query.terms, err);
+                self.store().note_error(&err);
                 return none;
             }
         };
@@ -824,6 +892,7 @@ impl IndexQueue {
             Ok(found) => found,
             Err(err) => {
                 warn!("Couldn't look up search results: {}", err);
+                self.store().note_error(&err);
                 return none;
             }
         };
@@ -857,6 +926,7 @@ impl IndexQueue {
             Ok(None) => return false,
             Err(err) => {
                 warn!("Couldn't take the next queued item: {}", err);
+                self.store().note_error(&err);
                 return false;
             }
         };
@@ -1527,6 +1597,77 @@ mod tests {
         let queue = IndexQueue::new();
         assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "damagedtitle");
+    }
+
+    fn titled_rows(prefix: &str) -> Vec<(String, String)> {
+        (0..400)
+            .map(|i| (format!("{}/p{}", GOOD, i), format!("{}{:0>200}", prefix, i)))
+            .collect()
+    }
+
+    fn seed_titled(dir: &std::path::Path, rows: &[(String, String)]) {
+        let rows: Vec<(&str, &str, i64)> = rows
+            .iter()
+            .map(|(item, title)| (item.as_str(), title.as_str(), now_secs()))
+            .collect();
+        seed(dir, &rows);
+    }
+
+    #[test]
+    fn open_store_wipes_an_index_marked_damaged_when_the_check_fails() {
+        // damage opening doesn't read (an index's b-tree, #266), found by a store error while
+        // running, which left the marker
+        let dir = temp_dir("marked-damaged");
+        seed_titled(&dir, &titled_rows("markedtitle"));
+        let file = dir.join("index.sqlite");
+        let (page_size, root): (usize, usize) = {
+            let conn = rusqlite::Connection::open(&file).unwrap();
+            let size: i64 = conn
+                .query_row("PRAGMA page_size", [], |r| r.get(0))
+                .unwrap();
+            let root: i64 = conn
+                .query_row(
+                    "SELECT rootpage FROM sqlite_master WHERE name = 'pages_indexed_at'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (size as usize, root as usize)
+        };
+        let mut bytes = std::fs::read(&file).unwrap();
+        let at = (root - 1) * page_size;
+        bytes[at..at + page_size].fill(0xAB);
+        std::fs::write(&file, bytes).unwrap();
+        drop(Store::open(&dir, 0).expect("opening doesn't notice"));
+        std::fs::write(
+            store::damage_marker(&dir),
+            "database disk image is malformed",
+        )
+        .unwrap();
+
+        let queue = IndexQueue::new();
+        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_wiped_and_working(&queue, &dir, "markedtitle");
+        assert!(
+            !store::damage_marker(&dir).exists(),
+            "erased with the index"
+        );
+    }
+
+    #[test]
+    fn open_store_keeps_an_index_marked_damaged_that_checks_out() {
+        let dir = temp_dir("marked-ok");
+        seed_titled(&dir, &titled_rows("keptitle"));
+        std::fs::write(
+            store::damage_marker(&dir),
+            "database disk image is malformed",
+        )
+        .unwrap();
+
+        let queue = IndexQueue::new();
+        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (400, 0));
+        assert!(!store::damage_marker(&dir).exists(), "the marker goes");
+        assert_eq!(queue.search("shared", 0, 10).0.n, 400, "and is searched");
     }
 
     #[test]
@@ -2551,6 +2692,7 @@ mod tests {
 
     #[test]
     fn read_retrying_tries_again_then_gives_up() {
+        let store = &Store::open_in_memory().unwrap();
         let tries = std::cell::Cell::new(0);
         let flaky = || {
             tries.set(tries.get() + 1);
@@ -2560,13 +2702,17 @@ mod tests {
                 Ok(tries.get())
             }
         };
-        assert_eq!(read_retrying("pages", flaky), Some(2), "a second try reads");
+        assert_eq!(
+            read_retrying(store, "pages", flaky),
+            Some(2),
+            "a second try reads"
+        );
         tries.set(0);
         let broken = || -> rusqlite::Result<()> {
             tries.set(tries.get() + 1);
             Err(rusqlite::Error::InvalidQuery)
         };
-        assert_eq!(read_retrying("pages", broken), None);
+        assert_eq!(read_retrying(store, "pages", broken), None);
         assert_eq!(tries.get(), PURGE_READ_TRIES);
     }
 
