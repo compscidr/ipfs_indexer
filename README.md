@@ -7,8 +7,8 @@ A search indexer for web pages published on [IPFS](https://ipfs.tech), written i
 - **Crawling:** starts from a seed CID (the IPFS Wikipedia mirror) and follows links to other IPFS pages. Worker threads (10 by default, `CRAWL_WORKERS`) fetch pages through a gateway; the default is the public `ipfs.filebase.io`, which allows about 200 requests a minute, so the indexer limits itself to 100 a minute there (`GATEWAY_REQUESTS_PER_MIN`).
 - **Only HTML is indexed.** Responses with any other content type, or bodies over 2 MB, are skipped without being downloaded. No images, video or other media are fetched or stored.
 - **Indexing:** for each page it keeps the CID/path, title, a 128-character excerpt and keyword counts.
-- **Denylists:** the [badbits](https://badbits.dwebops.pub/) list and an optional local takedown list are checked before anything is queued or fetched, and matching pages are removed from the index.
-- **Persistence (optional):** with `DATA_DIR` set, pages and the crawl queue are kept in SQLite, and the keyword index in segment files beside it; all of it is reloaded at startup.
+- **Denylists:** the [badbits](https://badbits.dwebops.pub/) list and an optional local takedown list are checked before anything is queued or fetched, and matching pages leave search results at once and are erased from disk in the background.
+- **Persistence (optional):** with `DATA_DIR` set, pages and the crawl queue are kept in SQLite, and the keyword index in segment files beside it; none of it is loaded into memory at startup.
 
 ## Running
 ```
@@ -38,17 +38,18 @@ The indexer **exits at startup** if it can't download the badbits list, read a c
 | `GET /enqueue/{cid}` or `/enqueue/{cid}/{path}` | Queues a page: `200` queued, `400` not a valid CID, `403` blocked by a denylist. |
 | `GET /status` | Queue length, index size, mirrors skipped (pages with the same text as one already indexed), keyword count (approximate, like `/keywords`), gateway health and version on one line. |
 | `GET /resources` | `Memory: <bytes> Index file: <bytes> Disk free: <bytes>`: process RSS, the size of the index (`index.sqlite` plus `segments/`) and free space on its filesystem (`-` without `DATA_DIR`). |
+| `GET /roots` | One line per root CID: `cid`, indexed pages, queued items and title, tab-separated, most indexed first. Counted in a `roots` table kept with the pages and queue, not scanned. |
 | `GET /version` | e.g. `0.1.0 (abc1234)`. The commit comes from `GIT_SHA` at build time. |
 | `GET /keywords` | The most common keywords. Approximate: counts include deleted pages until their segments are merged away. |
-| `POST /admin/deny`, `POST /admin/undeny` | Only with `ADMIN_TOKEN` set (otherwise 404); needs `Authorization: Bearer <token>`. The body is one `cid`, `cid/path` or `/ipfs/cid/path`: added to or removed from `LOCAL_DENYLIST` and applied at once. Returns `Blocked; <n> pages removed` or `Unblocked; <n> lines removed`. Badbits is never changed. |
-| `POST /admin/recrawl` | Same token. Queues every indexed page to be fetched again, so their links to pages not indexed yet are followed. Pages stay searchable meanwhile; a restart drops what is left of it. Returns `Queued <n> pages to crawl again`. |
+| `POST /admin/deny`, `POST /admin/undeny` | Only with `ADMIN_TOKEN` set (otherwise 404); needs `Authorization: Bearer <token>`. The body is one `cid`, `cid/path` or `/ipfs/cid/path`: added to or removed from `LOCAL_DENYLIST` and applied at once. Returns `Blocked; removal from disk queued` or `Unblocked; <n> lines removed`. Badbits is never changed. |
+| `POST /admin/recrawl` | Same token. Queues every indexed page to be fetched again, so their links to pages not indexed yet are followed. Pages stay searchable meanwhile; the queue is kept on disk, so a restart carries on with what is left. Returns `Queued <n> pages to crawl again`. |
 
 ## Denylists
 The badbits denylist is downloaded at startup and refreshed daily.
 
 For your own takedowns, set `LOCAL_DENYLIST=/path/to/local.deny`:
 - **Format:** one entry per line, `cid`, `cid/path`, `/ipfs/cid/path` or badbits-style `//<sha256 hex>`. A CID blocks everything under it, and other lines are ignored.
-- **Effect:** the file is re-read every 5 minutes. Listed items are removed from the index and search results, and never fetched or queued again.
+- **Effect:** the file is re-read every 5 minutes. Listed items leave search results at once and are erased from disk in the background, and are never fetched or queued again.
 
 ## Persistence
 Set `DATA_DIR` to keep the index across restarts: pages, mirrors and the crawl queue in `$DATA_DIR/index.sqlite`, the keyword index in `$DATA_DIR/segments/`.
@@ -56,9 +57,9 @@ Set `DATA_DIR` to keep the index across restarts: pages, mirrors and the crawl q
 - **Stored per page:** the CID/path, title, 128-character excerpt, keyword counts and when it was indexed. Nothing else.
 - **The keyword index** (which pages each word is on, and how often) lives on disk, not in memory (#231), in immutable segment files listed by `segments/MANIFEST` (#247). New pages are buffered in memory and written as a new segment every 60 s or 1M keyword entries; a background thread merges small segments into larger ones, up to 1 GiB; segments that size or larger aren't merged further, which bounds how long a merge or a takedown's rewrite takes, at the cost of a few more files per search on a very large index. An `index.sqlite` from before v0.2.6 (keyword index still inside it) isn't converted: the indexer refuses to start and says to wipe it (converting one in place ran out of memory on a 30 GB index and corrupted it).
 - **The crawl queue** (CID/paths waiting to be fetched, no content) is stored too, so a restart resumes the crawl. It lives only on disk, not in memory (#231). An item leaves it when a worker takes it, so a crash loses at most the few items being fetched.
-- **Startup:** both denylists are loaded first. Stored pages that are now denylisted, or older than `INDEX_MAX_AGE_DAYS`, are deleted. Only then are the remaining pages loaded, and the saved queue (minus anything now denylisted or already indexed); then crawling and serving start.
+- **Startup:** both denylists are loaded first. Nothing else is loaded into memory: pages, mirrors and the queue stay in `index.sqlite` (#231). Crawling and serving start at once. Pages blocked or expired while the indexer was down are hidden from search immediately, and a background purge and expiry erase them within minutes.
 - **Takedowns:**
-  - Whenever a denylist refresh removes pages, they leave search results at once. Their rows are deleted from `index.sqlite`, where `secure_delete` overwrites them with zeros.
+  - When a denylist gains entries, pages it blocks leave search results at once (each result is checked against both lists). A background scan of `pages` then deletes their rows from `index.sqlite`, where `secure_delete` overwrites them with zeros. At 100M pages the scan takes a few minutes. A list that's re-read unchanged (the local list every 5 minutes) triggers no scan.
   - Within seconds, every segment file holding the page, or any earlier version of it (a re-crawl gets a new entry), is rewritten without it. The old files are overwritten with zeros, synced and removed (#249). Expired pages and expired old versions are erased the same way.
   - The rollback journal is kept in memory, so plaintext copies of pages are never written to a separate journal file. Large deletes and queue changes (expiry, purges, `/admin/recrawl`) commit 1000 items at a time, so that journal stays small.
   - Erasure at the filesystem or SSD level (old blocks, wear levelling, copy-on-write filesystems such as btrfs or ZFS keeping the old blocks) is outside what the indexer can guarantee, for both `index.sqlite` and the segment files. Use full-disk encryption on the data volume for that.
