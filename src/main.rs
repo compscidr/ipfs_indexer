@@ -184,6 +184,16 @@ fn crawl_workers(value: Option<String>) -> Result<usize, String> {
     }
 }
 
+/// Drops pages past the max age, then re-seeds: at startup and daily after the denylist refresh
+fn expire_and_reseed(queue: &IndexQueue, max_age_secs: i64) {
+    let expired = queue.expire(max_age_secs);
+    if expired > 0 {
+        info!("Expired {} pages older than the max age", expired);
+    }
+    // expired pages aren't known any more, so the crawl from the seed reaches them again
+    queue.reseed();
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     //uncomment to enable hardcoded logging
@@ -340,14 +350,10 @@ async fn main() -> std::io::Result<()> {
             error!("Denylist purge panicked; carrying on");
         }
     });
-    // pages that expired while the indexer was down; the refresh thread does it daily after
+    // pages that expired while the indexer was down, then a reseed in case the seed was one;
+    // the refresh thread does the same daily
     let expire_queue = Arc::clone(&index_queue);
-    std::thread::spawn(move || {
-        let expired = expire_queue.expire(max_age_secs);
-        if expired > 0 {
-            info!("Expired {} pages older than the max age", expired);
-        }
-    });
+    std::thread::spawn(move || expire_and_reseed(&expire_queue, max_age_secs));
 
     let refresh_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
@@ -359,12 +365,7 @@ async fn main() -> std::io::Result<()> {
             }
             Err(err) => warn!("Couldn't refresh denylist, keeping the old one: {}", err),
         }
-        let expired = refresh_queue.expire(max_age_secs);
-        if expired > 0 {
-            info!("Expired {} pages older than the max age", expired);
-        }
-        // expired pages aren't known any more, so the crawl from the seed reaches them again
-        refresh_queue.reseed();
+        expire_and_reseed(&refresh_queue, max_age_secs);
     });
 
     if let Some(path) = local_denylist {
