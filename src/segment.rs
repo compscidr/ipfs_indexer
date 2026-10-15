@@ -406,8 +406,6 @@ impl Segment {
     }
 
     /// The format version it was written in
-    // used by search (#248), wired in by a later commit
-    #[allow(dead_code)]
     pub fn version(&self) -> u8 {
         self.version
     }
