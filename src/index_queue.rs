@@ -568,8 +568,9 @@ impl IndexQueue {
      * Deletes and erases (#249) every stored page, mirror and superseded version a denylist
      * blocks now, scanning `pages` in batches on the store's scan connection (#231). No lock is
      * held across batches: pages written meanwhile were checked against the lists already. A
-     * batch that fails to read is tried again a few times; if it still fails, or a delete
-     * fails, the rest of the round goes on and false is returned, for another round later.
+     * read (a batch, or the old versions) that fails is tried again a few times; if it still
+     * fails, or a delete or erase mark fails, the rest of the round goes on and false is
+     * returned, for another round later.
      */
     pub fn purge_blocked(&self) -> bool {
         let Some(store) = self.store.get() else {
@@ -619,8 +620,8 @@ impl IndexQueue {
         }
         // superseded versions whose own item or cid is now blocked, e.g. one that redirected
         // to a cid since taken down (#249)
-        match store.dead_versions() {
-            Ok(versions) => {
+        match read_retrying("old page versions", || store.dead_versions()) {
+            Some(versions) => {
                 let ids: Vec<u64> = versions
                     .into_iter()
                     .filter(|(_, item, cid, _)| blocked(item) || blocked(cid))
@@ -632,9 +633,10 @@ impl IndexQueue {
                         ids.len(),
                         err
                     );
+                    complete = false;
                 }
             }
-            Err(err) => warn!("Couldn't check old page versions: {}", err),
+            None => complete = false,
         }
         if removed > 0 {
             info!("Purged {} denylisted pages", removed);
@@ -2522,6 +2524,24 @@ mod tests {
         assert!(
             *queue.purge_due.lock().unwrap(),
             "another round is due rather than the takedown being dropped"
+        );
+    }
+
+    #[test]
+    fn a_purge_whose_old_versions_fail_to_read_queues_another_round() {
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .unwrap();
+        queue.purge_for_test(); // the one attach_store queued
+        queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
+        // pages and mirrors scan fine (nothing to delete); dead versions can't be read
+        queue.store.get().unwrap().drop_table_for_test("dead_pages");
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        queue.purge_for_test();
+        assert!(
+            *queue.purge_due.lock().unwrap(),
+            "another round is due for the versions it couldn't check"
         );
     }
 
