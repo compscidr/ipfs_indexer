@@ -10,6 +10,7 @@ pub const BADBITS_URL: &str = "https://badbits.dwebops.pub/badbits.deny";
  * "<cidv1 base32>/<path>", so the list never contains the CIDs themselves.
  * https://specs.ipfs.tech/compact-denylist-format/
  */
+#[derive(Clone)]
 pub struct Denylist {
     hashes: HashSet<[u8; 32]>,
 }
@@ -53,6 +54,12 @@ impl Denylist {
 
     pub fn len(&self) -> usize {
         self.hashes.len()
+    }
+
+    /// Whether this list has an entry `old` doesn't: only then can it block a stored page
+    /// that wasn't blocked before
+    pub fn adds_to(&self, old: &Denylist) -> bool {
+        self.hashes.iter().any(|hash| !old.hashes.contains(hash))
     }
 
     /**
@@ -232,5 +239,14 @@ mod tests {
     fn unparseable_cid_is_blocked() {
         assert!(Denylist::empty().is_blocked("notacid/wiki"));
         assert!(!Denylist::empty().is_blocked(OTHER));
+    }
+
+    #[test]
+    fn adds_to_is_true_only_for_new_entries() {
+        let old = Denylist::parse(&format!("{}\n", V1));
+        assert!(!old.adds_to(&old));
+        assert!(!Denylist::empty().adds_to(&old), "removals add nothing");
+        let more = Denylist::parse(&format!("{}\n{}/x\n", V1, V1));
+        assert!(more.adds_to(&old));
     }
 }

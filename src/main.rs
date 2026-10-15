@@ -184,6 +184,16 @@ fn crawl_workers(value: Option<String>) -> Result<usize, String> {
     }
 }
 
+/// Drops pages past the max age, then re-seeds: at startup and daily after the denylist refresh
+fn expire_and_reseed(queue: &IndexQueue, max_age_secs: i64) {
+    let expired = queue.expire(max_age_secs);
+    if expired > 0 {
+        info!("Expired {} pages older than the max age", expired);
+    }
+    // expired pages aren't known any more, so the crawl from the seed reaches them again
+    queue.reseed();
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     //uncomment to enable hardcoded logging
@@ -246,7 +256,7 @@ async fn main() -> std::io::Result<()> {
     // optional hand-maintained takedown list (plain CIDs / cid/path lines). Loaded once now, so
     // the store's startup check below sees it, then re-read every 5 min.
     let local_denylist = std::env::var("LOCAL_DENYLIST").ok();
-    // fail closed like badbits: starting without the takedown list would load and serve
+    // fail closed like badbits: starting without the takedown list would serve
     // stored pages that are on it
     if let Some(path) = &local_denylist {
         match Denylist::load_file(path) {
@@ -279,8 +289,8 @@ async fn main() -> std::io::Result<()> {
         }
     );
 
-    // the persisted index (#106): only pages that aren't denylisted or expired are loaded, and
-    // nothing is crawled or served until that's done. A configured but unusable DATA_DIR is fatal.
+    // the persisted index (#106): nothing is loaded from it (#231); blocked and expired pages
+    // are erased by the purge and expiry threads below. A configured but unusable DATA_DIR is fatal.
     let max_age_secs = std::env::var("INDEX_MAX_AGE_DAYS")
         .ok()
         .and_then(|d| d.parse::<i64>().ok())
@@ -300,9 +310,9 @@ async fn main() -> std::io::Result<()> {
         info!("Index cache: at most {} MB in memory", cache_mb);
         let attached = index_queue.open_store(std::path::Path::new(&dir), cache_mb, max_age_secs);
         match attached {
-            Ok((loaded, blocked, expired)) => info!(
-                "Loaded {} pages from {}/index.sqlite (dropped {} blocked, {} expired)",
-                loaded, dir, blocked, expired
+            Ok((pages, queued)) => info!(
+                "Opened {}/index.sqlite: {} pages, {} queued",
+                dir, pages, queued
             ),
             Err(err) => {
                 error!("Couldn't use DATA_DIR {}: {}", dir, err);
@@ -331,6 +341,19 @@ async fn main() -> std::io::Result<()> {
             error!("Index merge panicked; carrying on");
         }
     });
+    // erases pages a denylist change blocks (#231): search hides them at once, this takes them
+    // off disk; started after attach_store, which queues one full purge
+    let purge_queue = Arc::clone(&index_queue);
+    std::thread::spawn(move || loop {
+        let round = std::panic::catch_unwind(AssertUnwindSafe(|| purge_queue.run_purges()));
+        if round.is_err() {
+            error!("Denylist purge panicked; carrying on");
+        }
+    });
+    // pages that expired while the indexer was down, then a reseed in case the seed was one;
+    // the refresh thread does the same daily
+    let expire_queue = Arc::clone(&index_queue);
+    std::thread::spawn(move || expire_and_reseed(&expire_queue, max_age_secs));
 
     let refresh_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
@@ -342,12 +365,7 @@ async fn main() -> std::io::Result<()> {
             }
             Err(err) => warn!("Couldn't refresh denylist, keeping the old one: {}", err),
         }
-        let expired = refresh_queue.expire(max_age_secs);
-        if expired > 0 {
-            info!("Expired {} pages older than the max age", expired);
-        }
-        // expired pages aren't in the map any more, so the crawl from the seed reaches them again
-        refresh_queue.reseed();
+        expire_and_reseed(&refresh_queue, max_age_secs);
     });
 
     if let Some(path) = local_denylist {
@@ -585,7 +603,14 @@ mod tests {
     #[actix_web::test]
     async fn test_search_limit_and_bad_params() {
         let index_queue = web::Data::new(IndexQueue::new());
-        for item in ["bafyA", "bafyB", "bafyC"] {
+        // real CIDs: search serves no other (#231)
+        let cid = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
+        for item in [
+            format!("{}/A", cid),
+            format!("{}/B", cid),
+            format!("{}/C", cid),
+        ] {
+            let item = item.as_str();
             let counts = HashMap::from([("word".to_string(), 1)]);
             index_queue.index_for_test(
                 item,
