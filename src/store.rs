@@ -621,12 +621,13 @@ impl Store {
         self.queued.load(Ordering::Relaxed)
     }
 
-    /// Indexed and queued counts per root CID with the root page's title ("" if it isn't
-    /// indexed), most indexed first (#232); from `roots`, no scan (#231)
-    pub fn root_counts(&self) -> rusqlite::Result<Vec<(String, usize, usize, String)>> {
+    /// Indexed and queued counts per root CID with the root page's title and cid ("" if it
+    /// isn't indexed), most indexed first (#232); from `roots`, no scan (#231)
+    pub fn root_counts(&self) -> rusqlite::Result<Vec<(String, usize, usize, String, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare_cached(
-            "SELECT roots.root, roots.pages, roots.queued, coalesce(pages.title, '')
+            "SELECT roots.root, roots.pages, roots.queued, coalesce(pages.title, ''),
+                    coalesce(pages.cid, '')
              FROM roots LEFT JOIN pages ON pages.item = roots.root
              ORDER BY roots.pages DESC, roots.queued DESC, roots.root",
         )?;
@@ -636,6 +637,7 @@ impl Store {
                 r.get::<_, i64>(1)? as usize,
                 r.get::<_, i64>(2)? as usize,
                 r.get(3)?,
+                r.get(4)?,
             ))
         })?;
         rows.collect()
@@ -1855,7 +1857,7 @@ pub(crate) mod tests {
             .root_counts()
             .unwrap()
             .into_iter()
-            .map(|(root, pages, queued, _)| (root, pages, queued))
+            .map(|(root, pages, queued, ..)| (root, pages, queued))
             .collect();
         rows.sort();
         rows
@@ -1889,7 +1891,7 @@ pub(crate) mod tests {
         assert_eq!(roots_table(&store), roots_by_scan(&store));
         assert_eq!(
             store.root_counts().unwrap()[0],
-            ("a".to_string(), 2, 1, "A root".to_string())
+            ("a".to_string(), 2, 1, "A root".to_string(), "a".to_string())
         );
         assert_eq!(store.mirror_count(), 0);
         drop(store);

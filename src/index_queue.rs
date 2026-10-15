@@ -700,12 +700,25 @@ impl IndexQueue {
     }
 
     /// Indexed and queued counts per root CID (the first segment of "cid/path"), with the root
-    /// page's title if it's indexed, most indexed first (#232)
+    /// page's title if it's indexed, most indexed first (#232). Roots a denylist blocks are left
+    /// out, and a blocked root page's title blanked, even before the purge erases them (#231).
     pub fn root_counts(&self) -> Vec<(String, usize, usize, String)> {
-        self.store().root_counts().unwrap_or_else(|err| {
+        let rows = self.store().root_counts().unwrap_or_else(|err| {
             warn!("Couldn't count pages by root: {}", err);
             Vec::new()
-        })
+        });
+        rows.into_iter()
+            .filter(|(root, ..)| !self.blocked_quietly(root))
+            .map(|(root, pages, queued, title, cid)| {
+                // the root page may have redirected to a cid since taken down
+                let title = if cid.is_empty() || !self.blocked_quietly(&cid) {
+                    title
+                } else {
+                    String::new()
+                };
+                (root, pages, queued, title)
+            })
+            .collect()
     }
 
     /// how many crawled items weren't indexed, being the same text as an indexed page (#253)
@@ -1063,19 +1076,45 @@ mod tests {
 
     #[test]
     fn root_counts_group_items_by_their_root_cid() {
+        // real CIDs: a root that isn't one counts as blocked
+        let (wiki, other, lone) = (GOOD, BAD, QM);
         let queue = IndexQueue::new();
-        for item in ["wiki", "wiki/wiki/A", "wiki/wiki/B", "other/x"] {
-            queue.index_for_test(item, &page(item, item, &[]));
+        for item in [
+            wiki.to_string(),
+            format!("{}/wiki/A", wiki),
+            format!("{}/wiki/B", wiki),
+            format!("{}/x", other),
+        ] {
+            queue.index_for_test(&item, &page(&item, "t", &[]));
         }
-        queue.push_queued(vec!["wiki/wiki/C".to_string(), "lone/y".to_string()]);
+        queue.push_queued(vec![format!("{}/wiki/C", wiki), format!("{}/y", lone)]);
         assert_eq!(
             queue.root_counts(),
             vec![
-                ("wiki".to_string(), 3, 1, "wiki".to_string()),
-                ("other".to_string(), 1, 0, String::new()),
-                ("lone".to_string(), 0, 1, String::new()),
+                (wiki.to_string(), 3, 1, "t".to_string()),
+                (other.to_string(), 1, 0, String::new()),
+                (lone.to_string(), 0, 1, String::new()),
             ]
         );
+    }
+
+    #[test]
+    fn root_counts_hide_a_takedown_before_the_purge() {
+        let queue = IndexQueue::new();
+        queue
+            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .unwrap();
+        queue.purge_for_test(); // the one attach_store queued
+        queue.persist(BAD, &page(BAD, "secret title", &[]));
+        queue.persist(GOOD, &page(QM, "redirected title", &[]));
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n{}\n", BAD, QM)));
+        assert_eq!(
+            queue.root_counts(),
+            vec![(GOOD.to_string(), 1, 0, String::new())],
+            "a blocked root is gone and a blocked root page's title is blank, before the purge"
+        );
+        queue.purge_for_test();
+        assert_eq!(queue.root_counts(), Vec::new());
     }
 
     #[test]
@@ -1243,6 +1282,7 @@ mod tests {
     const DAY: i64 = 24 * 60 * 60;
     const GOOD: &str = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
     const BAD: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+    const QM: &str = "QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR";
 
     use crate::store::tests::dir_has;
 
