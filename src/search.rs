@@ -24,11 +24,12 @@ const SAMPLE: u64 = 1024;
 // a region is skipped only if its bound is below the K-th score by more than rounding explains
 const SLACK: f64 = 1e-9;
 
-// candidates the walk drew and pages it fully scored on this thread, so tests can see what
-// MaxScore skipped (#271)
+// candidates the walk drew, page-length lookups it made and pages it fully scored on this
+// thread, so tests can see what MaxScore skipped (#271)
 #[cfg(test)]
 thread_local! {
     static CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SCORED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -433,8 +434,10 @@ fn passive_terms(ceilings: &[f64], rest: f64, threshold: f64) -> usize {
  * Offers one segment's matches to `top` (#248, #271). Regions of blocks whose bound can't make
  * it are skipped by their headers. In the lead group, terms whose ceilings can't make it even
  * with every other group at its ceiling go passive: candidates come only from the rest. Each
- * candidate is dropped at the first upper bound below the K-th score: its counts alone, then
- * its lead weights, then each other group's weight in turn; only what's left is fully scored.
+ * candidate is dropped at the first upper bound below the K-th score: its lead counts alone,
+ * then each other group's counts in turn (after the leapfrog), then its exact weights once its
+ * length is looked up; only what's left is fully scored. A region's end and bound are kept
+ * until the walk passes it.
  */
 fn walk(
     segment: &Segment,
@@ -467,25 +470,38 @@ fn walk(
         .first()
         .map_or(0.0, |&g| groups[g].ceiling(scorer) + beyond[0]);
     let mut target = 0u64;
+    // the current region: its last id and bound, valid while target is at or before it
+    let mut region: Option<(u64, f64)> = None;
     loop {
+        let threshold = top.threshold();
         // θ only rises, so terms only go passive
-        let passive = passive_terms(&ceilings, rest, top.threshold()).max(groups[lead].passive);
+        let passive = passive_terms(&ceilings, rest, threshold).max(groups[lead].passive);
         if passive == ceilings.len() {
             // no page left here can make the top K
             return Ok(());
         }
-        groups[lead].passive = passive;
-        let passive_ceiling: f64 = ceilings[..passive].iter().sum();
-        for group in groups.iter_mut() {
-            group.seek_block(target)?;
-            if group.done() {
-                return Ok(());
-            }
+        if passive != groups[lead].passive {
+            groups[lead].passive = passive;
+            region = None;
         }
-        // ids from target to end are each in their cursors' current blocks, if anywhere
-        let end = groups.iter().filter_map(Group::block_end).min().unwrap();
-        let bound = passive_ceiling + groups.iter().map(|g| g.bound(scorer)).sum::<f64>();
-        if below(bound, top.threshold()) {
+        let passive_ceiling: f64 = ceilings[..passive].iter().sum();
+        let (end, bound) = match region {
+            Some((end, bound)) if target <= end => (end, bound),
+            _ => {
+                for group in groups.iter_mut() {
+                    group.seek_block(target)?;
+                    if group.done() {
+                        return Ok(());
+                    }
+                }
+                // ids from target to end are each in their cursors' current blocks, if anywhere
+                let end = groups.iter().filter_map(Group::block_end).min().unwrap();
+                let bound = passive_ceiling + groups.iter().map(|g| g.bound(scorer)).sum::<f64>();
+                region = Some((end, bound));
+                (end, bound)
+            }
+        };
+        if below(bound, threshold) {
             // a garbled last id of u64::MAX would wrap back to 0 and loop
             let Some(after) = end.checked_add(1) else {
                 return Ok(());
@@ -507,15 +523,9 @@ fn walk(
             if view.is_dead(candidate) {
                 break 'consider;
             }
-            let threshold = top.threshold();
             // its counts alone, at the shortest length their blocks allow
-            let counts = groups[lead].count_bound(scorer, candidate)?;
+            let mut counts = groups[lead].count_bound(scorer, candidate)?;
             if below(counts + passive_ceiling + rest, threshold) {
-                break 'consider;
-            }
-            let length = segment.length(candidate).unwrap_or(0);
-            let mut exact = groups[lead].weight(scorer, candidate, length)?;
-            if below(exact + passive_ceiling + rest, threshold) {
                 break 'consider;
             }
             for (i, &g) in others.iter().enumerate() {
@@ -527,10 +537,20 @@ fn walk(
                     }
                     Some(_) => {}
                 }
-                exact += groups[g].weight(scorer, candidate, length)?;
-                if below(exact + passive_ceiling + beyond[i], threshold) {
+                counts += groups[g].count_bound(scorer, candidate)?;
+                if below(counts + passive_ceiling + beyond[i], threshold) {
                     break 'consider;
                 }
+            }
+            let length = segment.length(candidate).unwrap_or(0);
+            #[cfg(test)]
+            LOOKUPS.with(|l| l.set(l.get() + 1));
+            let mut exact = 0.0;
+            for group in groups.iter_mut() {
+                exact += group.weight(scorer, candidate, length)?;
+            }
+            if below(exact + passive_ceiling, threshold) {
+                break 'consider;
             }
             groups[lead].seek_passive(candidate)?;
             #[cfg(test)]
@@ -1167,6 +1187,25 @@ mod tests {
         assert_eq!(found, (1..=10).collect::<Vec<u64>>());
         assert_eq!(found, exhaustive(&view, &query, &scorer, 10));
         assert!(scored < 640, "fully scored {} of 6,400 matches", scored);
+    }
+
+    #[test]
+    fn a_page_another_group_lacks_costs_no_length_lookup() {
+        let segments = Segments::open(&temp_dir("search-maxscore-lookups")).unwrap();
+        // alpha on even pages, beta on odd ones: no page has both
+        for id in 1..=2000u64 {
+            let word = if id % 2 == 0 { "alpha" } else { "beta" };
+            segments.add(id, 100, &words(&[(word, 1)]));
+        }
+        segments.flush().unwrap();
+        let query = Query::new(&groups(&[&["alpha"], &["beta"]]));
+        let view = segments.view(&["alpha", "beta"]);
+        let scorer = Scorer::new(2000, 100.0, &dfs(&view, &query).unwrap());
+        let mut top = TopK::new(10);
+        let before = LOOKUPS.with(|l| l.get());
+        walk(&view.segments[0], &query, &scorer, &view, &mut top).unwrap();
+        assert_eq!(LOOKUPS.with(|l| l.get()) - before, 0);
+        assert!(top.ranked().is_empty());
     }
 
     #[test]
