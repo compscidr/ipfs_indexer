@@ -787,6 +787,26 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    /**
+     * The most `weight` comes to for a posting in the current block with `count`, given a weight
+     * that grows with count and falls with page length (#271): its weight at the shortest length
+     * over every impact whose count reaches `count`. It no longer relies on the impacts being
+     * sorted, so a garbled header can't make it fall below a weight. Infinite if no impact
+     * reaches it, so nothing is skipped on it; 0 once done.
+     */
+    pub fn count_bound(&self, count: u32, weight: impl Fn(u32, u32) -> f64) -> f64 {
+        self.block.as_ref().map_or(0.0, |b| {
+            match (b.impacts.pairs().iter())
+                .filter(|&&(c, _)| c >= count)
+                .map(|&(_, length)| length)
+                .min()
+            {
+                Some(length) => weight(count, length),
+                None => f64::INFINITY,
+            }
+        })
+    }
+
     /// The current block's (count, page length) impacts; none once done
     #[cfg(test)]
     pub fn block_impacts(&self) -> Option<Vec<(u32, u32)>> {
@@ -1040,6 +1060,16 @@ mod tests {
                         impacts,
                         version
                     );
+                    // grows with count, falls with length
+                    let weight = |c: u32, l: u32| c as f64 / (c as f64 + 1.0 + l as f64 / 50.0);
+                    assert!(
+                        cursor.count_bound(count, weight) >= weight(count, length),
+                        "{} ({}, {}) over its count bound v{}",
+                        id,
+                        count,
+                        length,
+                        version
+                    );
                     if blocks.last().map(|b| b.0) != Some(last) {
                         blocks.push((last, impacts, Vec::new()));
                     }
@@ -1081,6 +1111,23 @@ mod tests {
                 assert!(cursor.current().unwrap().is_some());
             }
         }
+    }
+
+    #[test]
+    fn a_posting_whose_page_has_no_length_is_under_its_count_bound() {
+        let path = temp_dir("segment-orphan").join("1.seg");
+        let mut writer = SegmentWriter::create(&path).unwrap();
+        writer.add_doc(1, 300).unwrap();
+        writer.add_doc(3, 300).unwrap();
+        // page 2 was never added: its posting counts as length 0
+        writer.add_term(b"word", &[(1, 2), (2, 2), (3, 2)]).unwrap();
+        writer.finish().unwrap();
+        let segment = Segment::open(&path).unwrap();
+        assert_eq!(segment.length(2), None);
+        let cursor = segment.cursor(b"word").unwrap().unwrap();
+        let weight = |c: u32, l: u32| c as f64 / (c as f64 + 1.0 + l as f64 / 50.0);
+        assert_eq!(cursor.count_bound(2, weight), weight(2, 0));
+        assert_eq!(cursor.count_bound(1, weight), weight(1, 0));
     }
 
     #[test]
