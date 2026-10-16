@@ -850,14 +850,27 @@ mod tests {
     fn search_returns_exactly_what_an_exhaustive_search_ranks_first() {
         let (segments, pages) = corpus("search-equal");
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        // shapes MaxScore treats differently (#271): t0 is on every page, t29 on few
+        let mut queries: Vec<Vec<Vec<String>>> = vec![
+            groups(&[&["t0", "t25"]]),
+            groups(&[&["t1", "t29"]]),
+            groups(&[&["t0"], &["t1"]]),
+            groups(&[&["t0", "t1"], &["t2"]]),
+            groups(&[&["t2", "t20"], &["t0"]]),
+            groups(&[&["t0", "t1", "t28"], &["t1"]]),
+        ];
         for _ in 0..300 {
-            let query: Vec<Vec<String>> = (0..1 + rng.below(3))
-                .map(|_| {
-                    (0..1 + rng.below(2))
-                        .map(|_| format!("t{}", rng.below(VOCAB)))
-                        .collect()
-                })
-                .collect();
+            queries.push(
+                (0..1 + rng.below(3))
+                    .map(|_| {
+                        (0..1 + rng.below(2))
+                            .map(|_| format!("t{}", rng.below(VOCAB)))
+                            .collect()
+                    })
+                    .collect(),
+            );
+        }
+        for query in queries {
             let parsed = Query::new(&query);
             let view = segments.view(&terms(&parsed));
             let scorer = Scorer::new(pages, 120.0, &dfs(&view, &parsed).unwrap());
