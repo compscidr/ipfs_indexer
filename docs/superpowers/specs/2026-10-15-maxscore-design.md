@@ -1,6 +1,6 @@
 # MaxScore for OR queries and pairs of very frequent words (#271): design
 
-**Status:** draft · **Date:** 2026-10-15
+**Status:** implemented (v0.4.4) · **Date:** 2026-10-15
 
 ## Goal
 
@@ -29,7 +29,7 @@ Profiling at 1M pages shows why. Nearly every candidate is fully scored, because
 3. **`w3 w5`** faster than v0.4.3 at 10M. It stays linear in the index size. Score-ordered postings that would fix this are #282.
 4. **No regressions.** The other #248 queries and a rare pair are no more than 10% slower.
 
-The first targets were under 50 ms for `half OR tenth` and 3× for `w3 w5`. Measurement showed that scoring falls to about a thousand pages, but the walk still steps through every posting of the lead term, so both stay linear in its df. With the region bound kept per region and the length lookup after the leapfrog, 10M pages measured: `half OR tenth` 215 → 62 ms, `w3 w5` 370 → 262 ms, rare pair 0.8 → 0.8 ms (the user chose to ship this and leave the rest to #282).
+The first targets were under 50 ms for `half OR tenth` and 3× for `w3 w5`. Measurement showed that scoring falls to about a thousand pages, but the walk still steps through every posting of the lead term, so both stay linear in its df. With the region bound kept per region and the length lookup after the leapfrog, 10M pages measured: `half OR tenth` 215 → 51.5 ms, `w3 w5` 370 → 232 ms, rare pair 0.8 → 0.8 ms, `common` 13.9 → 9.7 ms (the user chose to ship this and leave the rest to #282).
 
 ## Decisions (agreed)
 
@@ -49,7 +49,7 @@ The first targets were under 50 ms for `half OR tenth` and 3× for `w3 w5`. Meas
 The walk keeps its shape: cursors only move forward, the lead group supplies candidates, the other groups are seeked to them (leapfrog), and the region skip uses block bounds. What changes is which lead terms supply candidates, and how much work a candidate gets before it's dropped.
 
 1. **Lead group:** the group with the smallest df in this segment, as now. **R** is the sum of the other groups' ceilings.
-2. **Essential terms.** Sort the lead group's terms by ceiling, ascending. The longest prefix whose ceilings sum, plus R, is below θ is **non-essential**: no page can make the top K from those terms alone. The rest are **essential**.
+2. **Essential terms.** Sort the lead group's terms by ceiling, ascending. The longest prefix whose ceilings sum, plus R, is below θ is **non-essential**: no page can make the top K from those terms alone. The rest are **essential**. (The code calls them active and passive.)
    - Candidates come only from the essential terms' cursors.
    - The split is recomputed whenever θ rises (the prefix only grows).
    - If every lead term becomes non-essential, no remaining page in the segment can make the top K, and the walk of that segment ends.

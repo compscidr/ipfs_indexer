@@ -789,15 +789,19 @@ impl<'a> Cursor<'a> {
 
     /**
      * The most `weight` comes to for a posting in the current block with `count`, given a weight
-     * that grows with count and falls with page length (#271): its weight at the length of the
-     * first impact whose count reaches `count`. Impacts ascend in both, so that's the shortest
-     * page any impact covering the posting allows. Infinite if no impact reaches it (a garbled
-     * header), so nothing is skipped on it; 0 once done.
+     * that grows with count and falls with page length (#271): its weight at the shortest length
+     * over every impact whose count reaches `count`. It no longer relies on the impacts being
+     * sorted, so a garbled header can't make it fall below a weight. Infinite if no impact
+     * reaches it, so nothing is skipped on it; 0 once done.
      */
     pub fn count_bound(&self, count: u32, weight: impl Fn(u32, u32) -> f64) -> f64 {
         self.block.as_ref().map_or(0.0, |b| {
-            match b.impacts.pairs().iter().find(|&&(c, _)| c >= count) {
-                Some(&(_, length)) => weight(count, length),
+            match (b.impacts.pairs().iter())
+                .filter(|&&(c, _)| c >= count)
+                .map(|&(_, length)| length)
+                .min()
+            {
+                Some(length) => weight(count, length),
                 None => f64::INFINITY,
             }
         })

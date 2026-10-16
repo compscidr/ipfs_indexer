@@ -474,7 +474,7 @@ fn walk(
     let mut region: Option<(u64, f64)> = None;
     loop {
         let threshold = top.threshold();
-        // θ only rises, so terms only go passive
+        // the K-th score only rises, so terms only go passive
         let passive = passive_terms(&ceilings, rest, threshold).max(groups[lead].passive);
         if passive == ceilings.len() {
             // no page left here can make the top K
