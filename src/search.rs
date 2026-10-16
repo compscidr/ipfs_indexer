@@ -109,6 +109,11 @@ impl Scorer {
         let norm = K1 * (1.0 - B + B * length as f64 / self.average);
         self.idf[term] * count * (K1 + 1.0) / (count + norm)
     }
+
+    /// The most a term can weigh on any page: its weight approaches this as count grows (#271)
+    pub fn ceiling(&self, term: usize) -> f64 {
+        self.idf[term] * (K1 + 1.0)
+    }
 }
 
 /// Each query term's df: its pages in every live segment (dead ones until merged out) and the
@@ -577,6 +582,33 @@ mod tests {
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             self.0 % n
+        }
+    }
+
+    #[test]
+    fn no_weight_exceeds_its_terms_ceiling() {
+        // the last df is above the page count, so it's capped
+        let scorer = Scorer::new(1000, 120.0, &[1, 500, 1000, 5000]);
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        for t in 0..4 {
+            let mut pairs: Vec<(u32, u32)> = Vec::new();
+            for count in [1, 2, 7, 1000, u32::MAX] {
+                for length in [0, 1, 120, 100_000, u32::MAX] {
+                    pairs.push((count, length));
+                }
+            }
+            for _ in 0..1000 {
+                pairs.push((1 + rng.below(1000) as u32, rng.below(10_000) as u32));
+            }
+            for (count, length) in pairs {
+                assert!(
+                    scorer.weight(t, count, length) <= scorer.ceiling(t),
+                    "term {} count {} length {}",
+                    t,
+                    count,
+                    length
+                );
+            }
         }
     }
 
