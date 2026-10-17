@@ -10,6 +10,7 @@ use log::{debug, error, info, warn};
 use simple_logger::SimpleLogger;
 
 use crate::denylist::Denylist;
+use crate::entry::Entry;
 use crate::index_queue::{Enqueued, IndexQueue};
 
 mod admin;
@@ -44,12 +45,13 @@ struct Gateway(String);
 #[get("/status")]
 async fn status(queue: web::Data<IndexQueue>, gateway: web::Data<Gateway>) -> HttpResponse {
     HttpResponse::Ok().body(format!(
-        "Queue length: {} Index size: {} Mirrors skipped: {} Number of Keywords: {} Indexed per minute: {} Gateway: {} ({}) Version: {}",
+        "Queue length: {} Index size: {} Mirrors skipped: {} Number of Keywords: {} Indexed per minute: {} Discovered: {} Gateway: {} ({}) Version: {}",
         queue.queue_length(),
         queue.index_length(),
         queue.mirror_length(),
         queue.keyword_length(),
         queue.indexed_per_minute(),
+        queue.discovered_count(),
         gateway.0,
         queue.gateway_health(),
         version()
@@ -133,19 +135,50 @@ async fn roots(queue: web::Data<IndexQueue>) -> HttpResponse {
     HttpResponse::Ok().body(lines.join("\n"))
 }
 
-// {item:.*} so "cid/path" submissions match too
+// {item:.*} so "cid/path" submissions match too. A name (a DNSLink domain, a .eth name or an
+// IPNS key) is recorded for the resolver, which queues its root (#213); the rest is a CID as before.
 #[get("/enqueue/{item:.*}")]
 async fn enqueue(data: web::Data<IndexQueue>, item: web::Path<String>) -> HttpResponse {
     let item = item.into_inner();
+    if let Some(Entry::Name(name)) = entry::parse(&item) {
+        return match data.discover(&name, "submitted") {
+            Ok(true) => HttpResponse::Ok().body(format!("Queued {} to resolve", name)),
+            Ok(false) => HttpResponse::Ok().body(format!("Already known: {}", name)),
+            Err(err) => HttpResponse::InternalServerError()
+                .body(format!("Couldn't record {}: {}", name, err)),
+        };
+    }
     match data.enqueue(item.clone()) {
         Enqueued::Queued => HttpResponse::Ok().body(format!("Enqueued {}", item)),
         Enqueued::InvalidCid => {
-            HttpResponse::BadRequest().body(format!("Not a valid CID: {}", item))
+            HttpResponse::BadRequest().body(format!("Not a valid CID or name: {}", item))
         }
         Enqueued::Blocked => {
             HttpResponse::Forbidden().body(format!("Blocked by denylist: {}", item))
         }
     }
+}
+
+/// One line per discovered entry (#213): entry, source, root, last checked (unix time) and the
+/// last error, tab-separated ("-" for none), most recently checked first
+#[get("/discovered")]
+async fn discovered(queue: web::Data<IndexQueue>) -> HttpResponse {
+    let dash = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
+    let lines: Vec<String> = queue
+        .discovered()
+        .into_iter()
+        .map(|d| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                d.entry,
+                d.source,
+                dash(d.root),
+                dash(d.checked_at.map(|t| t.to_string())),
+                dash(d.error.map(|e| e.replace(['\t', '\n'], " ")))
+            )
+        })
+        .collect();
+    HttpResponse::Ok().body(lines.join("\n"))
 }
 
 // ranked results; ?limit=n&offset=m pages through them (#209): 100 by default, the first 1,000 at most (#248)
@@ -204,6 +237,31 @@ fn health_min_rate(value: Option<String>) -> Result<u64, String> {
             )
         }),
     }
+}
+
+/// New discovered roots queued an hour: `DISCOVERY_PER_HOUR`, or 500 when unset; 0 is no limit
+/// (#213)
+fn discovery_per_hour(value: Option<String>) -> Result<u32, String> {
+    match value {
+        None => Ok(500),
+        Some(value) => value.parse::<u32>().map_err(|_| {
+            format!(
+                "DISCOVERY_PER_HOUR must be a whole number of roots an hour (0 = no limit), got {:?}",
+                value
+            )
+        }),
+    }
+}
+
+// runs a background loop on its own thread; one that panics is logged and started again a
+// minute later
+fn keep_running(name: &'static str, run: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || loop {
+        if std::panic::catch_unwind(AssertUnwindSafe(&run)).is_err() {
+            error!("{} panicked; starting it again in a minute", name);
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    });
 }
 
 // the rate is a 10-minute average, so it means little until this long after a start
@@ -467,6 +525,11 @@ async fn main() -> std::io::Result<()> {
         started: Instant::now(),
         min_rate,
     });
+    let per_hour =
+        discovery_per_hour(std::env::var("DISCOVERY_PER_HOUR").ok()).unwrap_or_else(|err| {
+            error!("{}", err);
+            std::process::exit(1);
+        });
     // per-page lines are debug (about 3 GB a day at info): one line a minute says how the crawl is going
     let summary_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
@@ -489,6 +552,42 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
+    // discovery (#213): the resolver always runs, since submitted names need it; each source runs
+    // only when configured
+    let cap = Arc::new(discovery::HourlyCap::new(per_hour));
+    {
+        let (queue, gateway, cap) = (Arc::clone(&index_queue), gateway.clone(), Arc::clone(&cap));
+        keep_running("Discovery resolver", move || {
+            discovery::run_resolver(&queue, &gateway, &cap)
+        });
+    }
+    match std::env::var("SEEDS_FILE").ok().filter(|p| !p.is_empty()) {
+        Some(path) => {
+            info!("Seeds file: {}", path);
+            let queue = Arc::clone(&index_queue);
+            keep_running("Seeds file", move || {
+                discovery::run_seeds(&queue, std::path::Path::new(&path))
+            });
+        }
+        None => info!("Seeds file: none (no SEEDS_FILE)"),
+    }
+    // the URL carries an API key: only its host is ever logged
+    match std::env::var("ETH_RPC_URL").ok().filter(|u| !u.is_empty()) {
+        Some(url) => match ens::HttpRpc::new(url) {
+            Ok(rpc) => {
+                info!("ENS scan: through {}", rpc.host());
+                let queue = Arc::clone(&index_queue);
+                let rpc = Arc::new(rpc);
+                keep_running("ENS scan", move || discovery::run_ens(&queue, rpc.as_ref()));
+            }
+            Err(err) => {
+                error!("ETH_RPC_URL: {}", err);
+                std::process::exit(1);
+            }
+        },
+        None => info!("ENS scan: off (no ETH_RPC_URL)"),
+    }
+
     let gateway_data = web::Data::new(Gateway(gateway));
     let flush_queue = Arc::clone(&index_queue);
     let served = HttpServer::new(move || {
@@ -504,6 +603,7 @@ async fn main() -> std::io::Result<()> {
             .service(search_handler)
             .service(keywords)
             .service(roots)
+            .service(discovered)
             .configure(|cfg| admin::configure(cfg, admin.clone()))
     })
     // localhost by default; set BIND_ADDR=0.0.0.0:9090 to accept remote connections
@@ -598,6 +698,91 @@ mod tests {
         for bad in ["", "-1", "fast", "1.5"] {
             assert!(health_min_rate(Some(bad.to_string())).is_err(), "{:?}", bad);
         }
+    }
+
+    #[actix_web::test]
+    async fn discovery_per_hour_defaults_to_500_and_rejects_non_numbers() {
+        assert_eq!(discovery_per_hour(None), Ok(500));
+        assert_eq!(discovery_per_hour(Some("0".to_string())), Ok(0));
+        assert_eq!(discovery_per_hour(Some("2000".to_string())), Ok(2000));
+        for bad in ["", "-1", "lots", "1.5"] {
+            assert!(
+                discovery_per_hour(Some(bad.to_string())).is_err(),
+                "{:?}",
+                bad
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn enqueue_records_names_for_the_resolver() {
+        let index_queue = web::Data::new(IndexQueue::new());
+        let app =
+            test::init_service(App::new().app_data(index_queue.clone()).service(enqueue)).await;
+        for (uri, code, body) in [
+            (
+                "/enqueue/docs.ipfs.tech",
+                200,
+                "Queued docs.ipfs.tech to resolve",
+            ),
+            (
+                "/enqueue/Docs.IPFS.tech",
+                200,
+                "Already known: docs.ipfs.tech",
+            ),
+            ("/enqueue/vitalik.eth", 200, "Queued vitalik.eth to resolve"),
+            (
+                "/enqueue/two%20words.com",
+                400,
+                "Not a valid CID or name: two words.com",
+            ),
+        ] {
+            let resp =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(resp.status().as_u16(), code, "{}", uri);
+            let got = test::read_body(resp).await;
+            assert_eq!(std::str::from_utf8(&got).unwrap(), body, "{}", uri);
+        }
+        assert_eq!(index_queue.queue_length(), 0, "names wait for the resolver");
+        let sources: Vec<String> = index_queue
+            .discovered()
+            .into_iter()
+            .map(|d| d.source)
+            .collect();
+        assert_eq!(sources, vec!["submitted", "submitted"]);
+    }
+
+    #[actix_web::test]
+    async fn discovered_lists_entries_and_status_counts_them() {
+        let index_queue = web::Data::new(IndexQueue::new());
+        index_queue.discover("docs.ipfs.tech", "seeds").unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(index_queue.clone())
+                .app_data(web::Data::new(Gateway("gw.example".to_string())))
+                .service(discovered)
+                .service(status),
+        )
+        .await;
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get().uri("/discovered").to_request(),
+        )
+        .await;
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "docs.ipfs.tech\tseeds\t-\t-\t-"
+        );
+        let body =
+            test::call_and_read_body(&app, test::TestRequest::get().uri("/status").to_request())
+                .await;
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains(" Discovered: 1 Gateway: gw.example"),
+            "{:?}",
+            body
+        );
     }
 
     #[actix_web::test]

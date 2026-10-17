@@ -1,0 +1,23 @@
+# Seeds for discovery (#213): one CID, cid/path, DNSLink domain, .eth name or IPNS key a line.
+# Set SEEDS_FILE to a copy of this; it's read at start and every hour. Names are resolved through
+# the gateway and checked again daily.
+
+# Wikipedia mirrors in other languages (distributed-wikipedia-mirror)
+tr.wikipedia-on-ipfs.org
+ar.wikipedia-on-ipfs.org
+zh.wikipedia-on-ipfs.org
+uk.wikipedia-on-ipfs.org
+ru.wikipedia-on-ipfs.org
+fa.wikipedia-on-ipfs.org
+my.wikipedia-on-ipfs.org
+
+# IPFS and libp2p project sites
+docs.ipfs.tech
+specs.ipfs.tech
+blog.ipfs.tech
+ipfs.tech
+libp2p.io
+
+# .eth sites
+vitalik.eth
+ens.eth
