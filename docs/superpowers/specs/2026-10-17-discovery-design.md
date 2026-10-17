@@ -1,6 +1,6 @@
 # Discover sites beyond links: seeds, DNSLink, ENS and submitted names (#213, part 1): design
 
-**Status:** agreed · **Date:** 2026-10-17
+**Status:** implemented (v0.5.0) · **Date:** 2026-10-17
 
 ## Goal
 
