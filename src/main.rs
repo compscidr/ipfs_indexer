@@ -12,6 +12,7 @@ use crate::denylist::Denylist;
 use crate::index_queue::{Enqueued, IndexQueue};
 
 mod admin;
+mod breaker;
 mod denylist;
 mod index_queue;
 mod index_result;
