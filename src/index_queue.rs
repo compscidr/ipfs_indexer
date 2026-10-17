@@ -466,6 +466,11 @@ impl IndexQueue {
         let _ = self.breaker.set(breaker);
     }
 
+    /// Why the crawl is paused after repeated gateway errors (#284), or None while it runs
+    pub fn crawl_paused(&self) -> Option<String> {
+        self.breaker().status()
+    }
+
     /// e.g. "ok 12s ago" or "error 3s ago: <reason>", for /status
     pub fn gateway_health(&self) -> String {
         if let Some(paused) = self.breaker().status() {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use threadpool::ThreadPool;
 
@@ -185,6 +186,72 @@ fn crawl_workers(value: Option<String>) -> Result<usize, String> {
                 value
             )),
         },
+    }
+}
+
+/// The lowest healthy indexing rate: `HEALTH_MIN_RATE` pages/min, or 500 when unset; 0 turns the
+/// check off (#285)
+fn health_min_rate(value: Option<String>) -> Result<u64, String> {
+    match value {
+        None => Ok(500),
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            format!(
+                "HEALTH_MIN_RATE must be a whole number of pages a minute (0 turns the check off), got {:?}",
+                value
+            )
+        }),
+    }
+}
+
+// the rate is a 10-minute average, so it means little until this long after a start
+const HEALTH_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/**
+ * Whether the crawl is working, for a monitor (#285): Err with the reason while it's paused after
+ * repeated gateway errors, or indexing fewer than min_rate pages a minute with work queued. While
+ * starting, or with nothing queued, it's Ok.
+ */
+fn health(
+    rate: u64,
+    queued: usize,
+    paused: Option<String>,
+    min_rate: u64,
+    up_for: Duration,
+) -> Result<String, String> {
+    if let Some(paused) = paused {
+        return Err(paused);
+    }
+    let counts = format!("{} pages/min, {} queued", rate, queued);
+    if up_for < HEALTH_GRACE {
+        return Ok(format!("starting: {}", counts));
+    }
+    if queued > 0 && rate < min_rate {
+        return Err(format!(
+            "slow: {} pages/min (minimum {}), {} queued",
+            rate, min_rate, queued
+        ));
+    }
+    Ok(format!("ok: {}", counts))
+}
+
+// when the process started and HEALTH_MIN_RATE, for /health
+struct Health {
+    started: Instant,
+    min_rate: u64,
+}
+
+/// 200 while the crawl is working, 503 when it's paused or slow, with the reason (#285)
+#[get("/health")]
+async fn health_handler(queue: web::Data<IndexQueue>, config: web::Data<Health>) -> HttpResponse {
+    match health(
+        queue.indexed_per_minute(),
+        queue.queue_length(),
+        queue.crawl_paused(),
+        config.min_rate,
+        config.started.elapsed(),
+    ) {
+        Ok(why) => HttpResponse::Ok().body(why),
+        Err(why) => HttpResponse::ServiceUnavailable().body(why),
     }
 }
 
@@ -388,6 +455,15 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     });
     info!("Crawl workers: {}", n_workers);
+    let min_rate = health_min_rate(std::env::var("HEALTH_MIN_RATE").ok()).unwrap_or_else(|err| {
+        error!("{}", err);
+        std::process::exit(1);
+    });
+    // crawling starts now: /health's grace period counts from here
+    let health_config = web::Data::new(Health {
+        started: Instant::now(),
+        min_rate,
+    });
     // per-page lines are debug (about 3 GB a day at info): one line a minute says how the crawl is going
     let summary_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
@@ -416,7 +492,9 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(index_queue.clone())
             .app_data(gateway_data.clone())
+            .app_data(health_config.clone())
             .service(status)
+            .service(health_handler)
             .service(version_handler)
             .service(resources)
             .service(enqueue)
@@ -460,6 +538,93 @@ mod tests {
             .iter()
             .map(|p| p.split(' ').next().unwrap().to_string())
             .collect()
+    }
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    #[actix_web::test]
+    async fn health_is_ok_while_starting_even_with_no_rate() {
+        assert_eq!(
+            health(0, 1000, None, 500, 14 * MIN),
+            Ok("starting: 0 pages/min, 1000 queued".to_string())
+        );
+    }
+
+    #[actix_web::test]
+    async fn health_fails_when_indexing_is_slow_with_work_queued() {
+        assert_eq!(
+            health(87, 1857261, None, 500, 15 * MIN),
+            Err("slow: 87 pages/min (minimum 500), 1857261 queued".to_string())
+        );
+        assert_eq!(
+            health(500, 1857261, None, 500, 15 * MIN),
+            Ok("ok: 500 pages/min, 1857261 queued".to_string())
+        );
+    }
+
+    #[actix_web::test]
+    async fn health_is_ok_with_nothing_to_crawl() {
+        assert_eq!(
+            health(0, 0, None, 500, 60 * MIN),
+            Ok("ok: 0 pages/min, 0 queued".to_string())
+        );
+    }
+
+    #[actix_web::test]
+    async fn health_fails_while_the_crawl_is_paused() {
+        let paused = "paused 4m: 16 of the last 20 fetches failed; last: 504".to_string();
+        assert_eq!(
+            health(3000, 1000, Some(paused.clone()), 500, MIN),
+            Err(paused)
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_min_rate_of_zero_turns_the_rate_check_off() {
+        assert_eq!(
+            health(0, 1000, None, 0, 60 * MIN),
+            Ok("ok: 0 pages/min, 1000 queued".to_string())
+        );
+    }
+
+    #[actix_web::test]
+    async fn health_min_rate_defaults_to_500_and_rejects_non_numbers() {
+        assert_eq!(health_min_rate(None), Ok(500));
+        assert_eq!(health_min_rate(Some("0".to_string())), Ok(0));
+        assert_eq!(health_min_rate(Some("1200".to_string())), Ok(1200));
+        for bad in ["", "-1", "fast", "1.5"] {
+            assert!(health_min_rate(Some(bad.to_string())).is_err(), "{:?}", bad);
+        }
+    }
+
+    #[actix_web::test]
+    async fn health_get_answers_503_when_slow_and_200_when_starting() {
+        let queue = web::Data::new(IndexQueue::new());
+        queue.enqueue("bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze".to_string());
+        for (started, code, body) in [
+            (
+                Instant::now() - 20 * MIN,
+                503,
+                "slow: 0 pages/min (minimum 500), 1 queued",
+            ),
+            (Instant::now(), 200, "starting: 0 pages/min, 1 queued"),
+        ] {
+            let app = test::init_service(
+                App::new()
+                    .app_data(queue.clone())
+                    .app_data(web::Data::new(Health {
+                        started,
+                        min_rate: 500,
+                    }))
+                    .service(health_handler),
+            )
+            .await;
+            let req = test::TestRequest::get().uri("/health").to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status().as_u16(), code);
+            let got = test::read_body(resp).await;
+            assert_eq!(std::str::from_utf8(&got).unwrap(), body);
+        }
     }
 
     #[actix_web::test]
