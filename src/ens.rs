@@ -14,6 +14,10 @@ pub const TOPIC: &str = "0xe379c1624ed7e714cc0937528a32359d69d5281337765313dba4e
 /// The first ENS registry's deployment (May 2017): no record is older
 pub const START_BLOCK: u64 = 3_327_417;
 pub const MAX_RANGE: u64 = 10_000;
+// an error keeps this many characters of a provider's answer
+const ERROR_CHARS: usize = 240;
+// a path segment or query value this long may be an API key, and is scrubbed from errors
+const KEY_CHARS: usize = 8;
 
 #[derive(Debug, PartialEq)]
 pub enum RpcError {
@@ -53,7 +57,10 @@ impl HttpRpc {
     }
 
     // text from the provider or the HTTP client with the URL's secrets (the key is often in its
-    // path or query, or its userinfo) replaced by "…"; a provider may echo the request path
+    // path or query, or its userinfo) replaced by "…", then cut to ERROR_CHARS. A provider may
+    // echo the request path or just the key, so each path segment and query value long enough
+    // to be a key counts too. Scrubbing comes first: a cut through a secret would leave a part
+    // of it no longer matching.
     fn scrub(&self, text: &str) -> String {
         let mut secrets = vec![self.url.clone()];
         if let Ok(url) = reqwest::Url::parse(&self.url) {
@@ -61,6 +68,14 @@ impl HttpRpc {
             secrets.extend(url.query().map(str::to_string));
             secrets.push(url.username().to_string());
             secrets.extend(url.password().map(str::to_string));
+            // short segments like "v2" aren't keys, and blanking them would garble errors
+            let parts = url
+                .path_segments()
+                .into_iter()
+                .flatten()
+                .map(str::to_string);
+            let values = url.query_pairs().map(|(_, value)| value.into_owned());
+            secrets.extend(parts.chain(values).filter(|s| s.len() >= KEY_CHARS));
         }
         let mut text = text.to_string();
         // longest first, so a part never leaves a fragment of the whole
@@ -68,7 +83,10 @@ impl HttpRpc {
         for secret in secrets.iter().filter(|s| !s.is_empty() && *s != "/") {
             text = text.replace(secret.as_str(), "…");
         }
-        text
+        match text.char_indices().nth(ERROR_CHARS) {
+            Some((at, _)) => format!("{}…", &text[..at]),
+            None => text,
+        }
     }
 
     /// The URL's host: the one part of it that's safe to log
@@ -110,7 +128,8 @@ impl Rpc for HttpRpc {
 // a JSON-RPC response body: its result, or its error
 fn answer(text: &str) -> Result<Value, RpcError> {
     let mut v: Value = serde_json::from_str(text)
-        .map_err(|_| RpcError::Transport(format!("not a JSON-RPC answer: {:.200}", text)))?;
+        // the whole body: scrub() cuts it once the secrets are out
+        .map_err(|_| RpcError::Transport(format!("not a JSON-RPC answer: {}", text)))?;
     if let Some(err) = v.get("error") {
         let msg = err
             .get("message")
@@ -480,9 +499,9 @@ mod tests {
         }
     }
 
-    // a server answering every request with a body that echoes the request path, as some
-    // providers' error pages do; `json_error` makes it a JSON-RPC error carrying the path
-    fn echoing_server(json_error: bool) -> u16 {
+    // a server answering every request with a 404 whose body is made from the request path, as
+    // some providers' error pages echo it
+    fn answering_server(body: impl Fn(&str) -> String + Send + 'static) -> u16 {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -493,12 +512,7 @@ mod tests {
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
-                let body = if json_error {
-                    json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": format!("bad {}", path)}})
-                        .to_string()
-                } else {
-                    format!("Cannot POST {}", path)
-                };
+                let body = body(&path);
                 let reply = format!(
                     "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -510,10 +524,51 @@ mod tests {
         port
     }
 
+    fn json_error(message: String) -> String {
+        json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": message}}).to_string()
+    }
+
+    // the error a provider answering with `body` turns into, for a URL holding three secrets
+    fn error_from(body: impl Fn(&str) -> String + Send + 'static) -> String {
+        let port = answering_server(body);
+        let rpc = HttpRpc::new(format!(
+            "http://user:PASSWORD@127.0.0.1:{}/v2/SECRETKEY?apikey=QUERYKEY",
+            port
+        ))
+        .unwrap();
+        match rpc.call("eth_blockNumber", json!([])) {
+            Err(RpcError::Transport(msg)) | Err(RpcError::Rpc(msg)) => msg,
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_key_cut_short_or_echoed_on_its_own_is_scrubbed() {
+        let errors = [
+            // the path straddles the length errors are cut to
+            error_from(|path| format!("{}Cannot POST {}", "x".repeat(180), path)),
+            // the key alone, without the path around it
+            error_from(|_| "invalid project id SECRETKEY".to_string()),
+            error_from(|_| json_error("bad api key QUERYKEY".to_string())),
+            error_from(|_| json_error(format!("{} PASSWORD", "y".repeat(190)))),
+        ];
+        for msg in errors {
+            for part in ["SECR", "QUER", "PASS"] {
+                assert!(!msg.contains(part), "{} in {}", part, msg);
+            }
+        }
+    }
+
     #[test]
     fn provider_answers_echoing_the_url_are_scrubbed() {
         for json_error in [false, true] {
-            let port = echoing_server(json_error);
+            let port = answering_server(move |path| {
+                if json_error {
+                    self::json_error(format!("bad {}", path))
+                } else {
+                    format!("Cannot POST {}", path)
+                }
+            });
             let rpc = HttpRpc::new(format!(
                 "http://user:PASSWORD@127.0.0.1:{}/v2/SECRETKEY?apikey=QUERYKEY",
                 port
