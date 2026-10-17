@@ -109,6 +109,25 @@ const SCHEMA: &str = "
         item     TEXT PRIMARY KEY,
         -- failed fetches so far (#284)
         attempts INTEGER NOT NULL DEFAULT 0
+    );
+    -- names and CIDs found by discovery sources, resolved to roots and checked again (#213)
+    CREATE TABLE IF NOT EXISTS discovered (
+        entry      TEXT PRIMARY KEY,
+        source     TEXT NOT NULL,
+        -- the ENS node, for an entry an ENS record points at
+        node       TEXT UNIQUE,
+        -- the last root queued
+        root       TEXT,
+        checked_at INTEGER,
+        next_at    INTEGER NOT NULL,
+        failures   INTEGER NOT NULL DEFAULT 0,
+        error      TEXT
+    );
+    CREATE INDEX IF NOT EXISTS discovered_next_at ON discovered (next_at);
+    -- where background scans are, e.g. the ENS scan's next block (#213)
+    CREATE TABLE IF NOT EXISTS discovery_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
     );";
 
 // indexed pages and queued items per root CID, kept in step with them for /roots (#231). Apart
@@ -704,6 +723,133 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Records an entry from a discovery source, due now; false if it's known already, which
+    /// leaves it as it is (#213)
+    pub fn discover(&self, entry: &str, source: &str, now: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO discovered (entry, source, next_at) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![entry, source, now])?;
+        Ok(n == 1)
+    }
+
+    /// An ENS node's latest record (#213): its entry replaces the one the node had; None (the
+    /// record was cleared) drops it. Entries another source found stay, losing only the node.
+    pub fn discover_ens(&self, node: &str, entry: Option<&str>, now: i64) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.prepare_cached(
+            "DELETE FROM discovered WHERE node = ?1 AND entry IS NOT ?2 AND source = 'ens'",
+        )?
+        .execute(params![node, entry])?;
+        tx.prepare_cached("UPDATE discovered SET node = NULL WHERE node = ?1 AND entry IS NOT ?2")?
+            .execute(params![node, entry])?;
+        if let Some(entry) = entry {
+            tx.prepare_cached(
+                "INSERT INTO discovered (entry, source, node, next_at) VALUES (?1, 'ens', ?2, ?3)
+                 ON CONFLICT (entry) DO UPDATE SET node = ?2",
+            )?
+            .execute(params![entry, node, now])?;
+        }
+        tx.commit()
+    }
+
+    /// Entries due by `now`, soonest first, at most `limit`
+    pub fn discovered_due(&self, now: i64, limit: usize) -> rusqlite::Result<Vec<Discovered>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {} FROM discovered WHERE next_at <= ?1 ORDER BY next_at LIMIT ?2",
+            DISCOVERED_COLUMNS
+        ))?;
+        let rows = stmt.query_map(params![now, limit as i64], discovered_row)?;
+        rows.collect()
+    }
+
+    /// A check that worked: the root it queued, and when it's due again
+    pub fn discovered_ok(
+        &self,
+        entry: &str,
+        root: &str,
+        now: i64,
+        next_at: i64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached(
+            "UPDATE discovered SET root = ?2, checked_at = ?3, next_at = ?4, failures = 0,
+             error = NULL WHERE entry = ?1",
+        )?
+        .execute(params![entry, root, now, next_at])?;
+        Ok(())
+    }
+
+    /// A check that failed: its error, one more failure, and when it's due again
+    pub fn discovered_failed(
+        &self,
+        entry: &str,
+        error: &str,
+        now: i64,
+        next_at: i64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached(
+            "UPDATE discovered SET checked_at = ?3, next_at = ?4, failures = failures + 1,
+             error = ?2 WHERE entry = ?1",
+        )?
+        .execute(params![entry, error, now, next_at])?;
+        Ok(())
+    }
+
+    /// Puts off an entry's check without counting one, e.g. while the hourly cap is used up
+    pub fn discovered_postpone(&self, entry: &str, next_at: i64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached("UPDATE discovered SET next_at = ?2 WHERE entry = ?1")?
+            .execute(params![entry, next_at])?;
+        Ok(())
+    }
+
+    /// Every entry, most recently checked first, then those never checked, for /discovered
+    pub fn discovered_all(&self) -> rusqlite::Result<Vec<Discovered>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {} FROM discovered ORDER BY checked_at IS NULL, checked_at DESC, entry",
+            DISCOVERED_COLUMNS
+        ))?;
+        let rows = stmt.query_map([], discovered_row)?;
+        rows.collect()
+    }
+
+    /// How many entries discovery has, for /status (0 if it can't be read)
+    pub fn discovered_count(&self) -> usize {
+        self.read_conn()
+            .query_row("SELECT count(*) FROM discovered", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| n as usize)
+            .unwrap_or(0)
+    }
+
+    /// A value a background scan saved, e.g. the ENS scan's next block
+    pub fn state(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let value = conn
+            .prepare_cached("SELECT value FROM discovery_state WHERE key = ?1")?
+            .query_row([key], |r| r.get(0))
+            .optional()?;
+        Ok(value)
+    }
+
+    pub fn set_state(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached(
+            "INSERT INTO discovery_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = ?2",
+        )?
+        .execute(params![key, value])?;
+        Ok(())
+    }
+
     pub fn queue_len(&self) -> usize {
         self.queued.load(Ordering::Relaxed)
     }
@@ -994,6 +1140,33 @@ fn refuse_old_format(conn: &Connection) -> Result<(), OpenError> {
         return Err(Box::new(OldFormat));
     }
     Ok(())
+}
+
+/// One row of `discovered` (#213): an entry, where it came from, its last root and when it's
+/// next checked
+#[derive(Debug, Clone, PartialEq)]
+pub struct Discovered {
+    pub entry: String,
+    pub source: String,
+    pub root: Option<String>,
+    pub checked_at: Option<i64>,
+    pub next_at: i64,
+    pub failures: u32,
+    pub error: Option<String>,
+}
+
+const DISCOVERED_COLUMNS: &str = "entry, source, root, checked_at, next_at, failures, error";
+
+fn discovered_row(r: &rusqlite::Row) -> rusqlite::Result<Discovered> {
+    Ok(Discovered {
+        entry: r.get(0)?,
+        source: r.get(1)?,
+        root: r.get(2)?,
+        checked_at: r.get(3)?,
+        next_at: r.get(4)?,
+        failures: r.get(5)?,
+        error: r.get(6)?,
+    })
 }
 
 // a "cid/path" item's root CID
@@ -1575,6 +1748,131 @@ pub(crate) mod tests {
             store.queue_pop().unwrap(),
             Some(("a/1".to_string(), 1)),
             "kept across a restart"
+        );
+    }
+
+    #[test]
+    fn discovered_entries_round_trip_and_come_due() {
+        let dir = temp_dir("discovered");
+        let store = Store::open(&dir, 0).unwrap();
+        assert!(store.discover("docs.ipfs.tech", "seeds", 100).unwrap());
+        assert!(
+            !store.discover("docs.ipfs.tech", "submitted", 50).unwrap(),
+            "known already"
+        );
+        assert!(store.discover("vitalik.eth", "submitted", 200).unwrap());
+        let due = |store: &Store, now| -> Vec<String> {
+            store
+                .discovered_due(now, 10)
+                .unwrap()
+                .into_iter()
+                .map(|d| d.entry)
+                .collect()
+        };
+        assert_eq!(due(&store, 150), vec!["docs.ipfs.tech"]);
+        store
+            .discovered_failed("docs.ipfs.tech", "504", 150, 3750)
+            .unwrap();
+        store
+            .discovered_failed("docs.ipfs.tech", "504", 3750, 11000)
+            .unwrap();
+        let docs = |store: &Store| {
+            store
+                .discovered_all()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.entry == "docs.ipfs.tech")
+                .unwrap()
+        };
+        let row = docs(&store);
+        assert_eq!(
+            (
+                row.failures,
+                row.error.as_deref(),
+                row.checked_at,
+                row.next_at
+            ),
+            (2, Some("504"), Some(3750), 11000)
+        );
+        store
+            .discovered_ok("docs.ipfs.tech", "bafyroot", 11000, 97400)
+            .unwrap();
+        store.discovered_postpone("vitalik.eth", 14400).unwrap();
+        assert!(due(&store, 14000).is_empty());
+        assert_eq!(due(&store, 14400), vec!["vitalik.eth"]);
+        drop(store);
+        let store = Store::open(&dir, 0).unwrap();
+        let all = store.discovered_all().unwrap();
+        assert_eq!(
+            all[0],
+            Discovered {
+                entry: "docs.ipfs.tech".into(),
+                source: "seeds".into(),
+                root: Some("bafyroot".into()),
+                checked_at: Some(11000),
+                next_at: 97400,
+                failures: 0,
+                error: None,
+            },
+            "checked first, the unchecked after"
+        );
+        assert_eq!(all[1].entry, "vitalik.eth");
+        assert_eq!(store.discovered_count(), 2);
+    }
+
+    #[test]
+    fn an_ens_node_keeps_only_its_latest_record() {
+        let store = Store::open_in_memory().unwrap();
+        let entries = |s: &Store| -> Vec<(String, String)> {
+            s.discovered_all()
+                .unwrap()
+                .into_iter()
+                .map(|d| (d.entry, d.source))
+                .collect()
+        };
+        let pair = |e: &str, s: &str| (e.to_string(), s.to_string());
+        store.discover_ens("0xnode", Some("bafyone"), 1).unwrap();
+        store.discover_ens("0xnode", Some("bafytwo"), 2).unwrap();
+        assert_eq!(entries(&store), vec![pair("bafytwo", "ens")]);
+        store.discover_ens("0xnode", None, 3).unwrap(); // cleared
+        assert!(entries(&store).is_empty());
+        // a record pointing at an entry another source found keeps that entry's source, and
+        // moving the record away leaves the entry in place
+        store.discover("seeded.eth", "seeds", 4).unwrap();
+        store
+            .discover_ens("0xother", Some("seeded.eth"), 5)
+            .unwrap();
+        assert_eq!(entries(&store), vec![pair("seeded.eth", "seeds")]);
+        store.discover_ens("0xother", Some("bafythree"), 6).unwrap();
+        assert_eq!(
+            entries(&store),
+            vec![pair("bafythree", "ens"), pair("seeded.eth", "seeds")]
+        );
+        store.discover_ens("0xother", None, 7).unwrap();
+        assert_eq!(entries(&store), vec![pair("seeded.eth", "seeds")]);
+    }
+
+    #[test]
+    fn a_store_from_before_discovery_gains_its_tables() {
+        let dir = temp_dir("discovery-tables");
+        drop(Store::open(&dir, 0).unwrap());
+        Connection::open(dir.join("index.sqlite"))
+            .unwrap()
+            .execute_batch("DROP TABLE discovered; DROP TABLE discovery_state;")
+            .unwrap();
+        let store = Store::open(&dir, 0).unwrap();
+        assert!(store.discover("docs.ipfs.tech", "seeds", 1).unwrap());
+        assert_eq!(store.state("ens_next_block").unwrap(), None);
+        store.set_state("ens_next_block", "3327417").unwrap();
+        store.set_state("ens_next_block", "3337417").unwrap();
+        drop(store);
+        assert_eq!(
+            Store::open(&dir, 0)
+                .unwrap()
+                .state("ens_next_block")
+                .unwrap()
+                .as_deref(),
+            Some("3337417")
         );
     }
 
