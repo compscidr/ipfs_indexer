@@ -27,7 +27,7 @@ Until now the crawler has found pages in two ways: by following links from one s
   - Alternatives for listing ENS sites are in #293: the ENS subgraph, or published lists.
 - **It runs inside the indexer,** one background thread per source. The rate limit, `enqueue()`, the denylists and `roots` all live there, and it's one binary and one deploy.
 - **Names are resolved through the existing gateway.** kubo already resolves DNSLink and `.eth`: `/ipns/docs.ipfs.tech/` answers 200 with `X-Ipfs-Roots`, and `vitalik.eth` resolves through eth.limo. So the indexer needs no DNS or ENS client of its own.
-- **ENS listing reads `ContenthashChanged` events through a public RPC endpoint** (`eth_getLogs`), set by `ETH_RPC_URL`.
+- **ENS listing reads `ContenthashChanged` events with `eth_getLogs`, through an RPC provider's free API key** (`ETH_RPC_URL`, which carries the key). A live check on 2026-10-17 showed why a key is needed: no keyless public endpoint serves old logs. publicnode needs a token for archive ranges, Flashbots has pruned its history, and 1rpc and Blast allow 10–50 blocks per request. Recent blocks did work: 153 events across 74 nodes in the last 10,000 blocks (146 `ipfs-ns`, 1 `ipns-ns`, 5 Swarm, 1 cleared).
 - **Submitted names are accepted by `/enqueue`,** so darksearch's Submit page can add them.
 - **There is no master switch.** A source runs only when it's configured.
 
@@ -67,7 +67,8 @@ Names may also be written as `/ipns/<name>` or `ipns://<name>`. CIDs may be writ
     iac deploys the real file.
 - **ENS** (`ETH_RPC_URL`; off when unset):
   - **Calls:** JSON-RPC `eth_getLogs` with `topics: [ContenthashChanged(bytes32,bytes)]` and no address, so the filter covers every resolver contract.
-  - **Range:** it walks from ENS's first registry deployment (block 3,327,417; the plan confirms this number) to the latest block, 10,000 blocks per request, with 1 s between requests. The first pass is about 2,000 requests. After that, each pass reads only new blocks, every 10 minutes.
+  - **Range:** it walks from ENS's first registry deployment (block 3,327,417) to the latest block, with 1 s between requests. Requests start at 10,000 blocks. Providers cap ranges and result counts differently, so when the provider answers with a JSON-RPC error, the range is halved, down to 1 block, and the request retried after 1 s. Each successful request doubles it again, back up to 10,000. The first pass is about 2,300 requests at full size. After that, each pass reads only new blocks, every 10 minutes.
+  - **The key stays out of logs.** `ETH_RPC_URL` is never logged; only its host is, at start. Transport errors are logged without the URL (`reqwest::Error::without_url`).
   - **Decoding:** each event's `topics[1]` is the ENS node, and its `data` is ABI-encoded bytes holding the EIP-1577 contenthash:
     - `0xe3 0x01 …` (`ipfs-ns`): the rest is a CID, so it's a CID entry;
     - `0xe5 0x01 …` (`ipns-ns`): the rest is a CID with the libp2p-key codec (an IPNS key), or the identity multihash of a DNS name (a domain). Either way it's a name entry;
@@ -116,7 +117,9 @@ Names may also be written as `/ipns/<name>` or `ipns://<name>`. CIDs may be writ
 - `GET /discovered` lists one line per entry, tab-separated like `/roots`, most recently checked first: entry, source, root (or `-`), checked (unix time or `-`), error (or `-`). No token needed: entries are public names and CIDs.
 
 **Errors:**
-- **ENS endpoint:** a failure or rate limit is logged. The scan keeps its position and retries after 1 minute, doubling up to 1 hour. Nothing is lost.
+- **ENS endpoint:**
+  - A JSON-RPC error halves the range and retries, as above.
+  - A transport failure, or an error at a 1-block range, is logged. The scan keeps its position and retries after 1 minute, doubling up to 1 hour. Nothing is lost.
 - **Store errors:** logged and noted with `note_error`, as other store writes do. That source's pass ends and runs again at its next interval.
 
 **Safety:** nothing here fetches page content except through the gateway, and every root passes through `enqueue()`. The resolver only reads headers. The ENS source talks only to `ETH_RPC_URL`.
@@ -137,8 +140,9 @@ Names may also be written as `/ipns/<name>` or `ipns://<name>`. CIDs may be writ
   - events decode, and the latest per node wins;
   - an empty record removes the node;
   - the position is saved and survives a restart;
-  - 10,000-block ranges;
-  - an RPC error backs off and keeps the position.
+  - 10,000-block ranges, halved on a JSON-RPC error and doubled back after successes;
+  - a transport error backs off and keeps the position;
+  - the URL never appears in an error message.
 - **Resolver,** against a local test gateway sending `X-Ipfs-Roots`:
   - a name's root is queued;
   - an unchanged root isn't queued again, and a changed one is;
@@ -160,7 +164,7 @@ v0.5.0.
 - **iac PR:**
   - deploy the seeds file, starting from `seeds.example.txt`;
   - set `SEEDS_FILE`;
-  - set `ETH_RPC_URL` to a public endpoint chosen and tried at deploy;
+  - set `ETH_RPC_URL` from a secret: a free API key from an RPC provider, which you create;
   - leave `DISCOVERY_PER_HOUR` at its default.
 - **darksearch PR:** the Submit page accepts names and says so.
 - **One week after deploy:** count discovered entries, resolved roots and their pages from `/discovered` and `/roots`.
