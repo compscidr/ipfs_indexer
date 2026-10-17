@@ -106,7 +106,9 @@ const SCHEMA: &str = "
     );
     -- the crawl frontier (#224): items waiting to be fetched, in insertion order
     CREATE TABLE IF NOT EXISTS queue (
-        item TEXT PRIMARY KEY
+        item     TEXT PRIMARY KEY,
+        -- failed fetches so far (#284)
+        attempts INTEGER NOT NULL DEFAULT 0
     );";
 
 // indexed pages and queued items per root CID, kept in step with them for /roots (#231). Apart
@@ -183,6 +185,13 @@ impl Store {
             fill_roots(&mut conn)?;
         } else {
             conn.execute_batch(ROOTS_SCHEMA)?;
+        }
+        // v0.4.4 and before had no attempts (#284); adding the column rewrites no rows
+        let has_attempts: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('queue') WHERE name = 'attempts'")?
+            .exists([])?;
+        if !has_attempts {
+            conn.execute_batch("ALTER TABLE queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")?;
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS pages_text_hash ON pages (text_hash);
@@ -651,24 +660,26 @@ impl Store {
         Ok(())
     }
 
-    /// Takes the oldest item off the frontier, or None if it's empty
-    pub fn queue_pop(&self) -> rusqlite::Result<Option<String>> {
+    /// Takes the oldest item off the frontier with its failed attempts so far, or None if it's
+    /// empty
+    pub fn queue_pop(&self) -> rusqlite::Result<Option<(String, u32)>> {
         let start = Instant::now();
         let mut conn = self.conn.lock().unwrap();
         let waited = start.elapsed();
         let tx = conn.transaction()?;
-        let item: Option<String> = tx
+        let next: Option<(String, u32)> = tx
             .prepare_cached(
-                "DELETE FROM queue WHERE rowid = (SELECT min(rowid) FROM queue) RETURNING item",
+                "DELETE FROM queue WHERE rowid = (SELECT min(rowid) FROM queue)
+                 RETURNING item, attempts",
             )?
-            .query_row([], |r| r.get(0))
+            .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        if let Some(item) = &item {
+        if let Some((item, _)) = &next {
             bump_root(&tx, item, 0, -1)?;
         }
         tx.commit()?;
         // not on empty polls: idle workers poll every 200ms
-        if item.is_some() {
+        if next.is_some() {
             self.queued.fetch_sub(1, Ordering::Relaxed);
             debug!(
                 "Store queue_pop: waited {:?}, took {:?}",
@@ -676,7 +687,21 @@ impl Store {
                 start.elapsed() - waited
             );
         }
-        Ok(item)
+        Ok(next)
+    }
+
+    /// Puts an item back at the end of the frontier with its failed attempts (#284). False if
+    /// it's queued already: that copy, and its count, win.
+    pub fn queue_retry(&self, item: &str, attempts: u32) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let n = tx
+            .prepare_cached("INSERT OR IGNORE INTO queue (item, attempts) VALUES (?1, ?2)")?
+            .execute(params![item, attempts])?;
+        bump_root(&tx, item, 0, n as i64)?;
+        tx.commit()?;
+        self.queued.fetch_add(n, Ordering::Relaxed);
+        Ok(n == 1)
     }
 
     pub fn queue_len(&self) -> usize {
@@ -1498,10 +1523,59 @@ pub(crate) mod tests {
         store.queue_remove(&["a/2".to_string()]).unwrap();
         assert_eq!(store.queue_load().unwrap(), vec!["b/1", "c/3"]);
         assert_eq!(store.queue_len(), 2);
-        assert_eq!(store.queue_pop().unwrap().as_deref(), Some("b/1"));
-        assert_eq!(store.queue_pop().unwrap().as_deref(), Some("c/3"));
+        assert_eq!(store.queue_pop().unwrap(), Some(("b/1".to_string(), 0)));
+        assert_eq!(store.queue_pop().unwrap(), Some(("c/3".to_string(), 0)));
         assert_eq!(store.queue_pop().unwrap(), None);
         assert_eq!(store.queue_len(), 0);
+    }
+
+    #[test]
+    fn queue_retry_goes_to_the_back_and_keeps_counts() {
+        let dir = temp_dir("queue-retry");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .queue_add(&["a/1".into(), "a/2".into(), "b/1".into()])
+            .unwrap();
+        assert_eq!(store.queue_pop().unwrap(), Some(("a/1".to_string(), 0)));
+        assert!(store.queue_retry("a/1", 1).unwrap());
+        assert_eq!(store.queue_len(), 3);
+        assert_eq!(store.queue_load().unwrap(), vec!["a/2", "b/1", "a/1"]);
+        assert_eq!(roots_table(&store), roots_by_scan(&store));
+        // a copy already queued (a link found it again) wins, attempts and all
+        assert!(!store.queue_retry("a/2", 2).unwrap());
+        assert_eq!(store.queue_len(), 3);
+        assert_eq!(roots_table(&store), roots_by_scan(&store));
+        assert_eq!(store.queue_pop().unwrap(), Some(("a/2".to_string(), 0)));
+    }
+
+    #[test]
+    fn a_queue_from_before_attempts_gains_the_column() {
+        let dir = temp_dir("queue-attempts");
+        let store = Store::open(&dir, 0).unwrap();
+        store.queue_add(&["a/1".into(), "a/2".into()]).unwrap();
+        drop(store);
+        {
+            // v0.4.4's queue: no attempts column
+            let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE queue RENAME TO queue_old;
+                 CREATE TABLE queue (item TEXT PRIMARY KEY);
+                 INSERT INTO queue (item) SELECT item FROM queue_old ORDER BY rowid;
+                 DROP TABLE queue_old;",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(store.queue_pop().unwrap(), Some(("a/1".to_string(), 0)));
+        store.queue_retry("a/1", 1).unwrap();
+        drop(store);
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(store.queue_pop().unwrap(), Some(("a/2".to_string(), 0)));
+        assert_eq!(
+            store.queue_pop().unwrap(),
+            Some(("a/1".to_string(), 1)),
+            "kept across a restart"
+        );
     }
 
     fn hashed(item: &str, words: &[(&str, u32)], hash: &[u8]) -> IndexResult {

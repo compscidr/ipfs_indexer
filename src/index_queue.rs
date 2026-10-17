@@ -922,7 +922,7 @@ impl IndexQueue {
         let start = Instant::now();
         // taken off disk now: a crash mid-fetch loses at most one item per worker
         let item = match self.store().queue_pop() {
-            Ok(Some(item)) => item,
+            Ok(Some((item, _attempts))) => item,
             Ok(None) => return false,
             Err(err) => {
                 warn!("Couldn't take the next queued item: {}", err);
@@ -1873,7 +1873,7 @@ mod tests {
         }
         assert_eq!(queue.queue_length(), 1);
         assert_eq!(
-            queue.store().queue_pop().unwrap().unwrap(),
+            queue.store().queue_pop().unwrap().unwrap().0,
             format!("{}/wiki/X", GOOD)
         );
     }
@@ -2152,7 +2152,7 @@ mod tests {
             .trim_end_matches('/')
             .to_string();
         assert!(queue.process_next(&gateway));
-        std::iter::from_fn(|| queue.store().queue_pop().unwrap()).collect()
+        std::iter::from_fn(|| queue.store().queue_pop().unwrap().map(|(item, _)| item)).collect()
     }
 
     #[test]
