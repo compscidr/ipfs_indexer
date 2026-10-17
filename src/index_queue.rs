@@ -191,7 +191,7 @@ const MAX_ATTEMPTS: u32 = 3;
  * Fetch a url and return its body, but only if the gateway says it's html and it fits in
  * MAX_BODY_BYTES. Ok(None) means it was skipped: images, video, etc are never downloaded.
  */
-fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, reqwest::Error> {
+fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, FetchError> {
     let client = reqwest::blocking::Client::builder()
         // public gateways can take ~50s on a cache miss
         .timeout(Duration::from_secs(90))
@@ -209,10 +209,11 @@ fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, reqwest::Erro
         return Ok(None);
     }
     let mut body = Vec::new();
-    if let Err(err) = response.take(MAX_BODY_BYTES + 1).read_to_end(&mut body) {
-        warn!("Skipping {}: error reading body: {}", url, err);
-        return Ok(None);
-    }
+    // a body cut short (a timeout, a reset) is the gateway failing, not the page (#284)
+    response
+        .take(MAX_BODY_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(FetchError::Body)?;
     if body.len() as u64 > MAX_BODY_BYTES {
         warn!("Skipping {}: larger than {} bytes", url, MAX_BODY_BYTES);
         return Ok(None);
@@ -265,12 +266,38 @@ fn looks_like_scheme(segment: &str) -> bool {
     }
 }
 
+// a failed fetch: the request itself (a status, a timeout, no connection), or reading its body
+#[derive(Debug)]
+enum FetchError {
+    Request(reqwest::Error),
+    Body(std::io::Error),
+}
+
+impl From<reqwest::Error> for FetchError {
+    fn from(err: reqwest::Error) -> Self {
+        FetchError::Request(err)
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Request(err) => write!(f, "{}", err),
+            FetchError::Body(err) => write!(f, "error reading body: {}", err),
+        }
+    }
+}
+
 // whether a failed fetch says something about the gateway itself, rather than the page:
-// network errors, timeouts, 5xx and 429 do; a 404 or other 4xx just means that page is missing
-fn is_gateway_error(err: &reqwest::Error) -> bool {
-    match err.status() {
-        Some(status) => status.is_server_error() || status.as_u16() == 429,
-        None => true,
+// network errors, timeouts, 5xx, 429 and a body cut short do; a 404 or other 4xx just means
+// that page is missing
+fn is_gateway_error(err: &FetchError) -> bool {
+    match err {
+        FetchError::Request(err) => match err.status() {
+            Some(status) => status.is_server_error() || status.as_u16() == 429,
+            None => true,
+        },
+        FetchError::Body(_) => true,
     }
 }
 
@@ -279,6 +306,40 @@ pub enum Enqueued {
     Queued,
     InvalidCid,
     Blocked,
+}
+
+// the test fetch a worker holds (#284): reported with tested(), else handed back on drop, or
+// counted as a failed test if the worker is panicking
+struct TestTurn<'a> {
+    breaker: &'a Breaker,
+    reported: bool,
+}
+
+impl<'a> TestTurn<'a> {
+    fn new(breaker: &'a Breaker) -> Self {
+        TestTurn {
+            breaker,
+            reported: false,
+        }
+    }
+
+    fn tested(mut self, failure: Option<&str>) {
+        self.reported = true;
+        self.breaker.tested(failure);
+    }
+}
+
+impl Drop for TestTurn<'_> {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        if std::thread::panicking() {
+            self.breaker.tested(Some("the test fetch panicked"));
+        } else {
+            self.breaker.hand_back();
+        }
+    }
 }
 
 // what a fetch came to (#284): a page to index, nothing to index (missing, skipped, a mirror
@@ -953,28 +1014,20 @@ impl IndexQueue {
         if permit == Permit::Wait {
             return false;
         }
-        // a test turn that fetches nothing goes to the next worker
-        let unused = || {
-            if permit == Permit::Test {
-                self.breaker().hand_back();
-            }
-        };
+        // a test turn that fetches nothing goes to the next worker; one that panics counts as
+        // a failed test, so the crawl pauses again rather than waiting on it forever
+        let test = (permit == Permit::Test).then(|| TestTurn::new(self.breaker()));
         // taken off disk now: a crash mid-fetch loses at most one item per worker
         let (item, attempts) = match self.store().queue_pop() {
             Ok(Some(next)) => next,
-            Ok(None) => {
-                unused();
-                return false;
-            }
+            Ok(None) => return false,
             Err(err) => {
                 warn!("Couldn't take the next queued item: {}", err);
                 self.store().note_error(&err);
-                unused();
                 return false;
             }
         };
         if self.is_blocked(&item) {
-            unused();
             return true;
         }
         debug!("Indexing {}", item);
@@ -983,9 +1036,9 @@ impl IndexQueue {
             Fetched::GatewayError(err) => Some(err.as_str()),
             _ => None,
         };
-        match permit {
-            Permit::Test => self.breaker().tested(failure),
-            _ => self.breaker().record(failure),
+        match test {
+            Some(test) => test.tested(failure),
+            None => self.breaker().record(failure),
         }
         match fetched {
             // a mirror's links lead to more of the mirror: the original's were followed
@@ -1101,7 +1154,7 @@ impl IndexQueue {
                     Ok(None) => None,
                     Err(e) => {
                         warn!("error retrieving content from {}: {}", url, e);
-                        if e.is_timeout() {
+                        if matches!(&e, FetchError::Request(e) if e.is_timeout()) {
                             self.enqueue(fullcid.clone());
                         }
                         None
@@ -2268,6 +2321,61 @@ mod tests {
         std::thread::sleep(Duration::from_millis(15));
         assert!(!queue.process_next("127.0.0.1:1"), "the queue is empty");
         assert_eq!(queue.breaker().permit(), Permit::Test, "the turn came back");
+    }
+
+    #[test]
+    fn a_test_fetch_that_panics_pauses_again_instead_of_stalling_the_crawl() {
+        let queue = IndexQueue::new();
+        queue.set_breaker_for_test(Breaker::with(
+            Duration::from_millis(10),
+            Duration::from_millis(40),
+        ));
+        for _ in 0..16 {
+            queue.breaker().record(Some("504"));
+        }
+        std::thread::sleep(Duration::from_millis(15));
+        queue.enqueue(format!("{}/wiki/Bad", GOOD));
+        // a refresh tag with a quote before "url=" panics detect_redirect's slicing
+        let gateway = gateway_of(serve_once(
+            "text/html",
+            br#"<body><noscript>a"<meta http-equiv="refresh"></noscript></body>"#.to_vec(),
+        ));
+        let fetched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.process_next(&gateway)
+        }));
+        assert!(fetched.is_err(), "this page panics the fetch");
+        assert_eq!(queue.breaker().permit(), Permit::Wait, "paused again");
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            queue.breaker().permit(),
+            Permit::Test,
+            "the next worker gets the next test"
+        );
+    }
+
+    #[test]
+    fn a_body_cut_short_is_a_gateway_error_and_the_page_is_retried() {
+        let queue = IndexQueue::new();
+        let item = format!("{}/wiki/A", GOOD);
+        queue.enqueue(item.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // promises 1000 bytes, sends a few, hangs up
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1000\r\n\r\n<title>t",
+            );
+        });
+        assert!(queue.process_next(&gateway));
+        assert_eq!(queue.store().queue_pop().unwrap(), Some((item, 1)));
+        assert!(
+            queue.gateway_health().starts_with("error "),
+            "{}",
+            queue.gateway_health()
+        );
     }
 
     #[test]
