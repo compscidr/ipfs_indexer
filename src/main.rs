@@ -15,6 +15,7 @@ use crate::index_queue::{Enqueued, IndexQueue};
 mod admin;
 mod breaker;
 mod denylist;
+mod discovery;
 mod ens;
 mod entry;
 mod index_queue;
