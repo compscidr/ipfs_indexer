@@ -1202,6 +1202,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "scraper",
+ "serde_json",
  "sha2",
  "simple_logger",
  "threadpool",
