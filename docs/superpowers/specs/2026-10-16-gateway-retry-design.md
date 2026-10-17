@@ -1,6 +1,6 @@
 # Retry gateway errors and pause when the gateway keeps failing (#284): design
 
-**Status:** agreed · **Date:** 2026-10-16
+**Status:** implemented (v0.4.5) · **Date:** 2026-10-16
 
 ## Goal
 
