@@ -54,13 +54,23 @@ fn cid_entry(s: &str) -> Option<Entry> {
     (cid.codec() != LIBP2P_KEY).then(|| Entry::Cid(s.to_string()))
 }
 
-// a domain (it has dots, which no CID's base does) or an IPNS key
+// a domain (it has dots, which no CID's base does) or a bare IPNS key, in base36 lowercase so
+// every spelling of a key is one entry. Cid::try_from would find a key after any "/ipfs/", so
+// the key must be nothing but letters and digits.
 fn name(s: &str) -> Option<Entry> {
     if s.contains('.') {
         return domain(s).map(Entry::Name);
     }
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
     let cid = Cid::try_from(s).ok()?;
-    (cid.codec() == LIBP2P_KEY).then(|| Entry::Name(s.to_string()))
+    if cid.codec() != LIBP2P_KEY {
+        return None;
+    }
+    cid.to_string_of_base(Base::Base36Lower)
+        .ok()
+        .map(Entry::Name)
 }
 
 /// A DNS name, lowercased (DNSLink or .eth): 2 or more labels of [a-z0-9-], each 1-63 long and
@@ -201,6 +211,32 @@ mod tests {
             &long_name,
         ] {
             assert_eq!(parse(bad), None, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn a_name_is_only_ever_a_bare_key_or_a_domain() {
+        let k = key();
+        for bad in [
+            format!("junk/ipfs/{}", k),
+            format!("%2e%2e\\ipfs\\{}?x=/ipfs/{}", V1, k),
+            format!("a\tb\nc/ipfs/{}", k),
+            format!("{}?x=1", k),
+            format!("{}\\x", k),
+            format!("/ipns/{}/page", k),
+        ] {
+            assert_eq!(parse(&bad), None, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn spellings_of_one_key_are_one_entry() {
+        let k = key();
+        let upper = k.to_ascii_uppercase();
+        let base32 = key_cid().to_string_of_base(Base::Base32Lower).unwrap();
+        assert_ne!(base32, k);
+        for spelling in [upper, base32] {
+            assert_eq!(parse(&spelling), name(&k), "{}", spelling);
         }
     }
 

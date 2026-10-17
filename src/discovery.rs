@@ -66,8 +66,21 @@ pub fn resolve(gateway: &str, name: &str) -> Result<String, String> {
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
+    // a dot segment would be taken as a step up, whatever its encoding
+    if name.is_empty() || name.chars().all(|c| c == '.') {
+        return Err(format!("not a name: {:.100}", name));
+    }
+    // the name is one percent-encoded path segment, never a "..", a "\\" or a query
+    let mut url =
+        reqwest::Url::parse(&format!("http://{}/", gateway)).map_err(|e| e.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "bad gateway address".to_string())?
+        .clear()
+        .push("ipns")
+        .push(name)
+        .push("");
     let response = client
-        .get(format!("http://{}/ipns/{}/", gateway, name))
+        .get(url)
         .send()
         .and_then(|r| r.error_for_status())
         .map_err(|e| e.to_string())?;
@@ -154,8 +167,9 @@ pub fn check(
     outcome
 }
 
-/// Checks the next due entry, unless the crawl is paused (#284) or none is due
-pub fn resolve_next(queue: &IndexQueue, gateway: &str, cap: &HourlyCap) -> Option<Checked> {
+/// Checks the next due entry, unless the crawl is paused (#284) or none is due. Also says whether
+/// the entry was a name, which went to the gateway.
+pub fn resolve_next(queue: &IndexQueue, gateway: &str, cap: &HourlyCap) -> Option<(Checked, bool)> {
     if queue.crawl_paused().is_some() {
         return None;
     }
@@ -170,18 +184,27 @@ pub fn resolve_next(queue: &IndexQueue, gateway: &str, cap: &HourlyCap) -> Optio
     };
     let checked = check(queue, gateway, cap, &row, now);
     debug!("Discovery: {} {:?}", row.entry, checked);
-    Some(checked)
+    Some((
+        checked,
+        matches!(entry::parse(&row.entry), Some(Entry::Name(_))),
+    ))
 }
 
-/// The resolver thread: at most one entry a second; with none due, or the crawl paused, it
-/// looks again in 10 s
+// how long the resolver waits after a check: a name, which went to the gateway, is followed by
+// 1 s; a CID entry by nothing; with none due (None), or the crawl paused, it looks again in 10 s
+fn pause_after(used_gateway: Option<bool>) -> Duration {
+    match used_gateway {
+        Some(true) => Duration::from_secs(1),
+        Some(false) => Duration::ZERO,
+        None => Duration::from_secs(10),
+    }
+}
+
+/// The resolver thread: at most one name a second
 pub fn run_resolver(queue: &IndexQueue, gateway: &str, cap: &HourlyCap) {
     loop {
-        let pause = match resolve_next(queue, gateway, cap) {
-            Some(_) => 1,
-            None => 10,
-        };
-        std::thread::sleep(Duration::from_secs(pause));
+        let used_gateway = resolve_next(queue, gateway, cap).map(|(_, name)| name);
+        std::thread::sleep(pause_after(used_gateway));
     }
 }
 
@@ -344,6 +367,7 @@ mod tests {
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
 
     const A: &str = "bafybeier6ud42ptljtfaxrdlknktw54b7ohfpg5h33mosxpxjndxs7xzvm";
     const B: &str = "bafybeiesmy6rsaglneqxbzkbdj5degzp2izydfadhl2vu3oyrp7k52fypu";
@@ -352,6 +376,11 @@ mod tests {
     // a gateway answering /ipns/<name>/ with X-Ipfs-Roots: <root>, or 504 if root is None, and
     // /ipfs/<path> with a page naming the path; returns its host:port
     fn gateway(root: Option<&'static str>) -> String {
+        gateway_recording(root, Arc::new(Mutex::new(vec![])))
+    }
+
+    // the same, noting the path of every request
+    fn gateway_recording(root: Option<&'static str>, paths: Arc<Mutex<Vec<String>>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let host = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
@@ -361,6 +390,7 @@ mod tests {
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                paths.lock().unwrap().push(path.clone());
                 let reply = match (path.starts_with("/ipns/"), root) {
                     (true, Some(root)) => format!(
                         "HTTP/1.1 200 OK\r\nX-Ipfs-Roots: {},bafkreiextra\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -576,6 +606,47 @@ mod tests {
     }
 
     #[test]
+    fn a_name_is_one_path_segment_under_ipns() {
+        for name in [
+            "..",
+            "%2e%2e",
+            ".",
+            "..\\ipfs\\bafyanycid",
+            "x/../../ipfs/bafyanycid",
+            "a?b=/ipfs/c",
+            "a#b",
+        ] {
+            let paths = Arc::new(Mutex::new(vec![]));
+            let gw = gateway_recording(Some(A), paths.clone());
+            let result = resolve(&gw, name);
+            let seen = paths.lock().unwrap().clone();
+            if name.chars().all(|c| c == '.') {
+                assert!(result.is_err() && seen.is_empty(), "{:?} {:?}", name, seen);
+                continue;
+            }
+            assert_eq!(seen.len(), 1, "{:?}", name);
+            assert!(seen[0].starts_with("/ipns/"), "{:?} -> {}", name, seen[0]);
+            assert_eq!(seen[0].matches('/').count(), 3, "{:?} -> {}", name, seen[0]);
+        }
+    }
+
+    #[test]
+    fn only_a_name_costs_the_resolver_its_pause() {
+        let queue = IndexQueue::new();
+        queue.discover(A, "seeds").unwrap();
+        let cap = HourlyCap::new(10);
+        let (checked, used_gateway) = resolve_next(&queue, "127.0.0.1:1", &cap).unwrap();
+        assert_eq!(checked, Checked::Queued(A.into()));
+        assert!(!used_gateway);
+        assert_eq!(pause_after(Some(used_gateway)), Duration::ZERO);
+        queue.discover("docs.ipfs.tech", "seeds").unwrap();
+        let (_, used_gateway) = resolve_next(&queue, &gateway(Some(B)), &cap).unwrap();
+        assert!(used_gateway);
+        assert_eq!(pause_after(Some(used_gateway)), Duration::from_secs(1));
+        assert_eq!(pause_after(None), Duration::from_secs(10));
+    }
+
+    #[test]
     fn seeds_lines_skip_comments_blanks_and_junk() {
         let text = format!(
             "# IPFS project sites\n\ndocs.ipfs.tech  # the docs\n/ipfs/{}\nnot a seed\nVitalik.eth\n",
@@ -695,7 +766,7 @@ mod tests {
         let gw = gateway(Some(A));
         assert_eq!(
             resolve_next(&queue, &gw, &HourlyCap::new(10)),
-            Some(Checked::Queued(A.into()))
+            Some((Checked::Queued(A.into()), true))
         );
         assert!(queue.process_next(&gw));
         assert_eq!(queue.index_length(), 1);

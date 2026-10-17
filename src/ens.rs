@@ -52,6 +52,25 @@ impl HttpRpc {
         Ok(HttpRpc { url, client })
     }
 
+    // text from the provider or the HTTP client with the URL's secrets (the key is often in its
+    // path or query, or its userinfo) replaced by "…"; a provider may echo the request path
+    fn scrub(&self, text: &str) -> String {
+        let mut secrets = vec![self.url.clone()];
+        if let Ok(url) = reqwest::Url::parse(&self.url) {
+            secrets.push(url.path().to_string());
+            secrets.extend(url.query().map(str::to_string));
+            secrets.push(url.username().to_string());
+            secrets.extend(url.password().map(str::to_string));
+        }
+        let mut text = text.to_string();
+        // longest first, so a part never leaves a fragment of the whole
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        for secret in secrets.iter().filter(|s| !s.is_empty() && *s != "/") {
+            text = text.replace(secret.as_str(), "…");
+        }
+        text
+    }
+
     /// The URL's host: the one part of it that's safe to log
     pub fn host(&self) -> String {
         reqwest::Url::parse(&self.url)
@@ -64,7 +83,8 @@ impl HttpRpc {
 impl Rpc for HttpRpc {
     fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let transport = |e: reqwest::Error| RpcError::Transport(e.without_url().to_string());
+        let transport =
+            |e: reqwest::Error| RpcError::Transport(self.scrub(&e.without_url().to_string()));
         let response = self
             .client
             .post(&self.url)
@@ -79,8 +99,10 @@ impl Rpc for HttpRpc {
         let status = response.status();
         let text = response.text().map_err(transport)?;
         answer(&text).map_err(|err| match err {
-            RpcError::Transport(msg) => RpcError::Transport(format!("HTTP {}: {}", status, msg)),
-            err => err,
+            RpcError::Transport(msg) => {
+                RpcError::Transport(self.scrub(&format!("HTTP {}: {}", status, msg)))
+            }
+            RpcError::Rpc(msg) => RpcError::Rpc(self.scrub(&msg)),
         })
     }
 }
@@ -455,6 +477,56 @@ mod tests {
         match rpc.call("eth_blockNumber", json!([])) {
             Err(RpcError::Transport(msg)) => assert!(!msg.contains("SECRETKEY"), "{}", msg),
             other => panic!("{:?}", other),
+        }
+    }
+
+    // a server answering every request with a body that echoes the request path, as some
+    // providers' error pages do; `json_error` makes it a JSON-RPC error carrying the path
+    fn echoing_server(json_error: bool) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body = if json_error {
+                    json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": format!("bad {}", path)}})
+                        .to_string()
+                } else {
+                    format!("Cannot POST {}", path)
+                };
+                let reply = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn provider_answers_echoing_the_url_are_scrubbed() {
+        for json_error in [false, true] {
+            let port = echoing_server(json_error);
+            let rpc = HttpRpc::new(format!(
+                "http://user:PASSWORD@127.0.0.1:{}/v2/SECRETKEY?apikey=QUERYKEY",
+                port
+            ))
+            .unwrap();
+            let msg = match rpc.call("eth_blockNumber", json!([])) {
+                Err(RpcError::Transport(msg)) | Err(RpcError::Rpc(msg)) => msg,
+                other => panic!("{:?}", other),
+            };
+            for secret in ["SECRETKEY", "QUERYKEY", "PASSWORD"] {
+                assert!(!msg.contains(secret), "{} in {}", secret, msg);
+            }
+            assert!(msg.contains('…'), "{}", msg);
         }
     }
 }

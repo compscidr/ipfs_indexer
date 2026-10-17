@@ -753,6 +753,30 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn enqueue_refuses_a_key_hidden_in_a_path() {
+        use cid::multihash::Multihash;
+        let mut bytes = vec![8, 1, 18, 32];
+        bytes.extend([7u8; 32]);
+        let key = cid::CidGeneric::<64>::new_v1(0x72, Multihash::wrap(0, &bytes).unwrap())
+            .to_string_of_base(cid::multibase::Base::Base36Lower)
+            .unwrap();
+        let index_queue = web::Data::new(IndexQueue::new());
+        let app =
+            test::init_service(App::new().app_data(index_queue.clone()).service(enqueue)).await;
+        for uri in [
+            format!("/enqueue/junk/ipfs/{}", key),
+            format!("/enqueue/junk%2Fipfs%2F{}", key),
+            format!("/enqueue/%252e%252e%5Cipfs%5C{}%3Fx=/ipfs/{}", key, key),
+        ] {
+            let resp =
+                test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+            assert_eq!(resp.status().as_u16(), 400, "{}", uri);
+        }
+        assert_eq!(index_queue.discovered_count(), 0);
+        assert_eq!(index_queue.queue_length(), 0);
+    }
+
+    #[actix_web::test]
     async fn discovered_lists_entries_and_status_counts_them() {
         let index_queue = web::Data::new(IndexQueue::new());
         index_queue.discover("docs.ipfs.tech", "seeds").unwrap();
