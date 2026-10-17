@@ -1,3 +1,4 @@
+use crate::breaker::{Breaker, Permit};
 use crate::denylist::{normalize_item, Denylist};
 use crate::index_result::IndexResult;
 use crate::rate::Rate;
@@ -183,11 +184,14 @@ fn check_marked_damage(dir: &std::path::Path) -> Result<(), OpenError> {
 // skip anything bigger than this rather than pulling it all into memory
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
+// a page the gateway fails on this many times in all is dropped (#284)
+const MAX_ATTEMPTS: u32 = 3;
+
 /**
  * Fetch a url and return its body, but only if the gateway says it's html and it fits in
  * MAX_BODY_BYTES. Ok(None) means it was skipped: images, video, etc are never downloaded.
  */
-fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, reqwest::Error> {
+fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, FetchError> {
     let client = reqwest::blocking::Client::builder()
         // public gateways can take ~50s on a cache miss
         .timeout(Duration::from_secs(90))
@@ -205,10 +209,11 @@ fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, reqwest::Erro
         return Ok(None);
     }
     let mut body = Vec::new();
-    if let Err(err) = response.take(MAX_BODY_BYTES + 1).read_to_end(&mut body) {
-        warn!("Skipping {}: error reading body: {}", url, err);
-        return Ok(None);
-    }
+    // a body cut short (a timeout, a reset) is the gateway failing, not the page (#284)
+    response
+        .take(MAX_BODY_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(FetchError::Body)?;
     if body.len() as u64 > MAX_BODY_BYTES {
         warn!("Skipping {}: larger than {} bytes", url, MAX_BODY_BYTES);
         return Ok(None);
@@ -261,12 +266,38 @@ fn looks_like_scheme(segment: &str) -> bool {
     }
 }
 
+// a failed fetch: the request itself (a status, a timeout, no connection), or reading its body
+#[derive(Debug)]
+enum FetchError {
+    Request(reqwest::Error),
+    Body(std::io::Error),
+}
+
+impl From<reqwest::Error> for FetchError {
+    fn from(err: reqwest::Error) -> Self {
+        FetchError::Request(err)
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Request(err) => write!(f, "{}", err),
+            FetchError::Body(err) => write!(f, "error reading body: {}", err),
+        }
+    }
+}
+
 // whether a failed fetch says something about the gateway itself, rather than the page:
-// network errors, timeouts, 5xx and 429 do; a 404 or other 4xx just means that page is missing
-fn is_gateway_error(err: &reqwest::Error) -> bool {
-    match err.status() {
-        Some(status) => status.is_server_error() || status.as_u16() == 429,
-        None => true,
+// network errors, timeouts, 5xx, 429 and a body cut short do; a 404 or other 4xx just means
+// that page is missing
+fn is_gateway_error(err: &FetchError) -> bool {
+    match err {
+        FetchError::Request(err) => match err.status() {
+            Some(status) => status.is_server_error() || status.as_u16() == 429,
+            None => true,
+        },
+        FetchError::Body(_) => true,
     }
 }
 
@@ -275,6 +306,48 @@ pub enum Enqueued {
     Queued,
     InvalidCid,
     Blocked,
+}
+
+// the test fetch a worker holds (#284): reported with tested(), else handed back on drop, or
+// counted as a failed test if the worker is panicking
+struct TestTurn<'a> {
+    breaker: &'a Breaker,
+    reported: bool,
+}
+
+impl<'a> TestTurn<'a> {
+    fn new(breaker: &'a Breaker) -> Self {
+        TestTurn {
+            breaker,
+            reported: false,
+        }
+    }
+
+    fn tested(mut self, failure: Option<&str>) {
+        self.reported = true;
+        self.breaker.tested(failure);
+    }
+}
+
+impl Drop for TestTurn<'_> {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        if std::thread::panicking() {
+            self.breaker.tested(Some("the test fetch panicked"));
+        } else {
+            self.breaker.hand_back();
+        }
+    }
+}
+
+// what a fetch came to (#284): a page to index, nothing to index (missing, skipped, a mirror
+// redirect...), or a gateway error, which is worth retrying
+enum Fetched {
+    Page(IndexResult, Vec<String>),
+    Nothing,
+    GatewayError(String),
 }
 
 pub struct IndexQueue {
@@ -302,6 +375,9 @@ pub struct IndexQueue {
     // spaces out gateway requests; unset means no limit
     throttle: OnceLock<Throttle>,
 
+    // pauses the crawl while the gateway keeps failing (#284); set on first use, or by a test
+    breaker: OnceLock<Breaker>,
+
     // pages written per minute, for /status (#264)
     indexed: Rate,
 }
@@ -317,6 +393,7 @@ impl IndexQueue {
             purge_due: Mutex::new(false),
             purge_wake: Condvar::new(),
             throttle: OnceLock::new(),
+            breaker: OnceLock::new(),
             indexed: Rate::new(),
         }
     }
@@ -380,8 +457,20 @@ impl IndexQueue {
         }
     }
 
+    fn breaker(&self) -> &Breaker {
+        self.breaker.get_or_init(Breaker::new)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_breaker_for_test(&self, breaker: Breaker) {
+        let _ = self.breaker.set(breaker);
+    }
+
     /// e.g. "ok 12s ago" or "error 3s ago: <reason>", for /status
     pub fn gateway_health(&self) -> String {
+        if let Some(paused) = self.breaker().status() {
+            return paused;
+        }
         match &*self.last_fetch.lock().unwrap() {
             None => "no fetches yet".to_string(),
             Some((at, Ok(()))) => format!("ok {}s ago", at.elapsed().as_secs()),
@@ -917,12 +1006,20 @@ impl IndexQueue {
         }
     }
 
-    /// Fetch and index the next queued item; false if the queue was empty
+    /// Fetch and index the next queued item; false if it took none (the queue was empty, or the
+    /// crawl is paused while the gateway keeps failing)
     pub fn process_next(&self, gateway: &str) -> bool {
         let start = Instant::now();
+        let permit = self.breaker().permit();
+        if permit == Permit::Wait {
+            return false;
+        }
+        // a test turn that fetches nothing goes to the next worker; one that panics counts as
+        // a failed test, so the crawl pauses again rather than waiting on it forever
+        let test = (permit == Permit::Test).then(|| TestTurn::new(self.breaker()));
         // taken off disk now: a crash mid-fetch loses at most one item per worker
-        let item = match self.store().queue_pop() {
-            Ok(Some(item)) => item,
+        let (item, attempts) = match self.store().queue_pop() {
+            Ok(Some(next)) => next,
             Ok(None) => return false,
             Err(err) => {
                 warn!("Couldn't take the next queued item: {}", err);
@@ -930,28 +1027,55 @@ impl IndexQueue {
                 return false;
             }
         };
-        if !self.is_blocked(&item) {
-            debug!("Indexing {}", item);
-            match self.retrieve_content(gateway.to_string(), item.clone()) {
-                // a mirror's links lead to more of the mirror: the original's were followed
-                Some((result, links)) => {
-                    if self.persist(&item, &result) {
-                        self.enqueue_many(links);
-                    }
-                }
-                // for now give up on error
-                None => warn!("Error retrieving CID {}", item),
-            }
-            debug!("Done {} in {:?}", item, start.elapsed());
+        if self.is_blocked(&item) {
+            return true;
         }
+        debug!("Indexing {}", item);
+        let fetched = self.retrieve_content(gateway.to_string(), item.clone());
+        let failure = match &fetched {
+            Fetched::GatewayError(err) => Some(err.as_str()),
+            _ => None,
+        };
+        match test {
+            Some(test) => test.tested(failure),
+            None => self.breaker().record(failure),
+        }
+        match fetched {
+            // a mirror's links lead to more of the mirror: the original's were followed
+            Fetched::Page(result, links) => {
+                if self.persist(&item, &result) {
+                    self.enqueue_many(links);
+                }
+            }
+            Fetched::Nothing => warn!("Error retrieving CID {}", item),
+            Fetched::GatewayError(err) => self.retry(&item, attempts, &err),
+        }
+        debug!("Done {} in {:?}", item, start.elapsed());
         true
     }
 
+    // a page the gateway failed on goes to the back of the queue, until MAX_ATTEMPTS (#284)
+    fn retry(&self, item: &str, attempts: u32, err: &str) {
+        let attempts = attempts + 1;
+        if attempts >= MAX_ATTEMPTS {
+            warn!("Dropping {} after {} attempts: {}", item, attempts, err);
+            return;
+        }
+        debug!(
+            "Retrying {} later ({} failed so far): {}",
+            item, attempts, err
+        );
+        if let Err(err) = self.store().queue_retry(item, attempts) {
+            warn!("Couldn't queue {} again: {}", item, err);
+            self.store().note_error(&err);
+        }
+    }
+
     /**
-     * Use the http client to obtain the page from the ipfs gateway. If there is a failure to
-     * obtain the CID, we give up for now.
+     * Use the http client to obtain the page from the ipfs gateway: the page and its links,
+     * nothing to index, or a gateway error to retry (#284)
      */
-    fn retrieve_content(&self, gateway: String, cid: String) -> Option<(IndexResult, Vec<String>)> {
+    fn retrieve_content(&self, gateway: String, cid: String) -> Fetched {
         let url = format!("http://{}/ipfs/{}", gateway, cid);
         debug!("Retrieving {}", url);
         self.wait_for_gateway();
@@ -965,11 +1089,11 @@ impl IndexQueue {
         *self.last_fetch.lock().unwrap() = Some((Instant::now(), health));
         let (html, mut base) = match fetched {
             Ok(Some(page)) => page,
-            Ok(None) => return None,
+            Ok(None) => return Fetched::Nothing,
+            Err(err) if is_gateway_error(&err) => return Fetched::GatewayError(err.to_string()),
             Err(err) => {
                 warn!("Error: {}, not re-enqueue-ing cid", err);
-                // self.enqueue(cid.clone()); // for now give up on error
-                return None;
+                return Fetched::Nothing;
             }
         };
         let mut document = Html::parse_document(html.as_str());
@@ -980,7 +1104,10 @@ impl IndexQueue {
         }
         trace!("received: {:?}", html.as_str());
 
-        self.process_content(&base, fullcid.clone(), document.clone())
+        match self.process_content(&base, fullcid.clone(), document.clone()) {
+            Some((result, links)) => Fetched::Page(result, links),
+            None => Fetched::Nothing,
+        }
     }
 
     /**
@@ -1027,7 +1154,7 @@ impl IndexQueue {
                     Ok(None) => None,
                     Err(e) => {
                         warn!("error retrieving content from {}: {}", url, e);
-                        if e.is_timeout() {
+                        if matches!(&e, FetchError::Request(e) if e.is_timeout()) {
                             self.enqueue(fullcid.clone());
                         }
                         None
@@ -1873,7 +2000,7 @@ mod tests {
         }
         assert_eq!(queue.queue_length(), 1);
         assert_eq!(
-            queue.store().queue_pop().unwrap().unwrap(),
+            queue.store().queue_pop().unwrap().unwrap().0,
             format!("{}/wiki/X", GOOD)
         );
     }
@@ -2062,6 +2189,232 @@ mod tests {
         );
     }
 
+    fn gateway_of(url: String) -> String {
+        url.trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    // a gateway that answers every request, 504 until `up` is set and then an html page naming
+    // the path (so pages differ and none is a mirror); counts the requests
+    fn serve_flaky() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let up = Arc::new(AtomicBool::new(false));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (is_up, counted) = (Arc::clone(&up), Arc::clone(&hits));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                counted.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if is_up.load(Ordering::SeqCst) {
+                    (
+                        "200 OK",
+                        format!("<title>{0}</title><body>words for {0}</body>", path),
+                    )
+                } else {
+                    ("504 Gateway Timeout", "timeout".to_string())
+                };
+                let header = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        (host, up, hits)
+    }
+
+    #[test]
+    fn a_gateway_error_sends_the_page_to_the_back_of_the_queue() {
+        let queue = IndexQueue::new();
+        let (a, b) = (format!("{}/wiki/A", GOOD), format!("{}/wiki/B", GOOD));
+        queue.enqueue_many(vec![a.clone(), b.clone()]);
+        let gateway = gateway_of(serve_status_once(
+            "504 Gateway Timeout",
+            "text/plain",
+            b"x".to_vec(),
+        ));
+        assert!(queue.process_next(&gateway));
+        assert_eq!(queue.store().queue_pop().unwrap(), Some((b, 0)));
+        assert_eq!(queue.store().queue_pop().unwrap(), Some((a, 1)));
+    }
+
+    #[test]
+    fn a_page_is_dropped_after_its_third_gateway_error() {
+        let queue = IndexQueue::new();
+        let item = format!("{}/wiki/A", GOOD);
+        assert!(queue.store().queue_retry(&item, 2).unwrap());
+        let gateway = gateway_of(serve_status_once(
+            "504 Gateway Timeout",
+            "text/plain",
+            b"x".to_vec(),
+        ));
+        assert!(queue.process_next(&gateway));
+        assert_eq!(queue.queue_length(), 0);
+    }
+
+    #[test]
+    fn a_missing_page_is_dropped_at_once() {
+        let queue = IndexQueue::new();
+        queue.enqueue(format!("{}/wiki/A", GOOD));
+        let gateway = gateway_of(serve_status_once(
+            "404 Not Found",
+            "text/plain",
+            b"no".to_vec(),
+        ));
+        assert!(queue.process_next(&gateway));
+        assert_eq!(queue.queue_length(), 0);
+    }
+
+    #[test]
+    fn a_retried_page_that_fetches_is_indexed() {
+        let queue = IndexQueue::new();
+        let item = format!("{}/wiki/A", GOOD);
+        assert!(queue.store().queue_retry(&item, 1).unwrap());
+        let gateway = gateway_of(serve_once(
+            "text/html",
+            b"<title>t</title><body>words here</body>".to_vec(),
+        ));
+        assert!(queue.process_next(&gateway));
+        assert_eq!(queue.index_length(), 1);
+        assert_eq!(queue.queue_length(), 0);
+    }
+
+    #[test]
+    fn missing_pages_never_pause_the_crawl() {
+        let queue = IndexQueue::new();
+        for i in 0..20 {
+            queue.enqueue(format!("{}/wiki/Gone{}", GOOD, i));
+            let gateway = gateway_of(serve_status_once(
+                "404 Not Found",
+                "text/plain",
+                b"no".to_vec(),
+            ));
+            assert!(queue.process_next(&gateway));
+        }
+        assert_eq!(queue.breaker().permit(), Permit::Go);
+    }
+
+    #[test]
+    fn a_test_turn_with_nothing_to_fetch_is_handed_back() {
+        let queue = IndexQueue::new();
+        queue.set_breaker_for_test(Breaker::with(
+            Duration::from_millis(10),
+            Duration::from_millis(40),
+        ));
+        for _ in 0..16 {
+            queue.breaker().record(Some("504"));
+        }
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(!queue.process_next("127.0.0.1:1"), "the queue is empty");
+        assert_eq!(queue.breaker().permit(), Permit::Test, "the turn came back");
+    }
+
+    #[test]
+    fn a_test_fetch_that_panics_pauses_again_instead_of_stalling_the_crawl() {
+        let queue = IndexQueue::new();
+        queue.set_breaker_for_test(Breaker::with(
+            Duration::from_millis(10),
+            Duration::from_millis(40),
+        ));
+        for _ in 0..16 {
+            queue.breaker().record(Some("504"));
+        }
+        std::thread::sleep(Duration::from_millis(15));
+        queue.enqueue(format!("{}/wiki/Bad", GOOD));
+        // a refresh tag with a quote before "url=" panics detect_redirect's slicing
+        let gateway = gateway_of(serve_once(
+            "text/html",
+            br#"<body><noscript>a"<meta http-equiv="refresh"></noscript></body>"#.to_vec(),
+        ));
+        let fetched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.process_next(&gateway)
+        }));
+        assert!(fetched.is_err(), "this page panics the fetch");
+        assert_eq!(queue.breaker().permit(), Permit::Wait, "paused again");
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            queue.breaker().permit(),
+            Permit::Test,
+            "the next worker gets the next test"
+        );
+    }
+
+    #[test]
+    fn a_body_cut_short_is_a_gateway_error_and_the_page_is_retried() {
+        let queue = IndexQueue::new();
+        let item = format!("{}/wiki/A", GOOD);
+        queue.enqueue(item.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // promises 1000 bytes, sends a few, hangs up
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1000\r\n\r\n<title>t",
+            );
+        });
+        assert!(queue.process_next(&gateway));
+        assert_eq!(queue.store().queue_pop().unwrap(), Some((item, 1)));
+        assert!(
+            queue.gateway_health().starts_with("error "),
+            "{}",
+            queue.gateway_health()
+        );
+    }
+
+    #[test]
+    fn the_crawl_pauses_while_the_gateway_fails_and_loses_no_pages() {
+        use std::sync::atomic::Ordering;
+        let queue = IndexQueue::new();
+        queue.set_breaker_for_test(Breaker::with(
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+        ));
+        let items: Vec<String> = (0..20).map(|i| format!("{}/wiki/P{}", GOOD, i)).collect();
+        queue.enqueue_many(items);
+        let (gateway, up, hits) = serve_flaky();
+        for _ in 0..16 {
+            assert!(queue.process_next(&gateway));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 16);
+        assert_eq!(queue.queue_length(), 20, "every failed page went back");
+        assert!(
+            queue.gateway_health().starts_with("paused "),
+            "{}",
+            queue.gateway_health()
+        );
+        // paused: nothing taken, nothing fetched
+        assert!(!queue.process_next(&gateway));
+        assert_eq!(hits.load(Ordering::SeqCst), 16);
+        assert_eq!(queue.queue_length(), 20);
+        up.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(60));
+        while queue.process_next(&gateway) {}
+        assert_eq!(queue.index_length(), 20, "the retried pages were indexed");
+        assert_eq!(queue.queue_length(), 0);
+        assert!(
+            queue.gateway_health().starts_with("ok "),
+            "{}",
+            queue.gateway_health()
+        );
+    }
+
     #[test]
     fn a_long_queue_loses_no_links() {
         // #224: the 1000-slot queue dropped pushes but still marked the items as queued
@@ -2152,7 +2505,7 @@ mod tests {
             .trim_end_matches('/')
             .to_string();
         assert!(queue.process_next(&gateway));
-        std::iter::from_fn(|| queue.store().queue_pop().unwrap()).collect()
+        std::iter::from_fn(|| queue.store().queue_pop().unwrap().map(|(item, _)| item)).collect()
     }
 
     #[test]
