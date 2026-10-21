@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "ipfs_indexer"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "actix-web",
  "cid",
@@ -1203,6 +1203,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "scraper",
+ "serde_json",
  "sha2",
  "simple_logger",
  "threadpool",

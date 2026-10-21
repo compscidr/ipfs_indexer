@@ -399,7 +399,7 @@ impl IndexQueue {
     }
 
     // the store for indexing and search; in memory if none was attached before first use
-    fn store(&self) -> &Store {
+    pub(crate) fn store(&self) -> &Store {
         self.store
             .get_or_init(|| Store::open_in_memory().expect("in-memory sqlite"))
     }
@@ -451,13 +451,13 @@ impl IndexQueue {
         let _ = self.throttle.set(Throttle::per_minute(per_min));
     }
 
-    fn wait_for_gateway(&self) {
+    pub(crate) fn wait_for_gateway(&self) {
         if let Some(throttle) = self.throttle.get() {
             throttle.wait();
         }
     }
 
-    fn breaker(&self) -> &Breaker {
+    pub(crate) fn breaker(&self) -> &Breaker {
         self.breaker.get_or_init(Breaker::new)
     }
 
@@ -469,6 +469,29 @@ impl IndexQueue {
     /// Why the crawl is paused after repeated gateway errors (#284), or None while it runs
     pub fn crawl_paused(&self) -> Option<String> {
         self.breaker().status()
+    }
+
+    /// Records a name or CID for the resolver (#213); false if it's known already
+    pub fn discover(&self, entry: &str, source: &str) -> rusqlite::Result<bool> {
+        self.store()
+            .discover(entry, source, now_secs())
+            .inspect_err(|err| {
+                warn!("Couldn't record {}: {}", entry, err);
+                self.store().note_error(err);
+            })
+    }
+
+    /// Every discovered entry, for /discovered (empty if the store can't be read)
+    pub fn discovered(&self) -> Vec<store::Discovered> {
+        self.store().discovered_all().unwrap_or_else(|err| {
+            warn!("Couldn't list discovered entries: {}", err);
+            self.store().note_error(&err);
+            Vec::new()
+        })
+    }
+
+    pub fn discovered_count(&self) -> usize {
+        self.store().discovered_count()
     }
 
     /// e.g. "ok 12s ago" or "error 3s ago: <reason>", for /status
