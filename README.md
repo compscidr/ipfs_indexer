@@ -31,6 +31,8 @@ RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080   # your own gateway (h
 | `SEEDS_FILE` | unset | A file of sites to discover (see [Discovery](#discovery)): one CID, `cid/path`, DNSLink domain, `.eth` name or IPNS key a line, `#` comments. Read at start and every hour. `seeds.example.txt` is a starting list. |
 | `ETH_RPC_URL` | unset | An Ethereum JSON-RPC endpoint with an API key (Alchemy, Infura, drpc...), for discovering `.eth` sites from ENS records. Keyless public endpoints don't serve old logs. Only its host is logged. |
 | `DISCOVERY_PER_HOUR` | `500` | The most new discovered roots queued an hour, across every source (`0` = no limit). |
+| `ETH_LOGS_MAX_BLOCKS` | `10000` | The most blocks one ENS `eth_getLogs` request asks for. Set it to your provider's limit: `10` on Alchemy's free plan. |
+| `ETH_REQUEST_SECS` | `1` | Seconds between ENS requests. Raise it to stay within a provider's monthly allowance: `6` keeps Alchemy's free plan (30M compute units a month, 60 per request) under its limit. |
 | `RUST_LOG` | unset | Log level, e.g. `info`: startup, warnings and errors, and one line a minute with the indexing rate, index size and queue length. `debug` adds several lines per page fetched, per queue write and per search query (about 3 GB a day at 4,000 pages a minute). |
 
 The indexer **exits at startup** if it can't download the badbits list, read a configured `LOCAL_DENYLIST`, or open a configured `DATA_DIR`, rather than run without them.
@@ -60,7 +62,7 @@ For your own takedowns, set `LOCAL_DENYLIST=/path/to/local.deny`:
 ## Discovery
 Besides following links from the seed (the Wikipedia mirror) and `/enqueue` submissions, the indexer finds sites from:
 - **a seeds file** (`SEEDS_FILE`): CIDs and names you list;
-- **ENS** (`ETH_RPC_URL`): every `.eth` name whose content record points at IPFS or IPNS, read from `ContenthashChanged` events. The first scan walks from 2017 in requests of up to 10,000 blocks (fewer if the provider objects), then only new blocks every 10 minutes;
+- **ENS** (`ETH_RPC_URL`): every `.eth` name whose content record points at IPFS or IPNS, read from `ContenthashChanged` events. The first scan walks from 2017 in requests of up to 10,000 blocks (fewer if the provider objects), then only new blocks every 10 minutes. On a plan that limits ranges, set `ETH_LOGS_MAX_BLOCKS` and `ETH_REQUEST_SECS`: on Alchemy's free plan (`10` and `6`) the first scan of ENS's history takes about 4–5 months, while new records are picked up within minutes;
 - **submitted names** (`/enqueue/<name>`).
 
 Each entry is kept in `index.sqlite` and listed by `/discovered`. A name is resolved through the gateway (`/ipns/<name>/`, its `X-Ipfs-Roots` header), at most one a second. Its root is queued through the same checks as any page (CID, denylists, HTML only), and checked again daily. When a site publishes a new root, the new one is crawled; an unchanged root is queued again, which re-crawls the site once its pages expire. Failures are retried after an hour, doubling up to a day. At most `DISCOVERY_PER_HOUR` new roots are queued an hour. Each source is off until configured; submitted names always work.

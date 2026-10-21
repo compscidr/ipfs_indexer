@@ -88,14 +88,13 @@ impl HttpRpc {
             None => text,
         }
     }
+}
 
-    /// The URL's host: the one part of it that's safe to log
-    pub fn host(&self) -> String {
-        reqwest::Url::parse(&self.url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
-            .unwrap_or_else(|| "?".to_string())
-    }
+/// An RPC URL's host, or None if it isn't a URL with one
+pub fn host_of(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
 }
 
 impl Rpc for HttpRpc {
@@ -179,7 +178,20 @@ pub fn latest_block(rpc: &dyn Rpc) -> Result<u64, RpcError> {
  * the next request asks for less; a transport error leaves the scan alone. Logs that can't be
  * read are skipped with a warning.
  */
+#[cfg(test)]
 pub fn step(rpc: &dyn Rpc, scan: &mut Scan, latest: u64) -> Result<Vec<Event>, RpcError> {
+    step_within(rpc, scan, latest, MAX_RANGE)
+}
+
+/// step(), never asking for more than `max` blocks: a provider's per-request limit (Alchemy's
+/// free plan allows 10), so the range doesn't grow past it only to be refused
+pub fn step_within(
+    rpc: &dyn Rpc,
+    scan: &mut Scan,
+    latest: u64,
+    max: u64,
+) -> Result<Vec<Event>, RpcError> {
+    scan.range = scan.range.clamp(1, max.max(1));
     if scan.next > latest {
         return Ok(Vec::new());
     }
@@ -211,7 +223,7 @@ pub fn step(rpc: &dyn Rpc, scan: &mut Scan, latest: u64) -> Result<Vec<Event>, R
         })
         .collect();
     scan.next = to + 1;
-    scan.range = (scan.range * 2).min(MAX_RANGE);
+    scan.range = (scan.range * 2).min(max.max(1));
     Ok(events)
 }
 
@@ -419,6 +431,29 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_cap_keeps_every_request_within_it() {
+        let rpc = FakeRpc::new(vec![
+            Ok(json!([])),
+            Err(RpcError::Rpc("no".into())),
+            Ok(json!([])),
+        ]);
+        let mut scan = Scan::starting(100);
+        step_within(&rpc, &mut scan, 1_000_000, 10).unwrap();
+        assert!(step_within(&rpc, &mut scan, 1_000_000, 10).is_err());
+        step_within(&rpc, &mut scan, 1_000_000, 10).unwrap();
+        let ranges: Vec<_> = rpc.calls().iter().map(range_of).collect();
+        assert_eq!(ranges, vec![(100, 109), (110, 119), (110, 114)]);
+        assert_eq!(
+            scan,
+            Scan {
+                next: 115,
+                range: 10
+            },
+            "back to the cap, not past it"
+        );
+    }
+
+    #[test]
     fn the_range_never_goes_below_one_block() {
         let rpc = FakeRpc::new(vec![Err(RpcError::Rpc("no".into()))]);
         let mut scan = Scan {
@@ -492,7 +527,10 @@ mod tests {
             .unwrap()
             .port();
         let rpc = HttpRpc::new(format!("http://127.0.0.1:{}/v2/SECRETKEY", port)).unwrap();
-        assert_eq!(rpc.host(), "127.0.0.1");
+        assert_eq!(
+            host_of(&format!("http://127.0.0.1:{}/v2/SECRETKEY", port)).as_deref(),
+            Some("127.0.0.1")
+        );
         match rpc.call("eth_blockNumber", json!([])) {
             Err(RpcError::Transport(msg)) => assert!(!msg.contains("SECRETKEY"), "{}", msg),
             other => panic!("{:?}", other),

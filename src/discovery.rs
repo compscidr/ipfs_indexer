@@ -295,8 +295,27 @@ pub fn ens_start(queue: &IndexQueue) -> Scan {
     )
 }
 
+/// How hard the ENS scan may use its provider: at most `max_blocks` blocks per eth_getLogs
+/// request, and `pause` between requests (ETH_LOGS_MAX_BLOCKS, ETH_REQUEST_SECS)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnsLimits {
+    pub max_blocks: u64,
+    pub pause: Duration,
+}
+
+impl Default for EnsLimits {
+    /// A provider plan without a range limit
+    fn default() -> Self {
+        EnsLimits {
+            max_blocks: ens::MAX_RANGE,
+            pause: Duration::from_secs(1),
+        }
+    }
+}
+
 /**
- * One pass of the ENS scan, from where it is to the latest block, with `pause` between requests.
+ * One pass of the ENS scan, from where it is to the latest block, with `limits.pause` between
+ * requests and at most `limits.max_blocks` blocks in each.
  * The position is saved after each one. A JSON-RPC error halves the range and the pass carries
  * on; at one block, or on a transport error, it stops with the error.
  */
@@ -304,12 +323,12 @@ pub fn ens_pass(
     queue: &IndexQueue,
     rpc: &dyn Rpc,
     scan: &mut Scan,
-    pause: Duration,
+    limits: &EnsLimits,
 ) -> Result<(), RpcError> {
     let latest = ens::latest_block(rpc)?;
     while scan.next <= latest {
         let range = scan.range;
-        match ens::step(rpc, scan, latest) {
+        match ens::step_within(rpc, scan, latest, limits.max_blocks) {
             Ok(events) => {
                 let skipped = apply_ens(queue, &events, now_secs());
                 debug!(
@@ -331,17 +350,17 @@ pub fn ens_pass(
             }
             Err(err) => return Err(err),
         }
-        std::thread::sleep(pause);
+        std::thread::sleep(limits.pause);
     }
     Ok(())
 }
 
 /// The ENS thread: a pass every 10 minutes; after an error, 1 minute, doubling up to an hour
-pub fn run_ens(queue: &IndexQueue, rpc: &dyn Rpc) {
+pub fn run_ens(queue: &IndexQueue, rpc: &dyn Rpc, limits: &EnsLimits) {
     let mut scan = ens_start(queue);
     let mut backoff = Duration::from_secs(60);
     loop {
-        match ens_pass(queue, rpc, &mut scan, Duration::from_secs(1)) {
+        match ens_pass(queue, rpc, &mut scan, limits) {
             Ok(()) => {
                 backoff = Duration::from_secs(60);
                 std::thread::sleep(Duration::from_secs(600));
@@ -724,11 +743,50 @@ mod tests {
         ]);
         let mut scan = ens_start(&queue);
         assert_eq!(scan.next, start);
-        ens_pass(&queue, &rpc, &mut scan, Duration::ZERO).unwrap();
+        ens_pass(
+            &queue,
+            &rpc,
+            &mut scan,
+            &EnsLimits {
+                pause: Duration::ZERO,
+                ..EnsLimits::default()
+            },
+        )
+        .unwrap();
         assert_eq!(scan.next, start + 15_001);
         assert_eq!(rpc.calls().len(), 5);
         assert_eq!(row(&queue, A).source, "ens");
         assert_eq!(ens_start(&queue).next, start + 15_001, "saved");
+    }
+
+    #[test]
+    fn an_ens_pass_keeps_within_the_providers_block_limit() {
+        let queue = IndexQueue::new();
+        let start = crate::ens::START_BLOCK;
+        let rpc = FakeRpc::new(vec![
+            Ok(json!(format!("{:#x}", start + 25))),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let limits = EnsLimits {
+            max_blocks: 10,
+            pause: Duration::ZERO,
+        };
+        let mut scan = ens_start(&queue);
+        ens_pass(&queue, &rpc, &mut scan, &limits).unwrap();
+        assert_eq!(scan.next, start + 26);
+        let widths: Vec<u64> = rpc.calls()[1..]
+            .iter()
+            .map(|(_, p)| {
+                let n = |k: &str| {
+                    u64::from_str_radix(p[0][k].as_str().unwrap().trim_start_matches("0x"), 16)
+                        .unwrap()
+                };
+                n("toBlock") - n("fromBlock") + 1
+            })
+            .collect();
+        assert_eq!(widths, vec![10, 10, 6]);
     }
 
     #[test]
@@ -742,7 +800,15 @@ mod tests {
         ]);
         let mut scan = ens_start(&queue);
         assert_eq!(
-            ens_pass(&queue, &rpc, &mut scan, Duration::ZERO),
+            ens_pass(
+                &queue,
+                &rpc,
+                &mut scan,
+                &EnsLimits {
+                    pause: Duration::ZERO,
+                    ..EnsLimits::default()
+                }
+            ),
             Err(RpcError::Transport("timed out".into()))
         );
         assert_eq!(ens_start(&queue).next, start + 10_000);
@@ -755,7 +821,16 @@ mod tests {
             next: start + 10_000,
             range: 1,
         };
-        assert!(ens_pass(&queue, &rpc, &mut scan, Duration::ZERO).is_err());
+        assert!(ens_pass(
+            &queue,
+            &rpc,
+            &mut scan,
+            &EnsLimits {
+                pause: Duration::ZERO,
+                ..EnsLimits::default()
+            }
+        )
+        .is_err());
         assert_eq!(rpc.calls().len(), 2);
     }
 
