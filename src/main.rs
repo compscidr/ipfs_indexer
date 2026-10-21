@@ -253,6 +253,51 @@ fn discovery_per_hour(value: Option<String>) -> Result<u32, String> {
     }
 }
 
+/// The most blocks one ENS eth_getLogs request asks for: `ETH_LOGS_MAX_BLOCKS`, or 10,000 when
+/// unset; set it to the provider's limit (10 on Alchemy's free plan) (#213)
+fn eth_logs_max_blocks(value: Option<String>) -> Result<u64, String> {
+    match value {
+        None => Ok(10_000),
+        Some(value) => match value.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "ETH_LOGS_MAX_BLOCKS must be a whole number of blocks above 0, got {:?}",
+                value
+            )),
+        },
+    }
+}
+
+/// Seconds between ENS requests: `ETH_REQUEST_SECS`, or 1 when unset; raise it to stay within a
+/// provider's monthly allowance (6 keeps Alchemy's free plan under its 30M compute units) (#213)
+fn eth_request_secs(value: Option<String>) -> Result<u64, String> {
+    match value {
+        None => Ok(1),
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            format!(
+                "ETH_REQUEST_SECS must be a whole number of seconds, got {:?}",
+                value
+            )
+        }),
+    }
+}
+
+/// Starts the ENS scan through `url` (#213); returns the URL's host, the one part safe to log.
+/// The client is built on the scan's own thread: reqwest's blocking client panics when built
+/// inside actix's async main (v0.5.0 crashed at start with ETH_RPC_URL set).
+fn start_ens(
+    queue: Arc<IndexQueue>,
+    url: String,
+    limits: discovery::EnsLimits,
+) -> Result<String, String> {
+    let host = ens::host_of(&url).ok_or("ETH_RPC_URL isn't a URL with a host")?;
+    keep_running("ENS scan", move || {
+        let rpc = ens::HttpRpc::new(url.clone()).expect("an HTTP client for ETH_RPC_URL");
+        discovery::run_ens(&queue, &rpc, &limits)
+    });
+    Ok(host)
+}
+
 // runs a background loop on its own thread; one that panics is logged and started again a
 // minute later
 fn keep_running(name: &'static str, run: impl Fn() + Send + 'static) {
@@ -573,18 +618,26 @@ async fn main() -> std::io::Result<()> {
     }
     // the URL carries an API key: only its host is ever logged
     match std::env::var("ETH_RPC_URL").ok().filter(|u| !u.is_empty()) {
-        Some(url) => match ens::HttpRpc::new(url) {
-            Ok(rpc) => {
-                info!("ENS scan: through {}", rpc.host());
-                let queue = Arc::clone(&index_queue);
-                let rpc = Arc::new(rpc);
-                keep_running("ENS scan", move || discovery::run_ens(&queue, rpc.as_ref()));
-            }
-            Err(err) => {
-                error!("ETH_RPC_URL: {}", err);
+        Some(url) => {
+            let exit = |err: String| -> ! {
+                error!("{}", err);
                 std::process::exit(1);
-            }
-        },
+            };
+            let limits = discovery::EnsLimits {
+                max_blocks: eth_logs_max_blocks(std::env::var("ETH_LOGS_MAX_BLOCKS").ok())
+                    .unwrap_or_else(|err| exit(err)),
+                pause: Duration::from_secs(
+                    eth_request_secs(std::env::var("ETH_REQUEST_SECS").ok())
+                        .unwrap_or_else(|err| exit(err)),
+                ),
+            };
+            let host =
+                start_ens(Arc::clone(&index_queue), url, limits).unwrap_or_else(|err| exit(err));
+            info!(
+                "ENS scan: through {}, at most {} blocks a request, {:?} apart",
+                host, limits.max_blocks, limits.pause
+            );
+        }
         None => info!("ENS scan: off (no ETH_RPC_URL)"),
     }
 
@@ -708,6 +761,51 @@ mod tests {
         for bad in ["", "-1", "lots", "1.5"] {
             assert!(
                 discovery_per_hour(Some(bad.to_string())).is_err(),
+                "{:?}",
+                bad
+            );
+        }
+    }
+
+    // main runs inside actix's async runtime, where building reqwest's blocking client panics
+    // (v0.5.0 crashed at start with ETH_RPC_URL set)
+    #[actix_web::test]
+    async fn the_ens_scan_starts_from_the_async_main() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let started = start_ens(
+            Arc::new(IndexQueue::new()),
+            format!("http://127.0.0.1:{}/v2/SECRETKEY", port),
+            discovery::EnsLimits::default(),
+        );
+        assert_eq!(started, Ok("127.0.0.1".to_string()));
+        assert!(start_ens(
+            Arc::new(IndexQueue::new()),
+            "not a url".to_string(),
+            discovery::EnsLimits::default()
+        )
+        .is_err());
+    }
+
+    #[actix_web::test]
+    async fn eth_limits_default_to_a_paid_plan_and_reject_bad_values() {
+        assert_eq!(eth_logs_max_blocks(None), Ok(10_000));
+        assert_eq!(eth_logs_max_blocks(Some("10".to_string())), Ok(10));
+        assert_eq!(eth_request_secs(None), Ok(1));
+        assert_eq!(eth_request_secs(Some("6".to_string())), Ok(6));
+        for bad in ["", "0", "-1", "ten", "1.5"] {
+            assert!(
+                eth_logs_max_blocks(Some(bad.to_string())).is_err(),
+                "{:?}",
+                bad
+            );
+        }
+        for bad in ["", "-1", "six"] {
+            assert!(
+                eth_request_secs(Some(bad.to_string())).is_err(),
                 "{:?}",
                 bad
             );
