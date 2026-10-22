@@ -608,7 +608,8 @@ impl IndexQueue {
                 store::wipe(dir)?;
                 open(false)
             }
-            Ok(counts) if verify => {
+            // unless opening (its upkeep, say) found new damage, which marked it again
+            Ok(counts) if verify && self.damage().is_none() => {
                 info!("The index checked out ok; keeping it");
                 std::fs::remove_file(store::damage_marker(dir))?;
                 Ok(counts)

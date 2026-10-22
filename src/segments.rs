@@ -478,11 +478,12 @@ impl Segments {
 
     /**
      * Checks the checksum of each file open() didn't (v0.5.6), once, skipping any a merge or
-     * rewrite checked first (see rewrite); files written since are checked as they're written. For a thread of its own: it reads them whole, one at a time,
-     * taking the state lock only to look each one up, so merges and searches go on. A file
-     * merged away meanwhile is skipped, even mid-read: erasing it (#249) zeroes it, which would
-     * look like damage. Returns the files and bytes checked, or the first file's error (a
-     * mismatch is corrupt, see store::is_corrupt).
+     * rewrite checked first (see rewrite); files written since are checked as they're written.
+     * For a thread of its own: it reads them whole, one at a time, taking the state lock only
+     * to look each one up, so merges and searches go on. A file merged away meanwhile is
+     * skipped: erasing it (#249) zeroes it, which would look like damage. A file that can't be
+     * read is skipped with a warning. Returns the files and bytes checked, or the first
+     * mismatch, as corrupt (see store::is_corrupt).
      */
     pub fn verify_opened(&self) -> io::Result<(usize, u64)> {
         let paths = std::mem::take(&mut *lock(&self.unverified));
@@ -513,7 +514,8 @@ impl Segments {
                 Err(_) if !self.is_live(&segment) => {
                     log::debug!("{} was merged away while it was checked", path.display());
                 }
-                Err(err) => return Err(err),
+                Err(err) if err.kind() == io::ErrorKind::InvalidData => return Err(err),
+                Err(err) => log::warn!("Couldn't check {}: {}", path.display(), err),
             }
         }
         Ok((files, bytes))
@@ -1136,14 +1138,24 @@ impl Segments {
             }
             let holding: Vec<Arc<Segment>> = {
                 let live = self.state.read().unwrap().segments.clone();
+                // a damaged file is left until the restart that erases the index (v0.5.6)
                 live.iter()
-                    .filter(|s| targets.iter().any(|&id| s.contains(id)))
+                    .filter(|s| !s.is_damaged() && targets.iter().any(|&id| s.contains(id)))
                     .cloned()
                     .collect()
             };
-            let mut replaced = false;
+            // one file failing doesn't hold up the rest; the first error is returned after
+            let (mut replaced, mut failed) = (false, None);
             for segment in holding {
-                replaced |= !self.rewrite(std::slice::from_ref(&segment))?;
+                match self.rewrite(std::slice::from_ref(&segment)) {
+                    Ok(done) => replaced |= !done,
+                    Err(err) => {
+                        failed.get_or_insert(err);
+                    }
+                }
+            }
+            if let Some(err) = failed {
+                return Err(err);
             }
             // a merge installed over one of them: its output may hold the page now
             if !replaced {
@@ -1156,7 +1168,17 @@ impl Segments {
     // format file on its own, else TIER_FANOUT segments of one size tier; and whether it's an
     // upgrade
     fn pick_merge(&self, upgrade: bool) -> Option<(Vec<Arc<Segment>>, bool)> {
-        let live = self.state.read().unwrap().segments.clone();
+        // a damaged file is left until the restart that erases the index (v0.5.6): picking it
+        // would fail every merge
+        let live: Vec<Arc<Segment>> = self
+            .state
+            .read()
+            .unwrap()
+            .segments
+            .iter()
+            .filter(|s| !s.is_damaged())
+            .cloned()
+            .collect();
         {
             let dead = self.dead.read().unwrap();
             for segment in live.iter() {
@@ -2523,6 +2545,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_damaged_unchecked_file_fails_its_tier_merge_once_then_the_rest_merge_without_it() {
+        let dir = temp_dir("segments-merge-damaged");
+        let segments = Segments::open(&dir).unwrap();
+        for id in 1..=TIER_FANOUT as u64 + 1 {
+            flushed(&segments, &[(id, &[("common", 1)])]);
+        }
+        drop(segments);
+        let files = segment_files(&dir);
+        crate::segment::damage_postings(&files[0]);
+        let paths = |segments: &Segments| -> Vec<PathBuf> {
+            let live = segments.snapshot();
+            live.iter().map(|s| s.path().to_path_buf()).collect()
+        };
+
+        let segments = Segments::open(&dir).unwrap();
+        crate::segment::CHECKSUMS.with(|n| n.set(0));
+        let err = segments.merge().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{}", err);
+        assert_eq!(paths(&segments), files, "nothing installed");
+        assert_eq!(segment_files(&dir), files, "no output left");
+
+        // the next round leaves it out, without reading it again
+        segments.merge().unwrap();
+        let live = paths(&segments);
+        assert_eq!(live.len(), 2, "{:?}", live);
+        assert!(live.contains(&files[0]));
+        assert_eq!(
+            crate::segment::CHECKSUMS.with(|n| n.get()),
+            TIER_FANOUT + 1,
+            "each file read once"
+        );
+    }
+
+    #[test]
     fn a_damaged_file_that_leaves_the_live_set_during_the_check_is_skipped() {
         let dir = temp_dir("segments-verify-gone");
         let segments = Segments::open(&dir).unwrap();
@@ -2533,7 +2589,8 @@ pub(crate) mod tests {
             crate::segment::damage_postings(file);
         }
         let segments = Segments::open(&dir).unwrap();
-        // the first left before the check reached it, the second while it was read
+        // the first left before the check reached it, the second after it was read, before its
+        // result was used (retire_locked's strong-count guard rules out an erase mid-read)
         segments.remove_for_test(&files[0]);
         let second = files[1].clone();
         segments.set_hook(move |segments, at| {

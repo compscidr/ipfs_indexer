@@ -19,7 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// (page id, how often the term appears on it)
 pub type Posting = (u64, u32);
@@ -41,10 +41,17 @@ thread_local! {
     pub(crate) static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // window reads for a range that began inside the window but ran past its end
     pub(crate) static STRADDLED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // files read whole for their checksum
+    pub(crate) static CHECKSUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 const END: &[u8] = b"ipxend";
 const FOOTER: u64 = 7 * 8 + 8 + 6;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+
+// a Segment's checksum (v0.5.6): not read yet, known good, or known not to match
+const UNCHECKED: u8 = 0;
+const SOUND: u8 = 1;
+const DAMAGED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SegmentInfo {
@@ -67,6 +74,8 @@ fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
 // FNV-1a 64 of a segment file of `bytes` bytes, up to the footer's checksum: the whole file
 // read, a chunk at a time
 fn checksum(file: &File, bytes: u64) -> io::Result<u64> {
+    #[cfg(test)]
+    CHECKSUMS.with(|n| n.set(n.get() + 1));
     let checked = bytes - 8 - END.len() as u64;
     let mut hash = FNV_OFFSET;
     let mut chunk = vec![0u8; 1 << 20];
@@ -391,8 +400,8 @@ pub struct Segment {
     shortest: u32,
     // the footer's checksum
     sum: u64,
-    // whether the checksum is known good: opened verified, written here, or verify passed
-    verified: AtomicBool,
+    // UNCHECKED, SOUND (opened verified, written here, or verify passed) or DAMAGED
+    checked: AtomicU8,
 }
 
 impl Segment {
@@ -405,7 +414,7 @@ impl Segment {
     /// not its checksum, which would re-read the whole file (#247). It counts as verified.
     pub fn open_written(path: &Path) -> io::Result<Segment> {
         let mut segment = Segment::read(path, false)?;
-        *segment.verified.get_mut() = true;
+        *segment.checked.get_mut() = SOUND;
         Ok(segment)
     }
 
@@ -492,31 +501,49 @@ impl Segment {
             version,
             shortest,
             sum,
-            verified: AtomicBool::new(verify),
+            checked: AtomicU8::new(if verify { SOUND } else { UNCHECKED }),
         })
     }
 
     /**
-     * Checks the checksum open_unverified skipped, reading the whole file, unless it's verified
+     * Checks the checksum open_unverified skipped, reading the whole file, unless it's known
      * already (v0.5.6): by the check after startup, and by a merge or rewrite before it copies
-     * the file's contents into a new one with a sound checksum. A pass is recorded; true if it
-     * read the file. A mismatch is a corrupt error naming the file.
+     * the file's contents into a new one with a sound checksum. The outcome is recorded, so a
+     * file is read once; true if it was read now. A mismatch is a corrupt error naming the
+     * file, logged the first time; another error (a failed read) leaves it unchecked.
      */
     pub fn verify(&self) -> io::Result<bool> {
-        if self.verified.load(Ordering::Relaxed) {
-            return Ok(false);
-        }
-        if checksum(&self.file, self.info.bytes)? != self.sum {
-            return Err(io::Error::new(
+        let mismatch = || {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "corrupt segment file {}: checksum doesn't match",
                     self.path.display()
                 ),
-            ));
+            )
+        };
+        match self.checked.load(Ordering::Relaxed) {
+            SOUND => return Ok(false),
+            DAMAGED => return Err(mismatch()),
+            _ => {}
         }
-        self.verified.store(true, Ordering::Relaxed);
+        if checksum(&self.file, self.info.bytes)? != self.sum {
+            if self.checked.swap(DAMAGED, Ordering::Relaxed) != DAMAGED {
+                log::error!(
+                    "{}: it's left as it is, so pages taken down in it stay on disk until a \
+                     restart erases the damaged index",
+                    mismatch()
+                );
+            }
+            return Err(mismatch());
+        }
+        self.checked.store(SOUND, Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// Whether verify found its checksum doesn't match: merges and rewrites leave it alone
+    pub fn is_damaged(&self) -> bool {
+        self.checked.load(Ordering::Relaxed) == DAMAGED
     }
 
     /// The format version it was written in
@@ -954,6 +981,17 @@ pub(crate) fn damage_postings(path: &Path) {
     // a varint's last byte: its low bit changes a count, not how the block decodes
     bytes[dict - 1] ^= 1;
     std::fs::write(path, bytes).unwrap();
+    // so a format change that moves what this damages fails here, not in a puzzling way later
+    assert!(
+        Segment::open_unverified(path).is_ok(),
+        "{} no longer opens",
+        path.display()
+    );
+    assert!(
+        Segment::open(path).is_err(),
+        "{} still checks out",
+        path.display()
+    );
 }
 
 #[cfg(test)]

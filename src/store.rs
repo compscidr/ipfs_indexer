@@ -189,7 +189,9 @@ impl Store {
         store.reader = Some(read_only()?);
         store.lookup = Some(read_only()?);
         store.scan = Some(read_only()?);
-        // erasures a crash interrupted finish before anything is crawled or served (#249)
+        // erasures a crash interrupted finish before anything is crawled or served (#249); a
+        // merge or erase rewrite here checks its unchecked inputs first, so it may read a few
+        // files whole before the API is up (bounded by what's due)
         let start = Instant::now();
         store.maintain();
         log::info!("Startup: upkeep in {:.1?}", start.elapsed());
@@ -639,8 +641,8 @@ impl Store {
                 }
                 Ok(files)
             }
+            // Segment::verify logged it
             Err(err) => {
-                log::error!("Checking the segment files failed: {}", err);
                 self.note_error(&err);
                 Err(err)
             }
@@ -1678,7 +1680,8 @@ pub(crate) mod tests {
             crate::segment::damage_postings(file);
         }
         let store = Store::open(&dir, 0).unwrap();
-        // the first left before the check reached it, the second while it was read
+        // the first left before the check reached it, the second after it was read, before its
+        // result was used (retire_locked's strong-count guard rules out an erase mid-read)
         store.segments.remove_for_test(&files[0]);
         let second = files[1].clone();
         store.segments.set_hook(move |segments, at| {
@@ -1731,6 +1734,35 @@ pub(crate) mod tests {
                 "no output left"
             );
         }
+    }
+
+    #[test]
+    fn a_damaged_file_doesnt_hold_up_takedowns_in_others_and_is_read_once() {
+        let dir = temp_dir("verify-takedowns");
+        let files = segmented(&dir, &["apple", "zebra"]);
+        crate::segment::damage_postings(&files[0]);
+        let store = Store::open(&dir, 0).unwrap();
+        let (bad, good) = (ids_in(&store, &files[0]), ids_in(&store, &files[1]));
+        let ids: Vec<u64> = bad.iter().chain(&good).copied().collect();
+        store.segments.set_dead(&ids);
+        store.segments.mark_erase(&ids);
+        crate::segment::CHECKSUMS.with(|n| n.set(0));
+        store.upkeep();
+        store.upkeep();
+        assert!(store.damage().is_some());
+        let live = store.segments.snapshot();
+        assert!(
+            live.iter().any(|s| s.path() == files[0]),
+            "left for the restart"
+        );
+        assert!(!live.iter().any(|s| s.path() == files[1]), "rewritten");
+        assert!(!files[1].exists(), "and erased");
+        assert!(live.iter().all(|s| !s.contains(good[0])));
+        assert_eq!(
+            crate::segment::CHECKSUMS.with(|n| n.get()),
+            2,
+            "each input read once"
+        );
     }
 
     #[test]
