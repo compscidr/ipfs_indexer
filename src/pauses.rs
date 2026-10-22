@@ -3,7 +3,7 @@
  * own, and the others crawl on. A root's breaker is made on its first outcome and dropped
  * once it is closed and the root has nothing queued; an open one always stays.
  */
-use crate::breaker::{Breaker, Permit};
+use crate::breaker::{Breaker, Permit, MAX_PAUSE, MIN_PAUSE};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -18,7 +18,7 @@ pub struct Pauses {
 
 impl Pauses {
     pub fn new() -> Pauses {
-        Pauses::with(Duration::from_secs(60), Duration::from_secs(15 * 60))
+        Pauses::with(MIN_PAUSE, MAX_PAUSE)
     }
 
     pub fn with(min: Duration, max: Duration) -> Pauses {

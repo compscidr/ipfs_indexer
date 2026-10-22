@@ -1261,7 +1261,7 @@ fn discovered_row(r: &rusqlite::Row) -> rusqlite::Result<Discovered> {
 }
 
 // a "cid/path" item's root CID
-fn root_of(item: &str) -> &str {
+pub(crate) fn root_of(item: &str) -> &str {
     item.split('/').next().unwrap_or(item)
 }
 

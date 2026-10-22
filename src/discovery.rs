@@ -380,9 +380,9 @@ pub fn run_ens(queue: &IndexQueue, rpc: &dyn Rpc, limits: &EnsLimits) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::breaker::Breaker;
     use crate::denylist::Denylist;
     use crate::ens::fake::{log, FakeRpc};
+    use crate::pauses::Pauses;
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -609,12 +609,14 @@ mod tests {
     #[test]
     fn the_resolver_waits_while_the_crawl_is_paused() {
         let queue = IndexQueue::new();
-        queue.set_breaker_for_test(Breaker::with(
+        queue.set_pauses_for_test(Pauses::with(
             Duration::from_secs(600),
             Duration::from_secs(900),
         ));
+        // the only root with pages queued is paused, so the whole crawl is (#286)
+        queue.enqueue(format!("{}/page", B));
         for _ in 0..16 {
-            queue.breaker().record(Some("504"));
+            queue.pauses().record(B, Some("504"));
         }
         queue.discover(A, "seeds").unwrap();
         assert_eq!(

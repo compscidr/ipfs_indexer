@@ -1,9 +1,10 @@
-use crate::breaker::{Breaker, Permit};
+use crate::breaker::Permit;
 use crate::denylist::{normalize_item, Denylist};
 use crate::index_result::IndexResult;
+use crate::pauses::Pauses;
 use crate::rate::Rate;
 use crate::search::{self, Query, Scorer, Total, MAX_RANKED};
-use crate::store::{self, now_secs, OpenError, Store, Upserted};
+use crate::store::{self, now_secs, root_of, OpenError, Queued, Store, Upserted};
 use actix_web::body::MessageBody;
 use cid::Cid;
 use dashmap::Map;
@@ -308,24 +309,26 @@ pub enum Enqueued {
     Blocked,
 }
 
-// the test fetch a worker holds (#284): reported with tested(), else handed back on drop, or
-// counted as a failed test if the worker is panicking
+// the test fetch a worker holds for a root (#284, per root since #286): reported with
+// tested(), else handed back on drop, or counted as a failed test if the worker is panicking
 struct TestTurn<'a> {
-    breaker: &'a Breaker,
+    pauses: &'a Pauses,
+    root: String,
     reported: bool,
 }
 
 impl<'a> TestTurn<'a> {
-    fn new(breaker: &'a Breaker) -> Self {
+    fn new(pauses: &'a Pauses, root: &str) -> Self {
         TestTurn {
-            breaker,
+            pauses,
+            root: root.to_string(),
             reported: false,
         }
     }
 
     fn tested(mut self, failure: Option<&str>) {
         self.reported = true;
-        self.breaker.tested(failure);
+        self.pauses.tested(&self.root, failure);
     }
 }
 
@@ -335,9 +338,10 @@ impl Drop for TestTurn<'_> {
             return;
         }
         if std::thread::panicking() {
-            self.breaker.tested(Some("the test fetch panicked"));
+            self.pauses
+                .tested(&self.root, Some("the test fetch panicked"));
         } else {
-            self.breaker.hand_back();
+            self.pauses.hand_back(&self.root);
         }
     }
 }
@@ -375,8 +379,9 @@ pub struct IndexQueue {
     // spaces out gateway requests; unset means no limit
     throttle: OnceLock<Throttle>,
 
-    // pauses the crawl while the gateway keeps failing (#284); set on first use, or by a test
-    breaker: OnceLock<Breaker>,
+    // pauses a root while the gateway keeps failing on its pages (#284, per root since #286);
+    // set on first use, or by a test
+    pauses: OnceLock<Pauses>,
 
     // pages written per minute, for /status (#264)
     indexed: Rate,
@@ -393,7 +398,7 @@ impl IndexQueue {
             purge_due: Mutex::new(false),
             purge_wake: Condvar::new(),
             throttle: OnceLock::new(),
-            breaker: OnceLock::new(),
+            pauses: OnceLock::new(),
             indexed: Rate::new(),
         }
     }
@@ -457,18 +462,53 @@ impl IndexQueue {
         }
     }
 
-    pub(crate) fn breaker(&self) -> &Breaker {
-        self.breaker.get_or_init(Breaker::new)
+    pub(crate) fn pauses(&self) -> &Pauses {
+        self.pauses.get_or_init(Pauses::new)
     }
 
     #[cfg(test)]
-    pub(crate) fn set_breaker_for_test(&self, breaker: Breaker) {
-        let _ = self.breaker.set(breaker);
+    pub(crate) fn set_pauses_for_test(&self, pauses: Pauses) {
+        let _ = self.pauses.set(pauses);
     }
 
-    /// Why the crawl is paused after repeated gateway errors (#284), or None while it runs
+    /// Why the crawl is paused (#284): every root with pages queued is paused after repeated
+    /// gateway errors (#286). None while any of them crawls, or nothing is queued
     pub fn crawl_paused(&self) -> Option<String> {
-        self.breaker().status()
+        // the usual case, without listing the queued roots: /health and the resolver ask often
+        if self.pauses().paused_count() == 0 {
+            return None;
+        }
+        match self.store().queued_roots() {
+            Ok(roots) => self.pauses().crawl_paused(&roots),
+            Err(err) => {
+                warn!("Couldn't list the roots with pages queued: {}", err);
+                self.store().note_error(&err);
+                None
+            }
+        }
+    }
+
+    /// How many roots are paused or testing (#286)
+    pub fn paused_roots(&self) -> usize {
+        self.pauses().paused_count()
+    }
+
+    /// e.g. "paused 4m: 16 of the last 20 fetches failed; last: <error>"; None while the root
+    /// crawls (#286)
+    pub fn root_pause(&self, root: &str) -> Option<String> {
+        self.pauses().status(root)
+    }
+
+    /// Forgets the closed pauses of roots with nothing queued, so one-page roots don't pile up
+    /// (#286). For the per-minute loop
+    pub fn prune_pauses(&self) {
+        match self.store().queued_roots() {
+            Ok(roots) => self.pauses().prune(&roots),
+            Err(err) => {
+                warn!("Couldn't list the roots with pages queued: {}", err);
+                self.store().note_error(&err);
+            }
+        }
     }
 
     /// Records a name or CID for the resolver (#213); false if it's known already
@@ -496,7 +536,7 @@ impl IndexQueue {
 
     /// e.g. "ok 12s ago" or "error 3s ago: <reason>", for /status
     pub fn gateway_health(&self) -> String {
-        if let Some(paused) = self.breaker().status() {
+        if let Some(paused) = self.crawl_paused() {
             return paused;
         }
         match &*self.last_fetch.lock().unwrap() {
@@ -1034,27 +1074,16 @@ impl IndexQueue {
         }
     }
 
-    /// Fetch and index the next queued item; false if it took none (the queue was empty, or the
-    /// crawl is paused while the gateway keeps failing)
+    /// Fetch and index the next queued item; false if it took none (nothing queued outside the
+    /// roots paused while the gateway keeps failing on them)
     pub fn process_next(&self, gateway: &str) -> bool {
         let start = Instant::now();
-        let permit = self.breaker().permit();
-        if permit == Permit::Wait {
+        // a test turn that fetches nothing (a blocked page) goes to the next worker; one that
+        // panics counts as a failed test, so its root pauses again rather than waiting forever
+        let Some((next, test)) = self.take_next_skipping(&self.pauses().skip()) else {
             return false;
-        }
-        // a test turn that fetches nothing goes to the next worker; one that panics counts as
-        // a failed test, so the crawl pauses again rather than waiting on it forever
-        let test = (permit == Permit::Test).then(|| TestTurn::new(self.breaker()));
-        // taken off disk now: a crash mid-fetch loses at most one item per worker
-        let (item, attempts) = match self.store().queue_pop() {
-            Ok(Some(next)) => next,
-            Ok(None) => return false,
-            Err(err) => {
-                warn!("Couldn't take the next queued item: {}", err);
-                self.store().note_error(&err);
-                return false;
-            }
         };
+        let Queued { item, attempts, .. } = next;
         if self.is_blocked(&item) {
             return true;
         }
@@ -1066,7 +1095,7 @@ impl IndexQueue {
         };
         match test {
             Some(test) => test.tested(failure),
-            None => self.breaker().record(failure),
+            None => self.pauses().record(root_of(&item), failure),
         }
         match fetched {
             // a mirror's links lead to more of the mirror: the original's were followed
@@ -1080,6 +1109,36 @@ impl IndexQueue {
         }
         debug!("Done {} in {:?}", item, start.elapsed());
         true
+    }
+
+    // takes the oldest page whose root isn't in `skip`, with the root's test turn if its pause
+    // is over (#286). Taken off disk now: a crash mid-fetch loses at most one item per worker.
+    // None if there's no such page, or another worker took its root's test after `skip` was
+    // made: that page goes back in its place, with its attempts
+    fn take_next_skipping(&self, skip: &[String]) -> Option<(Queued, Option<TestTurn<'_>>)> {
+        let next = match self.store().queue_take(skip) {
+            Ok(next) => next?,
+            Err(err) => {
+                warn!("Couldn't take the next queued item: {}", err);
+                self.store().note_error(&err);
+                return None;
+            }
+        };
+        let root = root_of(&next.item);
+        match self.pauses().permit(root) {
+            Permit::Go => Some((next, None)),
+            Permit::Test => {
+                let turn = TestTurn::new(self.pauses(), root);
+                Some((next, Some(turn)))
+            }
+            Permit::Wait => {
+                if let Err(err) = self.store().queue_put_back(&next) {
+                    warn!("Couldn't put {} back in the queue: {}", next.item, err);
+                    self.store().note_error(&err);
+                }
+                None
+            }
+        }
     }
 
     // a page the gateway failed on goes to the back of the queue, until MAX_ATTEMPTS (#284)
@@ -2265,6 +2324,45 @@ mod tests {
         (host, up, hits)
     }
 
+    // a gateway that answers 504 for paths containing `root` and an html page naming the path
+    // otherwise (#286)
+    fn serve_failing_root(root: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let (status, body) = if path.contains(root) {
+                    ("504 Gateway Timeout", "timeout".to_string())
+                } else {
+                    (
+                        "200 OK",
+                        format!("<title>{0}</title><body>words for {0}</body>", path),
+                    )
+                };
+                let header = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        host
+    }
+
+    // 16 gateway errors pause a root (#284's rule, per root since #286)
+    fn trip(queue: &IndexQueue, root: &str) {
+        for _ in 0..16 {
+            queue.pauses().record(root, Some("504"));
+        }
+    }
+
     #[test]
     fn a_gateway_error_sends_the_page_to_the_back_of_the_queue() {
         let queue = IndexQueue::new();
@@ -2333,34 +2431,40 @@ mod tests {
             ));
             assert!(queue.process_next(&gateway));
         }
-        assert_eq!(queue.breaker().permit(), Permit::Go);
+        assert_eq!(queue.pauses().permit(GOOD), Permit::Go);
     }
 
     #[test]
     fn a_test_turn_with_nothing_to_fetch_is_handed_back() {
         let queue = IndexQueue::new();
-        queue.set_breaker_for_test(Breaker::with(
+        queue.set_pauses_for_test(Pauses::with(
             Duration::from_millis(10),
             Duration::from_millis(40),
         ));
-        for _ in 0..16 {
-            queue.breaker().record(Some("504"));
-        }
+        queue.enqueue(format!("{}/wiki/Blocked", GOOD));
+        queue.set_local_denylist(Denylist::parse(&format!("{}\n", GOOD)));
+        trip(&queue, GOOD);
         std::thread::sleep(Duration::from_millis(15));
-        assert!(!queue.process_next("127.0.0.1:1"), "the queue is empty");
-        assert_eq!(queue.breaker().permit(), Permit::Test, "the turn came back");
+        assert!(
+            queue.process_next("127.0.0.1:1"),
+            "the blocked page was taken, not fetched"
+        );
+        assert_eq!(queue.queue_length(), 0);
+        assert_eq!(
+            queue.pauses().permit(GOOD),
+            Permit::Test,
+            "the turn came back"
+        );
     }
 
     #[test]
     fn a_test_fetch_that_panics_pauses_again_instead_of_stalling_the_crawl() {
         let queue = IndexQueue::new();
-        queue.set_breaker_for_test(Breaker::with(
+        queue.set_pauses_for_test(Pauses::with(
             Duration::from_millis(10),
             Duration::from_millis(40),
         ));
-        for _ in 0..16 {
-            queue.breaker().record(Some("504"));
-        }
+        trip(&queue, GOOD);
         std::thread::sleep(Duration::from_millis(15));
         queue.enqueue(format!("{}/wiki/Bad", GOOD));
         // a refresh tag with a quote before "url=" panics detect_redirect's slicing
@@ -2372,10 +2476,10 @@ mod tests {
             queue.process_next(&gateway)
         }));
         assert!(fetched.is_err(), "this page panics the fetch");
-        assert_eq!(queue.breaker().permit(), Permit::Wait, "paused again");
+        assert_eq!(queue.pauses().permit(GOOD), Permit::Wait, "paused again");
         std::thread::sleep(Duration::from_millis(25));
         assert_eq!(
-            queue.breaker().permit(),
+            queue.pauses().permit(GOOD),
             Permit::Test,
             "the next worker gets the next test"
         );
@@ -2410,7 +2514,7 @@ mod tests {
     fn the_crawl_pauses_while_the_gateway_fails_and_loses_no_pages() {
         use std::sync::atomic::Ordering;
         let queue = IndexQueue::new();
-        queue.set_breaker_for_test(Breaker::with(
+        queue.set_pauses_for_test(Pauses::with(
             Duration::from_millis(50),
             Duration::from_millis(200),
         ));
@@ -2422,8 +2526,11 @@ mod tests {
         }
         assert_eq!(hits.load(Ordering::SeqCst), 16);
         assert_eq!(queue.queue_length(), 20, "every failed page went back");
+        // its only root is paused, so the whole crawl is (#286)
         assert!(
-            queue.gateway_health().starts_with("paused "),
+            queue
+                .gateway_health()
+                .starts_with("paused: all 1 roots with pages queued"),
             "{}",
             queue.gateway_health()
         );
@@ -2441,6 +2548,117 @@ mod tests {
             "{}",
             queue.gateway_health()
         );
+    }
+
+    #[test]
+    fn one_failing_root_does_not_stop_the_others() {
+        let queue = IndexQueue::new();
+        queue.set_pauses_for_test(Pauses::with(
+            Duration::from_secs(60),
+            Duration::from_secs(900),
+        ));
+        let good: Vec<String> = (0..20).map(|i| format!("{}/wiki/P{}", GOOD, i)).collect();
+        let qm: Vec<String> = (0..5).map(|i| format!("{}/wiki/P{}", QM, i)).collect();
+        queue.enqueue_many(good);
+        queue.enqueue_many(qm);
+        let gateway = serve_failing_root(GOOD);
+        loop {
+            if queue.index_length() < 5 {
+                assert_eq!(queue.crawl_paused(), None, "QM still has pages to crawl");
+            }
+            if !queue.process_next(&gateway) {
+                break;
+            }
+        }
+        assert_eq!(queue.index_length(), 5, "every QM page was indexed");
+        assert_eq!(queue.paused_roots(), 1);
+        let pause = queue.root_pause(GOOD).unwrap_or_default();
+        assert!(pause.starts_with("paused "), "{}", pause);
+        assert_eq!(queue.root_pause(QM), None);
+        assert!(queue.crawl_paused().is_some(), "only GOOD has pages left");
+        // none lost: nothing of GOOD's was indexed, and none failed 3 times to be dropped; the
+        // 16 that tripped it failed once, the 4 after it weren't fetched
+        assert_eq!(queue.queue_length(), 20);
+        let mut attempts = vec![];
+        while let Some((item, n)) = queue.store().queue_pop().unwrap() {
+            assert!(item.starts_with(GOOD), "{}", item);
+            attempts.push(n);
+        }
+        attempts.sort();
+        assert_eq!(attempts, [vec![0; 4], vec![1; 16]].concat());
+    }
+
+    #[test]
+    fn every_root_failing_pauses_the_crawl() {
+        let queue = IndexQueue::new();
+        queue.set_pauses_for_test(Pauses::with(
+            Duration::from_secs(60),
+            Duration::from_secs(900),
+        ));
+        let items: Vec<String> = (0..16)
+            .flat_map(|i| {
+                [
+                    format!("{}/wiki/P{}", GOOD, i),
+                    format!("{}/wiki/P{}", QM, i),
+                ]
+            })
+            .collect();
+        queue.enqueue_many(items);
+        let (gateway, _up, _hits) = serve_flaky();
+        while queue.process_next(&gateway) {}
+        assert_eq!(queue.paused_roots(), 2);
+        let paused = queue.crawl_paused().unwrap_or_default();
+        assert!(
+            paused.starts_with("paused: all 2 roots with pages queued"),
+            "{}",
+            paused
+        );
+        assert!(
+            queue.gateway_health().starts_with("paused"),
+            "{}",
+            queue.gateway_health()
+        );
+        assert!(!queue.process_next(&gateway));
+        assert_eq!(queue.queue_length(), 32, "every failed page went back");
+    }
+
+    #[test]
+    fn a_page_whose_test_was_taken_goes_back_in_place() {
+        let queue = IndexQueue::new();
+        queue.set_pauses_for_test(Pauses::with(
+            Duration::from_millis(10),
+            Duration::from_millis(40),
+        ));
+        let (a, b) = (format!("{}/wiki/A", GOOD), format!("{}/wiki/B", GOOD));
+        assert!(queue.store().queue_retry(&a, 2).unwrap());
+        queue.enqueue(b.clone());
+        trip(&queue, GOOD);
+        std::thread::sleep(Duration::from_millis(15));
+        // another worker takes GOOD's test between the skip list and the pop
+        assert_eq!(queue.pauses().permit(GOOD), Permit::Test);
+        assert!(queue.take_next_skipping(&[]).is_none());
+        assert_eq!(queue.store().queue_pop().unwrap(), Some((a, 2)));
+        assert_eq!(queue.store().queue_pop().unwrap(), Some((b, 0)));
+    }
+
+    #[test]
+    fn a_resumed_root_crawls_again() {
+        use std::sync::atomic::Ordering;
+        let queue = IndexQueue::new();
+        queue.set_pauses_for_test(Pauses::with(
+            Duration::from_millis(10),
+            Duration::from_millis(40),
+        ));
+        queue.enqueue(format!("{}/wiki/A", GOOD));
+        trip(&queue, GOOD);
+        assert_eq!(queue.paused_roots(), 1);
+        std::thread::sleep(Duration::from_millis(15));
+        let (gateway, up, _hits) = serve_flaky();
+        up.store(true, Ordering::SeqCst);
+        assert!(queue.process_next(&gateway), "the test fetch");
+        assert_eq!(queue.index_length(), 1);
+        assert_eq!(queue.pauses().permit(GOOD), Permit::Go);
+        assert_eq!(queue.paused_roots(), 0);
     }
 
     #[test]

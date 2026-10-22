@@ -586,6 +586,8 @@ async fn main() -> std::io::Result<()> {
             summary_queue.index_length(),
             summary_queue.queue_length()
         );
+        // drops the pauses of roots crawling normally with nothing queued (#286)
+        summary_queue.prune_pauses();
     });
     let pool = ThreadPool::new(n_workers);
 

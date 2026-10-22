@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 // the last this many fetches are kept, and this many gateway errors among them pause the crawl
 const WINDOW: usize = 20;
 const TRIP: usize = 16;
-const MIN_PAUSE: Duration = Duration::from_secs(60);
-const MAX_PAUSE: Duration = Duration::from_secs(15 * 60);
+pub(crate) const MIN_PAUSE: Duration = Duration::from_secs(60);
+pub(crate) const MAX_PAUSE: Duration = Duration::from_secs(15 * 60);
 
 /// What a worker may do before taking a page
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -49,10 +49,6 @@ struct State {
 }
 
 impl Breaker {
-    pub fn new() -> Breaker {
-        Breaker::with(MIN_PAUSE, MAX_PAUSE)
-    }
-
     pub fn with(min: Duration, max: Duration) -> Breaker {
         Breaker::build(None, min, max)
     }
