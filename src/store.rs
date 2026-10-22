@@ -108,7 +108,9 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS queue (
         item     TEXT PRIMARY KEY,
         -- failed fetches so far (#284)
-        attempts INTEGER NOT NULL DEFAULT 0
+        attempts INTEGER NOT NULL DEFAULT 0,
+        -- the part of item before its first '/', so one root's items can be skipped (#286)
+        root     TEXT NOT NULL DEFAULT ''
     );
     -- names and CIDs found by discovery sources, resolved to roots and checked again (#213)
     CREATE TABLE IF NOT EXISTS discovered (
@@ -138,6 +140,18 @@ const ROOTS_SCHEMA: &str = "
         pages  INTEGER NOT NULL,
         queued INTEGER NOT NULL
     );";
+
+/// A queued item taken off the frontier, with what queue_put_back needs to restore it (#286)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Queued {
+    pub item: String,
+    pub attempts: u32,
+    pub rowid: i64,
+}
+
+// the oldest queued item of one root, through the queue_root index, whose entries run in
+// rowid order within a root
+const QUEUE_ROOT_FIRST: &str = "SELECT min(rowid) FROM queue WHERE root = ?1";
 
 impl Store {
     /// Opens DATA_DIR's index; SQLite keeps at most cache_mb of it in memory
@@ -212,11 +226,36 @@ impl Store {
         if !has_attempts {
             conn.execute_batch("ALTER TABLE queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")?;
         }
+        // v0.5.1 and before had no root (#286); the index is created with the others below
+        let has_root: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('queue') WHERE name = 'root'")?
+            .exists([])?;
+        if !has_root {
+            log::info!("Recording each queued item's root (one-time, #286)");
+            let tx = conn.transaction()?;
+            tx.execute_batch(&format!(
+                "ALTER TABLE queue ADD COLUMN root TEXT NOT NULL DEFAULT '';
+                 UPDATE queue SET root = {};",
+                QUEUE_ROOT_OF_ITEM
+            ))?;
+            tx.commit()?;
+        }
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS pages_text_hash ON pages (text_hash);
+            // (SQLite can't index rowid by name, but every index entry ends with it)
+            "CREATE INDEX IF NOT EXISTS queue_root ON queue (root);
+             CREATE INDEX IF NOT EXISTS pages_text_hash ON pages (text_hash);
              CREATE INDEX IF NOT EXISTS pages_indexed_at ON pages (indexed_at);
              CREATE INDEX IF NOT EXISTS mirrors_page ON mirrors (page);
              CREATE INDEX IF NOT EXISTS dead_pages_item ON dead_pages (item);",
+        )?;
+        // an older binary rolled back to and upgraded again leaves rows with no root (it writes
+        // only the item): fill them in, through the queue_root index, so none is skipped for good
+        conn.execute(
+            &format!(
+                "UPDATE queue SET root = {} WHERE root = ''",
+                QUEUE_ROOT_OF_ITEM
+            ),
+            [],
         )?;
         recover_unflushed(&mut conn, segments.flushed_through())?;
         // ids in the segments must never be handed out again, even if this file fell behind them
@@ -637,9 +676,9 @@ impl Store {
             let mut batch_added = 0;
             {
                 let mut stmt =
-                    tx.prepare_cached("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
+                    tx.prepare_cached("INSERT OR IGNORE INTO queue (item, root) VALUES (?1, ?2)")?;
                 for item in batch {
-                    let n = stmt.execute([item])?;
+                    let n = stmt.execute([item, root_of(item)])?;
                     bump_root(&tx, item, 0, n as i64)?;
                     batch_added += n;
                 }
@@ -681,32 +720,93 @@ impl Store {
 
     /// Takes the oldest item off the frontier with its failed attempts so far, or None if it's
     /// empty
+    #[cfg(test)]
     pub fn queue_pop(&self) -> rusqlite::Result<Option<(String, u32)>> {
+        Ok(self.queue_take(&[])?.map(|q| (q.item, q.attempts)))
+    }
+
+    /// Takes the oldest item whose root isn't in `skip`, or None if there's none (#286)
+    pub fn queue_take(&self, skip: &[String]) -> rusqlite::Result<Option<Queued>> {
         let start = Instant::now();
         let mut conn = self.conn.lock().unwrap();
         let waited = start.elapsed();
         let tx = conn.transaction()?;
-        let next: Option<(String, u32)> = tx
-            .prepare_cached(
-                "DELETE FROM queue WHERE rowid = (SELECT min(rowid) FROM queue)
-                 RETURNING item, attempts",
-            )?
-            .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?;
-        if let Some((item, _)) = &next {
-            bump_root(&tx, item, 0, -1)?;
+        let rowid: Option<i64> = if skip.is_empty() {
+            tx.query_row("SELECT min(rowid) FROM queue", [], |r| r.get(0))?
+        } else {
+            // each root's oldest item is one index lookup, however many of its items are queued
+            let mut first = tx.prepare_cached(QUEUE_ROOT_FIRST)?;
+            let mut oldest: Option<i64> = None;
+            for root in roots_queued(&tx)?.iter().filter(|r| !skip.contains(r)) {
+                let next: Option<i64> = first.query_row([root], |r| r.get(0))?;
+                oldest = oldest.into_iter().chain(next).min();
+            }
+            oldest
+        };
+        let next: Option<Queued> = match rowid {
+            Some(rowid) => tx
+                .prepare_cached("DELETE FROM queue WHERE rowid = ?1 RETURNING item, attempts")?
+                .query_row([rowid], |r| {
+                    Ok(Queued {
+                        item: r.get(0)?,
+                        attempts: r.get(1)?,
+                        rowid,
+                    })
+                })
+                .optional()?,
+            None => None,
+        };
+        if let Some(q) = &next {
+            bump_root(&tx, &q.item, 0, -1)?;
         }
         tx.commit()?;
         // not on empty polls: idle workers poll every 200ms
         if next.is_some() {
             self.queued.fetch_sub(1, Ordering::Relaxed);
             debug!(
-                "Store queue_pop: waited {:?}, took {:?}",
+                "Store queue_take: waited {:?}, took {:?}",
                 waited,
                 start.elapsed() - waited
             );
         }
         Ok(next)
+    }
+
+    /// Returns a taken item to its old place with its attempts (#286). If it was queued again
+    /// meanwhile that copy wins; if another item has its rowid by now (SQLite hands out the
+    /// highest rowid + 1, so a deleted last row's is reused), it goes at the end instead.
+    pub fn queue_put_back(&self, taken: &Queued) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let queued = tx
+            .prepare_cached("SELECT 1 FROM queue WHERE item = ?1")?
+            .exists([&taken.item])?;
+        if queued {
+            return Ok(());
+        }
+        let reused = tx
+            .prepare_cached("SELECT 1 FROM queue WHERE rowid = ?1")?
+            .exists([taken.rowid])?;
+        // a NULL rowid takes the next one
+        let rowid = if reused { None } else { Some(taken.rowid) };
+        tx.prepare_cached(
+            "INSERT INTO queue (rowid, item, attempts, root) VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![
+            rowid,
+            taken.item,
+            taken.attempts,
+            root_of(&taken.item)
+        ])?;
+        bump_root(&tx, &taken.item, 0, 1)?;
+        tx.commit()?;
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The roots with items queued (#286)
+    pub fn queued_roots(&self) -> rusqlite::Result<Vec<String>> {
+        roots_queued(&self.conn.lock().unwrap())
     }
 
     /// Puts an item back at the end of the frontier with its failed attempts (#284). False if
@@ -715,8 +815,10 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let n = tx
-            .prepare_cached("INSERT OR IGNORE INTO queue (item, attempts) VALUES (?1, ?2)")?
-            .execute(params![item, attempts])?;
+            .prepare_cached(
+                "INSERT OR IGNORE INTO queue (item, attempts, root) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![item, attempts, root_of(item)])?;
         bump_root(&tx, item, 0, n as i64)?;
         tx.commit()?;
         self.queued.fetch_add(n, Ordering::Relaxed);
@@ -1170,8 +1272,15 @@ fn discovered_row(r: &rusqlite::Row) -> rusqlite::Result<Discovered> {
 }
 
 // a "cid/path" item's root CID
-fn root_of(item: &str) -> &str {
+pub(crate) fn root_of(item: &str) -> &str {
     item.split('/').next().unwrap_or(item)
+}
+
+// the roots with items queued
+fn roots_queued(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    conn.prepare_cached("SELECT root FROM roots WHERE queued > 0")?
+        .query_map([], |r| r.get(0))?
+        .collect()
 }
 
 // adds to a root's page and queued counts, dropping the row once both are 0
@@ -1197,6 +1306,10 @@ fn bump_root(tx: &Connection, item: &str, pages: i64, queued: i64) -> rusqlite::
  * the two GROUP BYs sort every row's root in memory (temp_store), about 350 MB at 2M pages and
  * 3M queued, which is fine at that size for a one-time step.
  */
+// the root of a queued item: its first path segment (#286)
+const QUEUE_ROOT_OF_ITEM: &str =
+    "CASE WHEN instr(item, '/') > 0 THEN substr(item, 1, instr(item, '/') - 1) ELSE item END";
+
 fn fill_roots(conn: &mut Connection) -> rusqlite::Result<()> {
     log::info!("Counting pages and queued items per root (one-time, #231)");
     let tx = conn.transaction()?;
@@ -1241,12 +1354,12 @@ fn recover_unflushed(conn: &mut Connection, flushed_through: u64) -> rusqlite::R
     )?;
     tx.execute("DELETE FROM pages WHERE id > ?1", [flushed_through as i64])?;
     {
-        let mut queue = tx.prepare("INSERT OR IGNORE INTO queue (item) VALUES (?1)")?;
+        let mut queue = tx.prepare("INSERT OR IGNORE INTO queue (item, root) VALUES (?1, ?2)")?;
         for item in &items {
             bump_root(&tx, item, -1, 0)?;
         }
         for item in items.iter().chain(&mirrored) {
-            let n = queue.execute([item])?;
+            let n = queue.execute([item.as_str(), root_of(item)])?;
             bump_root(&tx, item, 0, n as i64)?;
         }
     }
@@ -1749,6 +1862,173 @@ pub(crate) mod tests {
             Some(("a/1".to_string(), 1)),
             "kept across a restart"
         );
+    }
+
+    fn queue_roots(store: &Store) -> Vec<String> {
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT root FROM queue ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn queue_of(items: &[&str]) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let items: Vec<String> = items.iter().map(|i| i.to_string()).collect();
+        store.queue_add(&items).unwrap();
+        store
+    }
+
+    #[test]
+    fn a_queue_without_root_gains_it_on_open() {
+        let dir = temp_dir("queue-root");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .queue_add(&["a/x/y".into(), "b".into(), "a/z".into()])
+            .unwrap();
+        drop(store);
+        {
+            // v0.5.1's queue: no root column
+            let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE q2 (item TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO q2 SELECT item, attempts FROM queue ORDER BY rowid;
+                 DROP TABLE queue;
+                 ALTER TABLE q2 RENAME TO queue;",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(queue_roots(&store), vec!["a", "b", "a"]);
+        for item in ["a/x/y", "b", "a/z"] {
+            assert_eq!(store.queue_pop().unwrap(), Some((item.to_string(), 0)));
+        }
+    }
+
+    #[test]
+    fn rows_queued_by_an_older_binary_gain_their_root_on_reopen() {
+        let dir = temp_dir("queue-root-rollback");
+        let store = Store::open(&dir, 0).unwrap();
+        store.queue_add(&["a/1".into()]).unwrap();
+        drop(store);
+        {
+            // v0.5.1 after a rollback: writes (item) only, so root defaults to ''
+            let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+            conn.execute("INSERT INTO queue (item) VALUES ('b/2/3')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO roots (root, pages, queued) VALUES ('b', 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(queue_roots(&store), vec!["a", "b"]);
+        let taken = store.queue_take(&["a".to_string()]).unwrap().unwrap();
+        assert_eq!(taken.item, "b/2/3");
+    }
+
+    #[test]
+    fn queue_add_and_retry_set_the_root() {
+        let store = Store::open_in_memory().unwrap();
+        store.queue_add(&["c/1".into()]).unwrap();
+        store.queue_retry("d/2", 1).unwrap();
+        assert_eq!(queue_roots(&store), vec!["c", "d"]);
+    }
+
+    #[test]
+    fn taking_skips_the_given_roots() {
+        let store = queue_of(&["a/1", "b/1", "a/2", "c/1"]);
+        let skip = vec!["a".to_string()];
+        let item = |q: Option<Queued>| q.map(|q| q.item);
+        assert_eq!(item(store.queue_take(&skip).unwrap()), Some("b/1".into()));
+        assert_eq!(item(store.queue_take(&skip).unwrap()), Some("c/1".into()));
+        assert_eq!(store.queue_take(&skip).unwrap(), None);
+        assert_eq!(store.queue_len(), 2);
+        assert_eq!(roots_table(&store), vec![("a".to_string(), 0, 2)]);
+        assert_eq!(store.queued_roots().unwrap(), vec!["a"]);
+    }
+
+    #[test]
+    fn taking_with_nothing_skipped_keeps_rowid_order() {
+        let store = queue_of(&["a/1", "b/1", "a/2", "c/1"]);
+        for item in ["a/1", "b/1", "a/2", "c/1"] {
+            assert_eq!(store.queue_take(&[]).unwrap().unwrap().item, item);
+        }
+        assert_eq!(store.queue_take(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn a_put_back_item_keeps_its_place_and_attempts() {
+        let store = queue_of(&["a/1", "a/2"]);
+        store.queue_retry("a/0", 2).unwrap();
+        let taken = store.queue_take(&[]).unwrap().unwrap();
+        assert_eq!(taken.item, "a/1");
+        store.queue_put_back(&taken).unwrap();
+        assert_eq!(store.queue_load().unwrap(), vec!["a/1", "a/2", "a/0"]);
+        assert_eq!(store.queue_len(), 3);
+        assert_eq!(roots_table(&store), vec![("a".to_string(), 0, 3)]);
+        assert_eq!(store.queue_take(&[]).unwrap(), Some(taken));
+        // from the middle of the queue: back where it was, with its attempts
+        let taken = store.queue_take(&["x".to_string()]).unwrap().unwrap();
+        assert_eq!(taken.item, "a/2");
+        let last = store.queue_take(&[]).unwrap().unwrap();
+        assert_eq!((last.item.as_str(), last.attempts), ("a/0", 2));
+        store.queue_put_back(&last).unwrap();
+        store.queue_put_back(&taken).unwrap();
+        assert_eq!(store.queue_load().unwrap(), vec!["a/2", "a/0"]);
+        assert_eq!(store.queue_len(), 2);
+        assert_eq!(roots_table(&store), vec![("a".to_string(), 0, 2)]);
+    }
+
+    #[test]
+    fn putting_back_an_item_queued_again_keeps_the_new_copy() {
+        let store = queue_of(&["a/1", "a/2"]);
+        let taken = store.queue_take(&[]).unwrap().unwrap();
+        store.queue_add(&["a/1".into()]).unwrap();
+        store.queue_put_back(&taken).unwrap();
+        assert_eq!(store.queue_load().unwrap(), vec!["a/2", "a/1"]);
+        assert_eq!(store.queue_take(&[]).unwrap().unwrap().item, "a/2");
+        assert_eq!(store.queue_take(&[]).unwrap().unwrap().attempts, 0);
+        assert_eq!(store.queue_len(), 0);
+        assert_eq!(roots_table(&store), vec![]);
+    }
+
+    #[test]
+    fn putting_back_an_item_whose_rowid_was_reused_queues_it_at_the_end() {
+        let store = Store::open_in_memory().unwrap();
+        store.queue_retry("a/1", 2).unwrap();
+        let taken = store.queue_take(&[]).unwrap().unwrap();
+        // the table is empty, so the next insert reuses the taken item's rowid
+        store.queue_add(&["b/1".into()]).unwrap();
+        store.queue_put_back(&taken).unwrap();
+        assert_eq!(store.queue_load().unwrap(), vec!["b/1", "a/1"]);
+        assert_eq!(store.queue_len(), 2);
+        assert_eq!(
+            roots_table(&store),
+            vec![("a".to_string(), 0, 1), ("b".to_string(), 0, 1)]
+        );
+        assert_eq!(store.queue_pop().unwrap(), Some(("b/1".to_string(), 0)));
+        assert_eq!(store.queue_pop().unwrap(), Some(("a/1".to_string(), 2)));
+    }
+
+    #[test]
+    fn taking_skips_a_root_without_scanning_its_pages() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", QUEUE_ROOT_FIRST))
+            .unwrap()
+            .query_map(["a"], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let plan = plan.join("; ");
+        assert!(plan.contains("queue_root"), "{}", plan);
+        assert!(!plan.contains("SCAN queue"), "{}", plan);
     }
 
     #[test]
