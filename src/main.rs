@@ -46,13 +46,14 @@ struct Gateway(String);
 #[get("/status")]
 async fn status(queue: web::Data<IndexQueue>, gateway: web::Data<Gateway>) -> HttpResponse {
     HttpResponse::Ok().body(format!(
-        "Queue length: {} Index size: {} Mirrors skipped: {} Number of Keywords: {} Indexed per minute: {} Discovered: {} Gateway: {} ({}) Version: {}",
+        "Queue length: {} Index size: {} Mirrors skipped: {} Number of Keywords: {} Indexed per minute: {} Discovered: {} Paused roots: {} Gateway: {} ({}) Version: {}",
         queue.queue_length(),
         queue.index_length(),
         queue.mirror_length(),
         queue.keyword_length(),
         queue.indexed_per_minute(),
         queue.discovered_count(),
+        queue.paused_roots(),
         gateway.0,
         queue.gateway_health(),
         version()
@@ -117,7 +118,8 @@ async fn keywords(queue: web::Data<IndexQueue>) -> HttpResponse {
     HttpResponse::Ok().body(format!("Keywords: {:?}", queue.top_keywords(10)))
 }
 
-// one line per root CID: "cid<TAB>indexed<TAB>queued<TAB>title", most indexed first (#232)
+// one line per root CID: "cid<TAB>indexed<TAB>queued<TAB>title<TAB>pause", most indexed first
+// (#232); the pause is the root's #284 pause text, or "-" (#286)
 #[get("/roots")]
 async fn roots(queue: web::Data<IndexQueue>) -> HttpResponse {
     let lines: Vec<String> = queue
@@ -125,11 +127,14 @@ async fn roots(queue: web::Data<IndexQueue>) -> HttpResponse {
         .into_iter()
         .map(|(cid, indexed, queued, title)| {
             format!(
-                "{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}",
                 cid,
                 indexed,
                 queued,
-                title.replace(['\t', '\n'], " ")
+                title.replace(['\t', '\n'], " "),
+                queue
+                    .root_pause(&cid)
+                    .map_or("-".to_string(), |p| p.replace(['\t', '\n'], " "))
             )
         })
         .collect();
@@ -904,10 +909,48 @@ mod tests {
         assert!(
             std::str::from_utf8(&body)
                 .unwrap()
-                .contains(" Discovered: 1 Gateway: gw.example"),
+                .contains(" Discovered: 1 Paused roots: 0 Gateway: gw.example"),
             "{:?}",
             body
         );
+    }
+
+    #[actix_web::test]
+    async fn roots_show_each_roots_pause() {
+        const GOOD: &str = "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze";
+        const QM: &str = "QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR";
+        let queue = web::Data::new(IndexQueue::new());
+        queue.index_for_test(
+            GOOD,
+            &crate::index_result::IndexResult::new(
+                GOOD.into(),
+                "t".into(),
+                "e".into(),
+                HashMap::new(),
+            ),
+        );
+        queue.enqueue(format!("{}/x", QM));
+        for _ in 0..16 {
+            queue.pauses().record(QM, Some("504"));
+        }
+        let app = test::init_service(App::new().app_data(queue.clone()).service(roots)).await;
+        let body =
+            test::call_and_read_body(&app, test::TestRequest::get().uri("/roots").to_request())
+                .await;
+        let body = std::str::from_utf8(&body).unwrap();
+        let mut seen = 0;
+        for line in body.lines() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            assert_eq!(fields.len(), 5, "{:?}", line);
+            if fields[0] == GOOD {
+                assert!(line.ends_with("\t-"), "{:?}", line);
+                seen += 1;
+            } else if fields[0] == QM {
+                assert!(fields[4].starts_with("paused "), "{:?}", line);
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 2, "{}", body);
     }
 
     #[actix_web::test]
