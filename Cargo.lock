@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "ipfs_indexer"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "actix-web",
  "cid",
