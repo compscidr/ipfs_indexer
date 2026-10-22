@@ -19,6 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// (page id, how often the term appears on it)
 pub type Posting = (u64, u32);
@@ -390,6 +391,8 @@ pub struct Segment {
     shortest: u32,
     // the footer's checksum
     sum: u64,
+    // whether the checksum is known good: opened verified, written here, or verify passed
+    verified: AtomicBool,
 }
 
 impl Segment {
@@ -398,10 +401,17 @@ impl Segment {
         Segment::read(path, true)
     }
 
-    /// Opens a segment file with its structure checked, but not its checksum, which would
-    /// re-read the whole file (#247): one this process just wrote and fsynced, or one opened at
-    /// startup, checked by verify after the API is up (v0.5.6)
+    /// Opens a segment file this process just wrote and fsynced: its structure is checked, but
+    /// not its checksum, which would re-read the whole file (#247). It counts as verified.
     pub fn open_written(path: &Path) -> io::Result<Segment> {
+        let mut segment = Segment::read(path, false)?;
+        *segment.verified.get_mut() = true;
+        Ok(segment)
+    }
+
+    /// Opens a segment file at startup with its structure checked but not its checksum, so the
+    /// API needn't wait for every file to be read whole (v0.5.6): verify does that later
+    pub fn open_unverified(path: &Path) -> io::Result<Segment> {
         Segment::read(path, false)
     }
 
@@ -482,12 +492,20 @@ impl Segment {
             version,
             shortest,
             sum,
+            verified: AtomicBool::new(verify),
         })
     }
 
-    /// Checks the checksum open_written skipped, reading the whole file: for the check after
-    /// startup (v0.5.6). A mismatch is a corrupt error naming the file.
-    pub fn verify(&self) -> io::Result<()> {
+    /**
+     * Checks the checksum open_unverified skipped, reading the whole file, unless it's verified
+     * already (v0.5.6): by the check after startup, and by a merge or rewrite before it copies
+     * the file's contents into a new one with a sound checksum. A pass is recorded; true if it
+     * read the file. A mismatch is a corrupt error naming the file.
+     */
+    pub fn verify(&self) -> io::Result<bool> {
+        if self.verified.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
         if checksum(&self.file, self.info.bytes)? != self.sum {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -497,7 +515,8 @@ impl Segment {
                 ),
             ));
         }
-        Ok(())
+        self.verified.store(true, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// The format version it was written in
@@ -1046,13 +1065,27 @@ mod tests {
             &[(1, 1), (2, 1)],
             &[("apple", vec![(1, 1)]), ("zebra", vec![(2, 1)])],
         );
-        Segment::open_written(&path).unwrap().verify().unwrap();
+        let segment = Segment::open_unverified(&path).unwrap();
+        assert!(segment.verify().unwrap(), "read");
+        assert!(!segment.verify().unwrap(), "once");
+        assert!(
+            !Segment::open_written(&path).unwrap().verify().unwrap(),
+            "written here"
+        );
+        assert!(
+            !Segment::open(&path).unwrap().verify().unwrap(),
+            "verified opening"
+        );
         damage_postings(&path);
-        let segment = Segment::open_written(&path).expect("opening doesn't read the postings");
+        let segment = Segment::open_unverified(&path).expect("opening doesn't read the postings");
         assert_eq!(segment.postings(b"apple").unwrap(), vec![(1, 1)]);
         let err = segment.verify().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("1.seg"), "{}", err);
+        assert!(
+            segment.verify().is_err(),
+            "a failure isn't recorded as a pass"
+        );
         assert!(Segment::open(&path).is_err(), "a verifying open fails it");
     }
 

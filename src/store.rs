@@ -1691,6 +1691,62 @@ pub(crate) mod tests {
         assert!(!damage_marker(&dir).exists());
     }
 
+    // the page ids in a store's live segment file
+    fn ids_in(store: &Store, file: &Path) -> Vec<u64> {
+        let live = store.segments.snapshot();
+        let segment = live.iter().find(|s| s.path() == file).unwrap();
+        segment.docs().map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn a_rewrite_or_merge_checks_an_unchecked_input_first_and_fails_on_damage() {
+        // a takedown's rewrite (#249) and a merge, before the background check got there
+        for merge in [false, true] {
+            let dir = temp_dir("verify-before-rewrite");
+            let files = segmented(&dir, &["apple", "zebra"]);
+            crate::segment::damage_postings(&files[0]);
+            let store = Store::open(&dir, 0).unwrap();
+            let ids = ids_in(&store, &files[0]);
+            store.segments.set_dead(&ids);
+            if merge {
+                store.merge();
+            } else {
+                store.segments.mark_erase(&ids);
+                store.upkeep();
+            }
+            let name = files[0].file_name().unwrap().to_string_lossy().into_owned();
+            let damage = store.damage().expect("marked damaged");
+            assert!(damage.contains(&name), "{}", damage);
+            assert!(damage_marker(&dir).exists());
+            let live: Vec<PathBuf> = store
+                .segments
+                .snapshot()
+                .iter()
+                .map(|s| s.path().to_path_buf())
+                .collect();
+            assert_eq!(live, files, "nothing installed");
+            assert_eq!(
+                crate::segments::tests::segment_files(&dir.join("segments")),
+                files,
+                "no output left"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rewrite_checks_an_input_once_and_the_background_check_skips_it() {
+        let dir = temp_dir("verify-rewrite-ok");
+        let files = segmented(&dir, &["apple", "zebra", "mango"]);
+        let store = Store::open(&dir, 0).unwrap();
+        let ids = ids_in(&store, &files[0]);
+        store.segments.set_dead(&ids);
+        store.segments.mark_erase(&ids);
+        store.upkeep();
+        assert_eq!(store.damage(), None);
+        // the rewritten file is gone; the other two are checked
+        assert_eq!(store.verify_segments().unwrap(), 2);
+    }
+
     #[test]
     fn integrity_problems_is_empty_for_a_sound_index_or_none() {
         let dir = temp_dir("integrity");

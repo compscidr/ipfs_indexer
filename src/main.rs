@@ -548,7 +548,12 @@ async fn main() -> std::io::Result<()> {
     // them (v0.5.6); a bad one marks the index damaged, for /health and the next start
     if std::env::var("DATA_DIR").is_ok() {
         let verify_queue = Arc::clone(&index_queue);
-        std::thread::spawn(move || verify_queue.verify_store());
+        std::thread::spawn(move || {
+            let check = std::panic::catch_unwind(AssertUnwindSafe(|| verify_queue.verify_store()));
+            if check.is_err() {
+                error!("The segment check panicked; the segment files weren't all checked");
+            }
+        });
     }
     // pages that expired while the indexer was down, then a reseed in case the seed was one;
     // the refresh thread does the same daily

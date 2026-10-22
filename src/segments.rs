@@ -447,7 +447,7 @@ impl Segments {
             let segment = if verify {
                 Segment::open(&path)?
             } else {
-                Segment::open_written(&path)?
+                Segment::open_unverified(&path)?
             };
             live.push(Arc::new(segment));
         }
@@ -477,8 +477,8 @@ impl Segments {
     }
 
     /**
-     * Checks the checksum of each file open() didn't (v0.5.6), once; files written since are
-     * checked as they're written. For a thread of its own: it reads them whole, one at a time,
+     * Checks the checksum of each file open() didn't (v0.5.6), once, skipping any a merge or
+     * rewrite checked first (see rewrite); files written since are checked as they're written. For a thread of its own: it reads them whole, one at a time,
      * taking the state lock only to look each one up, so merges and searches go on. A file
      * merged away meanwhile is skipped, even mid-read: erasing it (#249) zeroes it, which would
      * look like damage. Returns the files and bytes checked, or the first file's error (a
@@ -504,10 +504,12 @@ impl Segments {
             #[cfg(test)]
             self.hook(Hook::Verified);
             match verified {
-                Ok(()) => {
+                Ok(true) => {
                     files += 1;
                     bytes += segment.info().bytes;
                 }
+                // a merge or rewrite checked it first
+                Ok(false) => {}
                 Err(_) if !self.is_live(&segment) => {
                     log::debug!("{} was merged away while it was checked", path.display());
                 }
@@ -854,8 +856,9 @@ impl Segments {
             self.hook(Hook::BeforeMerge);
             // false: another install took an input first; the next pick starts from what's live
             match self.rewrite(&inputs) {
-                // a failed upgrade (a full disk, say) mustn't hold up the merges behind it
-                Err(err) if upgrading => {
+                // a failed upgrade (a full disk, say) mustn't hold up the merges behind it; a
+                // damaged file is reported (v0.5.6)
+                Err(err) if upgrading && err.kind() != io::ErrorKind::InvalidData => {
                     log::warn!(
                         "Upgrading segment {} failed, retrying in {} minutes: {}",
                         inputs[0].path().display(),
@@ -1195,6 +1198,18 @@ impl Segments {
         // replaced between the pick and `seen`: no later install would prompt a check
         if !self.all_live(inputs) {
             return Ok(false);
+        }
+        // a file opened at startup is checked before it's copied (v0.5.6): else damage the
+        // background check hadn't reached would go on in a file with a sound checksum, and the
+        // damaged one be erased unreported. A mismatch fails the rewrite, as corrupt.
+        for input in inputs {
+            if let Err(err) = input.verify() {
+                // held here, so not erased under the read; but replaced, it no longer matters
+                if !self.all_live(inputs) {
+                    return Ok(false);
+                }
+                return Err(err);
+            }
         }
         let mut replaced = || {
             #[cfg(test)]
@@ -2487,6 +2502,24 @@ pub(crate) mod tests {
             Segments::open(&dir).unwrap().verify_opened().unwrap(),
             (2, bytes_ok)
         );
+    }
+
+    #[test]
+    fn an_upgrade_of_a_damaged_unchecked_file_fails_as_corrupt_and_installs_nothing() {
+        let dir = temp_dir("segments-upgrade-damaged");
+        let segments = Segments::open(&dir).unwrap();
+        segments.set_write_version(1);
+        segments.add(1, 1, &words(&[("alpha", 1)]));
+        segments.flush().unwrap();
+        drop(segments);
+        let files = segment_files(&dir);
+        crate::segment::damage_postings(&files[0]);
+
+        let segments = Segments::open(&dir).unwrap();
+        let err = segments.merge().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{}", err);
+        assert_eq!(segments.snapshot()[0].path(), files[0]);
+        assert_eq!(segment_files(&dir), files, "no output left");
     }
 
     #[test]
