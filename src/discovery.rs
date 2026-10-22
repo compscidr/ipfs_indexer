@@ -16,6 +16,8 @@ const HOUR: i64 = 60 * 60;
 const DAY: i64 = 24 * HOUR;
 // the ENS scan's next block, in discovery_state
 const ENS_NEXT_BLOCK: &str = "ens_next_block";
+// how much of a gateway's error body a failed check keeps
+const ERROR_BODY_CHARS: usize = 200;
 
 /// At most `per_hour` new roots an hour, across every source (0: no limit)
 pub struct HourlyCap {
@@ -79,11 +81,24 @@ pub fn resolve(gateway: &str, name: &str) -> Result<String, String> {
         .push("ipns")
         .push(name)
         .push("");
-    let response = client
-        .get(url)
-        .send()
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| e.to_string())?;
+    let response = client.get(url).send().map_err(|e| e.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        // kubo says why in the body, e.g. "DNSLink lookup could not find a TXT record"
+        let body = response.text().unwrap_or_default();
+        let why: String = body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(ERROR_BODY_CHARS)
+            .collect();
+        return Err(if why.is_empty() {
+            status.to_string()
+        } else {
+            format!("{}: {}", status, why)
+        });
+    }
     let roots = response
         .headers()
         .get("x-ipfs-roots")
@@ -253,6 +268,10 @@ pub fn run_seeds(queue: &IndexQueue, path: &Path) {
                 if new > 0 {
                     info!("Seeds file: {} new of {} entries", new, entries.len());
                 }
+                let gone = forget_seeds(queue, &entries);
+                if gone > 0 {
+                    info!("Seeds file: {} no longer listed, forgotten", gone);
+                }
             }
             Err(err) => warn!(
                 "Couldn't read seeds file {}: {}; keeping the entries read before",
@@ -262,6 +281,20 @@ pub fn run_seeds(queue: &IndexQueue, path: &Path) {
         }
         std::thread::sleep(Duration::from_secs(HOUR as u64));
     }
+}
+
+/// Forgets seeds that are no longer in the file; returns how many. The pages they led to stay
+/// until they expire.
+pub fn forget_seeds(queue: &IndexQueue, entries: &[Entry]) -> usize {
+    let keep: Vec<String> = entries.iter().map(|e| e.as_str().to_string()).collect();
+    queue
+        .store()
+        .discovered_forget("seeds", &keep)
+        .unwrap_or_else(|err| {
+            warn!("Couldn't forget old seeds: {}", err);
+            queue.store().note_error(&err);
+            0
+        })
 }
 
 /// Stores ENS events: a node's IPFS or IPNS record becomes its entry (due now), a cleared one
@@ -693,6 +726,68 @@ mod tests {
         // an unreadable file adds nothing, and the entries stay
         assert_eq!(add_seeds(&queue, &[], NOW + 2 * HOUR), 0);
         assert_eq!(queue.discovered_count(), 2);
+    }
+
+    #[test]
+    fn seeds_taken_out_of_the_file_are_forgotten() {
+        let queue = IndexQueue::new();
+        add_seeds(&queue, &parse_seeds("docs.ipfs.tech\nvitalik.eth\n"), NOW);
+        queue.discover("app.uniswap.org", "submitted").unwrap();
+        assert_eq!(forget_seeds(&queue, &parse_seeds("vitalik.eth\n")), 1);
+        let mut left: Vec<String> = queue.discovered().into_iter().map(|d| d.entry).collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["app.uniswap.org", "vitalik.eth"],
+            "only seeds are forgotten"
+        );
+        assert_eq!(forget_seeds(&queue, &parse_seeds("vitalik.eth\n")), 0);
+    }
+
+    // a gateway that answers every request with this status line and body; returns its host:port
+    fn gateway_answering(status: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let reply = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        host
+    }
+
+    #[test]
+    fn a_failed_name_says_what_the_gateway_said() {
+        let gw = gateway_answering(
+            "500 Internal Server Error",
+            "failed to resolve /ipns/libp2p.io/: DNSLink lookup could not find a TXT record\n",
+        );
+        assert_eq!(
+            resolve(&gw, "libp2p.io"),
+            Err("500 Internal Server Error: failed to resolve /ipns/libp2p.io/: DNSLink lookup could not find a TXT record".to_string())
+        );
+        // a long body is cut, and its lines joined
+        let long: &'static str = Box::leak(format!("a\nb {}", "x".repeat(500)).into_boxed_str());
+        let err = resolve(&gateway_answering("502 Bad Gateway", long), "x.eth").unwrap_err();
+        assert!(err.starts_with("502 Bad Gateway: a b xxx"), "{}", err);
+        assert_eq!(
+            err.chars().count(),
+            "502 Bad Gateway: ".len() + ERROR_BODY_CHARS
+        );
+        // no body: just the status
+        assert_eq!(
+            resolve(&gateway_answering("504 Gateway Timeout", ""), "x.eth"),
+            Err("504 Gateway Timeout".to_string())
+        );
     }
 
     #[test]

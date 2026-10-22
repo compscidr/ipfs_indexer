@@ -911,6 +911,26 @@ impl Store {
         Ok(())
     }
 
+    /// Drops a source's entries that aren't in `keep`, e.g. seeds taken out of the file; returns
+    /// how many
+    pub fn discovered_forget(&self, source: &str, keep: &[String]) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut forgotten = 0;
+        {
+            let listed: Vec<String> = tx
+                .prepare_cached("SELECT entry FROM discovered WHERE source = ?1")?
+                .query_map([source], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut stmt = tx.prepare_cached("DELETE FROM discovered WHERE entry = ?1")?;
+            for entry in listed.iter().filter(|e| !keep.contains(e)) {
+                forgotten += stmt.execute([entry])?;
+            }
+        }
+        tx.commit()?;
+        Ok(forgotten)
+    }
+
     /// Every entry, most recently checked first, then those never checked, for /discovered
     pub fn discovered_all(&self) -> rusqlite::Result<Vec<Discovered>> {
         let conn = self.read_conn();
