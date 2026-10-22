@@ -491,11 +491,15 @@ async fn main() -> std::io::Result<()> {
     };
     if let Ok(dir) = std::env::var("DATA_DIR") {
         info!("Index cache: at most {} MB in memory", cache_mb);
+        let opening = std::time::Instant::now();
         let attached = index_queue.open_store(std::path::Path::new(&dir), cache_mb, max_age_secs);
         match attached {
             Ok((pages, queued)) => info!(
-                "Opened {}/index.sqlite: {} pages, {} queued",
-                dir, pages, queued
+                "Opened {}/index.sqlite: {} pages, {} queued, in {:.1?}",
+                dir,
+                pages,
+                queued,
+                opening.elapsed()
             ),
             Err(err) => {
                 error!("Couldn't use DATA_DIR {}: {}", dir, err);

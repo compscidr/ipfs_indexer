@@ -171,7 +171,9 @@ impl Store {
         store.lookup = Some(read_only()?);
         store.scan = Some(read_only()?);
         // erasures a crash interrupted finish before anything is crawled or served (#249)
+        let start = Instant::now();
         store.maintain();
+        log::info!("Startup: upkeep in {:.1?}", start.elapsed());
         Ok(store)
     }
 
@@ -207,6 +209,8 @@ impl Store {
             conn.pragma_update(None, "cache_size", -(cache_mb as i64) * 1024)?;
         }
         refuse_old_format(&conn)?;
+        // how long each part of opening takes, for slow starts
+        let start = Instant::now();
         let has_roots: bool = conn
             .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'roots'")?
             .exists([])?;
@@ -257,6 +261,8 @@ impl Store {
             ),
             [],
         )?;
+        log::info!("Startup: schema and migrations in {:.1?}", start.elapsed());
+        let start = Instant::now();
         recover_unflushed(&mut conn, segments.flushed_through())?;
         // ids in the segments must never be handed out again, even if this file fell behind them
         // (rolled back by a power loss, or wiped while segments/ was kept)
@@ -285,6 +291,11 @@ impl Store {
             .map(|id| id.map(|id| id as u64))
             .collect::<rusqlite::Result<_>>()?;
         segments.mark_erase(&erase);
+        log::info!(
+            "Startup: unflushed and dead pages in {:.1?}",
+            start.elapsed()
+        );
+        let start = Instant::now();
         let queued: i64 = conn.query_row("SELECT count(*) FROM queue", [], |r| r.get(0))?;
         let mirrors: i64 = conn.query_row("SELECT count(*) FROM mirrors", [], |r| r.get(0))?;
         let (pages, lengths): (i64, i64) = conn.query_row(
@@ -292,6 +303,13 @@ impl Store {
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        log::info!(
+            "Startup: counted {} pages, {} queued and {} mirrors in {:.1?}",
+            pages,
+            queued,
+            mirrors,
+            start.elapsed()
+        );
         Ok(Store {
             conn: Mutex::new(conn),
             reader: None,

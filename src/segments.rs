@@ -419,10 +419,20 @@ impl Segments {
     pub fn open(dir: &Path) -> io::Result<Segments> {
         fs::create_dir_all(dir)?;
         let (next_gen, flushed_through, names) = read_manifest(dir)?.unwrap_or((1, 0, Vec::new()));
-        let mut live = Vec::new();
+        // each file is read whole for its checksum: how long that takes, for slow starts
+        let start = Instant::now();
+        let (mut live, mut bytes) = (Vec::new(), 0u64);
         for name in &names {
-            live.push(Arc::new(Segment::open(&dir.join(name))?));
+            let path = dir.join(name);
+            bytes += fs::metadata(&path)?.len();
+            live.push(Arc::new(Segment::open(&path)?));
         }
+        log::info!(
+            "Startup: checked {} segment files ({:.1} GB) in {:.1?}",
+            live.len(),
+            bytes as f64 / 1e9,
+            start.elapsed()
+        );
         for entry in fs::read_dir(dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
             if name == "MANIFEST.tmp" || (name.ends_with(".seg") && !names.contains(&name)) {
