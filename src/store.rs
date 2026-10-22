@@ -4,8 +4,8 @@ use log::debug;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,8 +48,9 @@ pub struct Store {
     lengths: AtomicU64,
     // rows in `mirrors`, for /status (#253)
     mirrors: AtomicUsize,
-    // set once a store error says the index is damaged, so it's marked (and logged) once (#266)
-    damaged: AtomicBool,
+    // set once a store error says the index is damaged, so it's marked (and logged) once (#266);
+    // the error, for /health (v0.5.6)
+    damaged: OnceLock<String>,
 }
 
 /**
@@ -157,11 +158,26 @@ pub struct Queued {
 const QUEUE_ROOT_FIRST: &str = "SELECT min(rowid) FROM queue WHERE root = ?1";
 
 impl Store {
-    /// Opens DATA_DIR's index; SQLite keeps at most cache_mb of it in memory
+    /// Opens DATA_DIR's index; SQLite keeps at most cache_mb of it in memory. The segment files'
+    /// checksums aren't read: see verify_segments.
     pub fn open(dir: &Path, cache_mb: u32) -> Result<Store, OpenError> {
+        Store::open_with(dir, cache_mb, false)
+    }
+
+    /// Opens DATA_DIR's index like open, with every segment file read whole for its checksum
+    /// first: a bad one fails the open as corrupt (see is_corrupt)
+    pub fn open_verified(dir: &Path, cache_mb: u32) -> Result<Store, OpenError> {
+        Store::open_with(dir, cache_mb, true)
+    }
+
+    fn open_with(dir: &Path, cache_mb: u32, verify_segments: bool) -> Result<Store, OpenError> {
         let path = dir.join("index.sqlite");
         let conn = Connection::open(&path)?;
-        let segments = Segments::open(&dir.join("segments"))?;
+        let segments = if verify_segments {
+            Segments::open_verified(&dir.join("segments"))?
+        } else {
+            Segments::open(&dir.join("segments"))?
+        };
         let mut store = Store::init(conn, Some(path.clone()), cache_mb, segments)?;
         // default cache_size, not cache_mb: SQLite drops a connection's cache whenever another
         // one commits, which the crawl does constantly, so a big one here would rarely be warm
@@ -173,7 +189,9 @@ impl Store {
         store.reader = Some(read_only()?);
         store.lookup = Some(read_only()?);
         store.scan = Some(read_only()?);
-        // erasures a crash interrupted finish before anything is crawled or served (#249)
+        // erasures a crash interrupted finish before anything is crawled or served (#249); a
+        // merge or erase rewrite here checks its unchecked inputs first, so it may read a few
+        // files whole before the API is up (bounded by what's due)
         let start = Instant::now();
         store.maintain();
         log::info!("Startup: upkeep in {:.1?}", start.elapsed());
@@ -332,7 +350,7 @@ impl Store {
             pages: AtomicUsize::new(pages as usize),
             lengths: AtomicU64::new(lengths as u64),
             mirrors: AtomicUsize::new(mirrors as usize),
-            damaged: AtomicBool::new(false),
+            damaged: OnceLock::new(),
         })
     }
 
@@ -574,7 +592,7 @@ impl Store {
      * search carry on meanwhile.
      */
     pub fn note_error(&self, err: &(dyn std::error::Error + 'static)) {
-        if !is_corrupt(err) || self.damaged.swap(true, Ordering::Relaxed) {
+        if !is_corrupt(err) || self.damaged.set(err.to_string()).is_err() {
             return;
         }
         let Some(path) = &self.path else {
@@ -595,6 +613,39 @@ impl Store {
                 marker.display(),
                 write_err
             ),
+        }
+    }
+
+    /// The error that marked the index damaged this run (note_error), if one did
+    pub fn damage(&self) -> Option<String> {
+        self.damaged.get().cloned()
+    }
+
+    /**
+     * Checks the checksums of the segment files open didn't read whole (Segments::verify_opened,
+     * v0.5.6), for a thread of its own once the store is attached. A file that fails marks the
+     * index damaged (note_error): /health says so, and the next start checks every file and
+     * rebuilds. Returns how many files were checked.
+     */
+    pub fn verify_segments(&self) -> std::io::Result<usize> {
+        let start = Instant::now();
+        match self.segments.verify_opened() {
+            Ok((files, bytes)) => {
+                if files > 0 {
+                    log::info!(
+                        "Checked {} segment files ({:.1} GB) in {:.1?}",
+                        files,
+                        bytes as f64 / 1e9,
+                        start.elapsed()
+                    );
+                }
+                Ok(files)
+            }
+            // Segment::verify logged it
+            Err(err) => {
+                self.note_error(&err);
+                Err(err)
+            }
         }
     }
 
@@ -1584,6 +1635,148 @@ pub(crate) mod tests {
         Store::open_in_memory()
             .unwrap()
             .note_error(&sqlite_error(rusqlite::ffi::SQLITE_CORRUPT));
+    }
+
+    // a store in dir with one segment file per word, closed; the files, by name
+    fn segmented(dir: &Path, words: &[&str]) -> Vec<PathBuf> {
+        let store = Store::open(dir, 0).unwrap();
+        for (i, word) in words.iter().enumerate() {
+            let item = format!("bafy{}", i);
+            store
+                .upsert(&item, &page(&item, "t", &[(word, 1)]), 1)
+                .unwrap();
+            store.flush().unwrap();
+        }
+        crate::segments::tests::segment_files(&dir.join("segments"))
+    }
+
+    #[test]
+    fn the_segment_check_counts_sound_files_and_marks_a_damaged_one() {
+        let dir = temp_dir("verify-segments");
+        let files = segmented(&dir, &["apple", "zebra"]);
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(store.verify_segments().unwrap(), 2);
+        assert_eq!(store.damage(), None);
+        assert!(!damage_marker(&dir).exists());
+        drop(store);
+
+        crate::segment::damage_postings(&files[1]);
+        let store = Store::open(&dir, 0).expect("opening doesn't read the postings");
+        assert_eq!(store.postings("apple").unwrap().len(), 1, "and it serves");
+        assert!(store.verify_segments().is_err());
+        let name = files[1].file_name().unwrap().to_string_lossy().into_owned();
+        let damage = store.damage().expect("marked damaged");
+        assert!(damage.contains(&name), "{}", damage);
+        assert!(fs::read_to_string(damage_marker(&dir))
+            .unwrap()
+            .contains(&name));
+    }
+
+    #[test]
+    fn a_damaged_segment_merged_away_during_the_check_isnt_reported() {
+        let dir = temp_dir("verify-segments-gone");
+        let files = segmented(&dir, &["apple", "zebra"]);
+        for file in &files {
+            crate::segment::damage_postings(file);
+        }
+        let store = Store::open(&dir, 0).unwrap();
+        // the first left before the check reached it, the second after it was read, before its
+        // result was used (retire_locked's strong-count guard rules out an erase mid-read)
+        store.segments.remove_for_test(&files[0]);
+        let second = files[1].clone();
+        store.segments.set_hook(move |segments, at| {
+            if at == crate::segments::Hook::Verified {
+                segments.remove_for_test(&second);
+            }
+        });
+        assert_eq!(store.verify_segments().unwrap(), 0);
+        assert_eq!(store.damage(), None);
+        assert!(!damage_marker(&dir).exists());
+    }
+
+    // the page ids in a store's live segment file
+    fn ids_in(store: &Store, file: &Path) -> Vec<u64> {
+        let live = store.segments.snapshot();
+        let segment = live.iter().find(|s| s.path() == file).unwrap();
+        segment.docs().map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn a_rewrite_or_merge_checks_an_unchecked_input_first_and_fails_on_damage() {
+        // a takedown's rewrite (#249) and a merge, before the background check got there
+        for merge in [false, true] {
+            let dir = temp_dir("verify-before-rewrite");
+            let files = segmented(&dir, &["apple", "zebra"]);
+            crate::segment::damage_postings(&files[0]);
+            let store = Store::open(&dir, 0).unwrap();
+            let ids = ids_in(&store, &files[0]);
+            store.segments.set_dead(&ids);
+            if merge {
+                store.merge();
+            } else {
+                store.segments.mark_erase(&ids);
+                store.upkeep();
+            }
+            let name = files[0].file_name().unwrap().to_string_lossy().into_owned();
+            let damage = store.damage().expect("marked damaged");
+            assert!(damage.contains(&name), "{}", damage);
+            assert!(damage_marker(&dir).exists());
+            let live: Vec<PathBuf> = store
+                .segments
+                .snapshot()
+                .iter()
+                .map(|s| s.path().to_path_buf())
+                .collect();
+            assert_eq!(live, files, "nothing installed");
+            assert_eq!(
+                crate::segments::tests::segment_files(&dir.join("segments")),
+                files,
+                "no output left"
+            );
+        }
+    }
+
+    #[test]
+    fn a_damaged_file_doesnt_hold_up_takedowns_in_others_and_is_read_once() {
+        let dir = temp_dir("verify-takedowns");
+        let files = segmented(&dir, &["apple", "zebra"]);
+        crate::segment::damage_postings(&files[0]);
+        let store = Store::open(&dir, 0).unwrap();
+        let (bad, good) = (ids_in(&store, &files[0]), ids_in(&store, &files[1]));
+        let ids: Vec<u64> = bad.iter().chain(&good).copied().collect();
+        store.segments.set_dead(&ids);
+        store.segments.mark_erase(&ids);
+        crate::segment::CHECKSUMS.with(|n| n.set(0));
+        store.upkeep();
+        store.upkeep();
+        assert!(store.damage().is_some());
+        let live = store.segments.snapshot();
+        assert!(
+            live.iter().any(|s| s.path() == files[0]),
+            "left for the restart"
+        );
+        assert!(!live.iter().any(|s| s.path() == files[1]), "rewritten");
+        assert!(!files[1].exists(), "and erased");
+        assert!(live.iter().all(|s| !s.contains(good[0])));
+        assert_eq!(
+            crate::segment::CHECKSUMS.with(|n| n.get()),
+            2,
+            "each input read once"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_checks_an_input_once_and_the_background_check_skips_it() {
+        let dir = temp_dir("verify-rewrite-ok");
+        let files = segmented(&dir, &["apple", "zebra", "mango"]);
+        let store = Store::open(&dir, 0).unwrap();
+        let ids = ids_in(&store, &files[0]);
+        store.segments.set_dead(&ids);
+        store.segments.mark_erase(&ids);
+        store.upkeep();
+        assert_eq!(store.damage(), None);
+        // the rewritten file is gone; the other two are checked
+        assert_eq!(store.verify_segments().unwrap(), 2);
     }
 
     #[test]

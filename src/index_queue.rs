@@ -145,13 +145,14 @@ fn read_retrying<T>(
 
 /**
  * If a store error marked the index as damaged while it ran (#266), checks all of index.sqlite:
- * erases the index if the check finds damage (open then starts it empty), else keeps it and
- * drops the marker. Damaged segments needn't be checked here: opening checks every one.
+ * erases the index if the check finds damage (open then starts it empty), else keeps it. Opening
+ * no longer reads the segment files whole (v0.5.6), so true means it must here: their checksums
+ * are checked as they open, and the marker goes once they pass.
  */
-fn check_marked_damage(dir: &std::path::Path) -> Result<(), OpenError> {
+fn check_marked_damage(dir: &std::path::Path) -> Result<bool, OpenError> {
     let marker = store::damage_marker(dir);
     if !marker.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let reason = std::fs::read_to_string(&marker).unwrap_or_default();
     warn!(
@@ -167,10 +168,10 @@ fn check_marked_damage(dir: &std::path::Path) -> Result<(), OpenError> {
     };
     if problems.is_empty() {
         info!(
-            "The index checked out ok in {:?}; keeping it",
+            "index.sqlite checked out ok in {:?}; checking the segment files as they open",
             start.elapsed()
         );
-        std::fs::remove_file(&marker)?;
+        Ok(true)
     } else {
         error!(
             "The index in {} is damaged ({}); erasing it and starting again empty",
@@ -178,8 +179,8 @@ fn check_marked_damage(dir: &std::path::Path) -> Result<(), OpenError> {
             problems.join("; ")
         );
         store::wipe(dir)?;
+        Ok(false)
     }
-    Ok(())
 }
 
 // skip anything bigger than this rather than pulling it all into memory
@@ -578,8 +579,9 @@ impl IndexQueue {
     /**
      * Opens DATA_DIR's index and attaches it (see attach_store). A damaged index is erased and
      * started again empty, once, rather than refusing to start until someone wipes it by hand:
-     * it's rebuilt by crawling either way. Opening only reads part of index.sqlite, so damage a
-     * store error found while running (marked by Store::note_error, #266) is checked here first.
+     * it's rebuilt by crawling either way. Opening only reads part of index.sqlite, and none of
+     * the segment files whole (v0.5.6), so damage a store error or the segment check found while
+     * running (marked by Store::note_error, #266) is checked here first.
      */
     pub fn open_store(
         &self,
@@ -587,12 +589,16 @@ impl IndexQueue {
         cache_mb: u32,
         max_age_secs: i64,
     ) -> Result<(usize, usize), OpenError> {
-        let open = || -> Result<_, OpenError> {
-            let store = Store::open(dir, cache_mb)?;
+        let open = |verify: bool| -> Result<_, OpenError> {
+            let store = if verify {
+                Store::open_verified(dir, cache_mb)?
+            } else {
+                Store::open(dir, cache_mb)?
+            };
             Ok(self.attach_store(store, max_age_secs)?)
         };
-        check_marked_damage(dir)?;
-        match open() {
+        let verify = check_marked_damage(dir)?;
+        match open(verify) {
             Err(err) if store::is_corrupt(&*err) => {
                 error!(
                     "The index in {} is damaged ({}); erasing it and starting again empty",
@@ -600,10 +606,27 @@ impl IndexQueue {
                     err
                 );
                 store::wipe(dir)?;
-                open()
+                open(false)
+            }
+            // unless opening (its upkeep, say) found new damage, which marked it again
+            Ok(counts) if verify && self.damage().is_none() => {
+                info!("The index checked out ok; keeping it");
+                std::fs::remove_file(store::damage_marker(dir))?;
+                Ok(counts)
             }
             other => other,
         }
+    }
+
+    /// Checks the segment files' checksums, which opening skipped (Store::verify_segments,
+    /// v0.5.6). For a thread of its own once the store is attached: it reads the whole index.
+    pub fn verify_store(&self) {
+        let _ = self.store().verify_segments();
+    }
+
+    /// The error that marked the index damaged this run (#266), for /health
+    pub fn damage(&self) -> Option<String> {
+        self.store.get()?.damage()
     }
 
     /**
@@ -1902,6 +1925,41 @@ mod tests {
         let queue = IndexQueue::new();
         assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "segmenttext77");
+    }
+
+    #[test]
+    fn a_segment_the_background_check_fails_is_marked_and_the_next_start_wipes_it() {
+        let dir = temp_dir("verify-segment");
+        let queue = IndexQueue::new();
+        queue.open_store(&dir, 0, 30 * DAY).unwrap();
+        queue.persist(GOOD, &page(GOOD, "t", &[("checkedtext77", 1)]));
+        queue.flush_for_test();
+        drop(queue);
+        let files = crate::segments::tests::segment_files(&dir.join("segments"));
+        crate::segment::damage_postings(&files[0]);
+
+        // opening doesn't read it whole: the index opens and serves
+        let queue = IndexQueue::new();
+        queue.open_store(&dir, 0, 30 * DAY).unwrap();
+        assert_eq!(queue.search("checkedtext77", 0, 10).1.len(), 1);
+        assert_eq!(queue.damage(), None);
+        queue.verify_store();
+        let damage = queue.damage().expect("the check marks it");
+        let name = files[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(damage.contains(&name), "{}", damage);
+        assert!(store::damage_marker(&dir).exists());
+        assert_eq!(
+            queue.search("checkedtext77", 0, 10).1.len(),
+            1,
+            "search carries on"
+        );
+        drop(queue);
+
+        // the marker has the next start check every file
+        let queue = IndexQueue::new();
+        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_wiped_and_working(&queue, &dir, "checkedtext77");
+        assert!(!store::damage_marker(&dir).exists());
     }
 
     #[test]

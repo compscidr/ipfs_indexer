@@ -19,6 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// (page id, how often the term appears on it)
 pub type Posting = (u64, u32);
@@ -40,10 +41,17 @@ thread_local! {
     pub(crate) static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // window reads for a range that began inside the window but ran past its end
     pub(crate) static STRADDLED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // files read whole for their checksum
+    pub(crate) static CHECKSUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 const END: &[u8] = b"ipxend";
 const FOOTER: u64 = 7 * 8 + 8 + 6;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+
+// a Segment's checksum (v0.5.6): not read yet, known good, or known not to match
+const UNCHECKED: u8 = 0;
+const SOUND: u8 = 1;
+const DAMAGED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SegmentInfo {
@@ -61,6 +69,24 @@ fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
     bytes
         .iter()
         .fold(hash, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+// FNV-1a 64 of a segment file of `bytes` bytes, up to the footer's checksum: the whole file
+// read, a chunk at a time
+fn checksum(file: &File, bytes: u64) -> io::Result<u64> {
+    #[cfg(test)]
+    CHECKSUMS.with(|n| n.set(n.get() + 1));
+    let checked = bytes - 8 - END.len() as u64;
+    let mut hash = FNV_OFFSET;
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut offset = 0;
+    while offset < checked {
+        let n = (checked - offset).min(chunk.len() as u64) as usize;
+        file.read_exact_at(&mut chunk[..n], offset)?;
+        hash = fnv1a(hash, &chunk[..n]);
+        offset += n as u64;
+    }
+    Ok(hash)
 }
 
 fn put_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -372,6 +398,10 @@ pub struct Segment {
     version: u8,
     // the shortest page: a v1 block's bound's length, having no impacts
     shortest: u32,
+    // the footer's checksum
+    sum: u64,
+    // UNCHECKED, SOUND (opened verified, written here, or verify passed) or DAMAGED
+    checked: AtomicU8,
 }
 
 impl Segment {
@@ -381,8 +411,16 @@ impl Segment {
     }
 
     /// Opens a segment file this process just wrote and fsynced: its structure is checked, but
-    /// not its checksum, which would re-read the whole file (#247). Open checks it at startup.
+    /// not its checksum, which would re-read the whole file (#247). It counts as verified.
     pub fn open_written(path: &Path) -> io::Result<Segment> {
+        let mut segment = Segment::read(path, false)?;
+        *segment.checked.get_mut() = SOUND;
+        Ok(segment)
+    }
+
+    /// Opens a segment file at startup with its structure checked but not its checksum, so the
+    /// API needn't wait for every file to be read whole (v0.5.6): verify does that later
+    pub fn open_unverified(path: &Path) -> io::Result<Segment> {
         Segment::read(path, false)
     }
 
@@ -397,20 +435,9 @@ impl Segment {
             return Err(corrupt());
         }
         let field = |i: usize| u64::from_le_bytes(footer[i * 8..i * 8 + 8].try_into().unwrap());
-        if verify {
-            let checked = bytes - 8 - END.len() as u64;
-            let mut hash = FNV_OFFSET;
-            let mut chunk = vec![0u8; 1 << 20];
-            let mut offset = 0;
-            while offset < checked {
-                let n = (checked - offset).min(chunk.len() as u64) as usize;
-                file.read_exact_at(&mut chunk[..n], offset)?;
-                hash = fnv1a(hash, &chunk[..n]);
-                offset += n as u64;
-            }
-            if hash != field(7) {
-                return Err(corrupt());
-            }
+        let sum = field(7);
+        if verify && checksum(&file, bytes)? != sum {
+            return Err(corrupt());
         }
         let header = read_at(&file, 0, MAGIC.len() as u64 + 1)?;
         if &header[..MAGIC.len()] != MAGIC {
@@ -473,7 +500,50 @@ impl Segment {
             lengths,
             version,
             shortest,
+            sum,
+            checked: AtomicU8::new(if verify { SOUND } else { UNCHECKED }),
         })
+    }
+
+    /**
+     * Checks the checksum open_unverified skipped, reading the whole file, unless it's known
+     * already (v0.5.6): by the check after startup, and by a merge or rewrite before it copies
+     * the file's contents into a new one with a sound checksum. The outcome is recorded, so a
+     * file is read once; true if it was read now. A mismatch is a corrupt error naming the
+     * file, logged the first time; another error (a failed read) leaves it unchecked.
+     */
+    pub fn verify(&self) -> io::Result<bool> {
+        let mismatch = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt segment file {}: checksum doesn't match",
+                    self.path.display()
+                ),
+            )
+        };
+        match self.checked.load(Ordering::Relaxed) {
+            SOUND => return Ok(false),
+            DAMAGED => return Err(mismatch()),
+            _ => {}
+        }
+        if checksum(&self.file, self.info.bytes)? != self.sum {
+            if self.checked.swap(DAMAGED, Ordering::Relaxed) != DAMAGED {
+                log::error!(
+                    "{}: it's left as it is, so pages taken down in it stay on disk until a \
+                     restart erases the damaged index",
+                    mismatch()
+                );
+            }
+            return Err(mismatch());
+        }
+        self.checked.store(SOUND, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// Whether verify found its checksum doesn't match: merges and rewrites leave it alone
+    pub fn is_damaged(&self) -> bool {
+        self.checked.load(Ordering::Relaxed) == DAMAGED
     }
 
     /// The format version it was written in
@@ -894,6 +964,36 @@ impl Iterator for Terms {
     }
 }
 
+/// Flips a bit in a file's last posting, which opening doesn't read: only its checksum notices
+#[cfg(test)]
+pub(crate) fn damage_postings(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let footer = bytes.len() - FOOTER as usize;
+    let field = |i: usize| {
+        u64::from_le_bytes(
+            bytes[footer + i * 8..footer + i * 8 + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    };
+    let (postings, dict) = (field(1), field(2));
+    assert!(postings < dict, "{} has no postings", path.display());
+    // a varint's last byte: its low bit changes a count, not how the block decodes
+    bytes[dict - 1] ^= 1;
+    std::fs::write(path, bytes).unwrap();
+    // so a format change that moves what this damages fails here, not in a puzzling way later
+    assert!(
+        Segment::open_unverified(path).is_ok(),
+        "{} no longer opens",
+        path.display()
+    );
+    assert!(
+        Segment::open(path).is_err(),
+        "{} still checks out",
+        path.display()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,6 +1093,38 @@ mod tests {
         assert!(Segment::open(&path).is_err(), "truncated");
         std::fs::write(&path, b"").unwrap();
         assert!(Segment::open(&path).is_err(), "empty");
+    }
+
+    #[test]
+    fn a_damaged_posting_opens_and_serves_and_only_verify_notices() {
+        let path = temp_dir("segment-verify").join("1.seg");
+        write(
+            &path,
+            &[(1, 1), (2, 1)],
+            &[("apple", vec![(1, 1)]), ("zebra", vec![(2, 1)])],
+        );
+        let segment = Segment::open_unverified(&path).unwrap();
+        assert!(segment.verify().unwrap(), "read");
+        assert!(!segment.verify().unwrap(), "once");
+        assert!(
+            !Segment::open_written(&path).unwrap().verify().unwrap(),
+            "written here"
+        );
+        assert!(
+            !Segment::open(&path).unwrap().verify().unwrap(),
+            "verified opening"
+        );
+        damage_postings(&path);
+        let segment = Segment::open_unverified(&path).expect("opening doesn't read the postings");
+        assert_eq!(segment.postings(b"apple").unwrap(), vec![(1, 1)]);
+        let err = segment.verify().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("1.seg"), "{}", err);
+        assert!(
+            segment.verify().is_err(),
+            "a failure isn't recorded as a pass"
+        );
+        assert!(Segment::open(&path).is_err(), "a verifying open fails it");
     }
 
     // the (count, length) pairs no other beats on both, by brute force, ascending
