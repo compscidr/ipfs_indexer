@@ -49,6 +49,7 @@ struct State {
 }
 
 impl Breaker {
+    #[cfg(test)]
     pub fn with(min: Duration, max: Duration) -> Breaker {
         Breaker::build(None, min, max)
     }
@@ -104,11 +105,6 @@ impl Breaker {
         self.state().until.is_some()
     }
 
-    /// The last gateway error seen; empty before any
-    pub fn last_error(&self) -> String {
-        self.state().last_error.clone()
-    }
-
     /// e.g. "paused 4m: 16 of the last 20 fetches failed; last: <error>"; None while crawling
     pub fn status(&self) -> Option<String> {
         self.status_at(Instant::now())
@@ -123,7 +119,6 @@ impl Breaker {
         matches!(s.until, Some(until) if s.testing || now < until)
     }
 
-    // "the crawl", or "it" for a root (named in the same line)
     // " of root <name>" for a root's breaker, else nothing
     fn of_root(&self) -> String {
         match &self.name {
@@ -132,6 +127,7 @@ impl Breaker {
         }
     }
 
+    // "the crawl", or "it" for a root (named in the same line)
     fn object(&self) -> &'static str {
         if self.name.is_some() {
             "it"

@@ -231,12 +231,13 @@ impl Store {
             .prepare("SELECT 1 FROM pragma_table_info('queue') WHERE name = 'root'")?
             .exists([])?;
         if !has_root {
+            log::info!("Recording each queued item's root (one-time, #286)");
             let tx = conn.transaction()?;
-            tx.execute_batch(
+            tx.execute_batch(&format!(
                 "ALTER TABLE queue ADD COLUMN root TEXT NOT NULL DEFAULT '';
-                 UPDATE queue SET root = CASE WHEN instr(item, '/') > 0
-                     THEN substr(item, 1, instr(item, '/') - 1) ELSE item END;",
-            )?;
+                 UPDATE queue SET root = {};",
+                QUEUE_ROOT_OF_ITEM
+            ))?;
             tx.commit()?;
         }
         conn.execute_batch(
@@ -246,6 +247,15 @@ impl Store {
              CREATE INDEX IF NOT EXISTS pages_indexed_at ON pages (indexed_at);
              CREATE INDEX IF NOT EXISTS mirrors_page ON mirrors (page);
              CREATE INDEX IF NOT EXISTS dead_pages_item ON dead_pages (item);",
+        )?;
+        // an older binary rolled back to and upgraded again leaves rows with no root (it writes
+        // only the item): fill them in, through the queue_root index, so none is skipped for good
+        conn.execute(
+            &format!(
+                "UPDATE queue SET root = {} WHERE root = ''",
+                QUEUE_ROOT_OF_ITEM
+            ),
+            [],
         )?;
         recover_unflushed(&mut conn, segments.flushed_through())?;
         // ids in the segments must never be handed out again, even if this file fell behind them
@@ -710,6 +720,7 @@ impl Store {
 
     /// Takes the oldest item off the frontier with its failed attempts so far, or None if it's
     /// empty
+    #[cfg(test)]
     pub fn queue_pop(&self) -> rusqlite::Result<Option<(String, u32)>> {
         Ok(self.queue_take(&[])?.map(|q| (q.item, q.attempts)))
     }
@@ -1295,6 +1306,10 @@ fn bump_root(tx: &Connection, item: &str, pages: i64, queued: i64) -> rusqlite::
  * the two GROUP BYs sort every row's root in memory (temp_store), about 350 MB at 2M pages and
  * 3M queued, which is fine at that size for a one-time step.
  */
+// the root of a queued item: its first path segment (#286)
+const QUEUE_ROOT_OF_ITEM: &str =
+    "CASE WHEN instr(item, '/') > 0 THEN substr(item, 1, instr(item, '/') - 1) ELSE item END";
+
 fn fill_roots(conn: &mut Connection) -> rusqlite::Result<()> {
     log::info!("Counting pages and queued items per root (one-time, #231)");
     let tx = conn.transaction()?;
@@ -1891,6 +1906,29 @@ pub(crate) mod tests {
         for item in ["a/x/y", "b", "a/z"] {
             assert_eq!(store.queue_pop().unwrap(), Some((item.to_string(), 0)));
         }
+    }
+
+    #[test]
+    fn rows_queued_by_an_older_binary_gain_their_root_on_reopen() {
+        let dir = temp_dir("queue-root-rollback");
+        let store = Store::open(&dir, 0).unwrap();
+        store.queue_add(&["a/1".into()]).unwrap();
+        drop(store);
+        {
+            // v0.5.1 after a rollback: writes (item) only, so root defaults to ''
+            let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+            conn.execute("INSERT INTO queue (item) VALUES ('b/2/3')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO roots (root, pages, queued) VALUES ('b', 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(queue_roots(&store), vec!["a", "b"]);
+        let taken = store.queue_take(&["a".to_string()]).unwrap().unwrap();
+        assert_eq!(taken.item, "b/2/3");
     }
 
     #[test]
