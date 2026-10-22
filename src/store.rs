@@ -132,13 +132,16 @@ const SCHEMA: &str = "
         value TEXT NOT NULL
     );";
 
-// indexed pages and queued items per root CID, kept in step with them for /roots (#231). Apart
-// from SCHEMA: an index from before it creates it in the same transaction that fills it.
+// indexed pages and queued items per root CID, kept in step with them for /roots (#231), and
+// the pages' summed length; their sums are the index's totals, read at open instead of counting
+// `pages` (#267). Apart from SCHEMA: an index from before it creates it in the same transaction
+// that fills it.
 const ROOTS_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS roots (
         root   TEXT PRIMARY KEY,
         pages  INTEGER NOT NULL,
-        queued INTEGER NOT NULL
+        queued INTEGER NOT NULL,
+        length INTEGER NOT NULL DEFAULT 0
     );";
 
 /// A queued item taken off the frontier, with what queue_put_back needs to restore it (#286)
@@ -223,6 +226,13 @@ impl Store {
         } else {
             conn.execute_batch(ROOTS_SCHEMA)?;
         }
+        // v0.5.4 and before had no length in roots (#267): summed once from pages
+        let has_root_length: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('roots') WHERE name = 'length'")?
+            .exists([])?;
+        if !has_root_length {
+            fill_root_lengths(&mut conn)?;
+        }
         // v0.4.4 and before had no attempts (#284); adding the column rewrites no rows
         let has_attempts: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('queue') WHERE name = 'attempts'")?
@@ -296,13 +306,14 @@ impl Store {
             start.elapsed()
         );
         let start = Instant::now();
-        let queued: i64 = conn.query_row("SELECT count(*) FROM queue", [], |r| r.get(0))?;
-        let mirrors: i64 = conn.query_row("SELECT count(*) FROM mirrors", [], |r| r.get(0))?;
-        let (pages, lengths): (i64, i64) = conn.query_row(
-            "SELECT count(*), coalesce(sum(length), 0) FROM pages",
+        // from roots, a few hundred rows, rather than counting pages and queue (#267)
+        let (pages, queued, lengths): (i64, i64, i64) = conn.query_row(
+            "SELECT coalesce(sum(pages), 0), coalesce(sum(queued), 0), coalesce(sum(length), 0)
+             FROM roots",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        let mirrors: i64 = conn.query_row("SELECT count(*) FROM mirrors", [], |r| r.get(0))?;
         log::info!(
             "Startup: counted {} pages, {} queued and {} mirrors in {:.1?}",
             pages,
@@ -414,7 +425,7 @@ impl Store {
             ],
             |r| r.get(0),
         )?;
-        bump_root(&tx, item, 1, 0)?;
+        bump_root(&tx, item, 1, 0, length)?;
         if let Some((old, _)) = old {
             tx.prepare_cached("UPDATE mirrors SET page = ?2 WHERE page = ?1")?
                 .execute(params![old, id])?;
@@ -454,7 +465,7 @@ impl Store {
             "INSERT INTO dead_pages (id, item, cid, died_at, erase) VALUES (?1, ?2, ?3, ?4, 0)",
         )?
         .execute(params![id, item, cid, now_secs()])?;
-        bump_root(tx, item, -1, 0)?;
+        bump_root(tx, item, -1, 0, -length)?;
         Ok(Some((id, length as u64)))
     }
 
@@ -697,7 +708,7 @@ impl Store {
                     tx.prepare_cached("INSERT OR IGNORE INTO queue (item, root) VALUES (?1, ?2)")?;
                 for item in batch {
                     let n = stmt.execute([item, root_of(item)])?;
-                    bump_root(&tx, item, 0, n as i64)?;
+                    bump_root(&tx, item, 0, n as i64, 0)?;
                     batch_added += n;
                 }
             }
@@ -726,7 +737,7 @@ impl Store {
                 let mut stmt = tx.prepare_cached("DELETE FROM queue WHERE item = ?1")?;
                 for item in batch {
                     let n = stmt.execute([item])?;
-                    bump_root(&tx, item, 0, -(n as i64))?;
+                    bump_root(&tx, item, 0, -(n as i64), 0)?;
                     removed += n;
                 }
             }
@@ -775,7 +786,7 @@ impl Store {
             None => None,
         };
         if let Some(q) = &next {
-            bump_root(&tx, &q.item, 0, -1)?;
+            bump_root(&tx, &q.item, 0, -1, 0)?;
         }
         tx.commit()?;
         // not on empty polls: idle workers poll every 200ms
@@ -816,7 +827,7 @@ impl Store {
             taken.attempts,
             root_of(&taken.item)
         ])?;
-        bump_root(&tx, &taken.item, 0, 1)?;
+        bump_root(&tx, &taken.item, 0, 1, 0)?;
         tx.commit()?;
         self.queued.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -837,7 +848,7 @@ impl Store {
                 "INSERT OR IGNORE INTO queue (item, attempts, root) VALUES (?1, ?2, ?3)",
             )?
             .execute(params![item, attempts, root_of(item)])?;
-        bump_root(&tx, item, 0, n as i64)?;
+        bump_root(&tx, item, 0, n as i64, 0)?;
         tx.commit()?;
         self.queued.fetch_add(n, Ordering::Relaxed);
         Ok(n == 1)
@@ -1321,20 +1332,58 @@ fn roots_queued(conn: &Connection) -> rusqlite::Result<Vec<String>> {
         .collect()
 }
 
-// adds to a root's page and queued counts, dropping the row once both are 0
-fn bump_root(tx: &Connection, item: &str, pages: i64, queued: i64) -> rusqlite::Result<()> {
+// adds to a root's page and queued counts and its pages' length, dropping the row once both
+// counts are 0
+fn bump_root(
+    tx: &Connection,
+    item: &str,
+    pages: i64,
+    queued: i64,
+    length: i64,
+) -> rusqlite::Result<()> {
     if pages == 0 && queued == 0 {
         return Ok(());
     }
     let root = root_of(item);
     tx.prepare_cached(
-        "INSERT INTO roots (root, pages, queued) VALUES (?1, ?2, ?3)
-         ON CONFLICT (root) DO UPDATE SET pages = pages + ?2, queued = queued + ?3",
+        "INSERT INTO roots (root, pages, queued, length) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (root) DO UPDATE
+         SET pages = pages + ?2, queued = queued + ?3, length = length + ?4",
     )?
-    .execute(params![root, pages, queued])?;
+    .execute(params![root, pages, queued, length])?;
     tx.prepare_cached("DELETE FROM roots WHERE root = ?1 AND pages <= 0 AND queued <= 0")?
         .execute([root])?;
     Ok(())
+}
+
+// the root of a queued item: its first path segment (#286)
+const QUEUE_ROOT_OF_ITEM: &str =
+    "CASE WHEN instr(item, '/') > 0 THEN substr(item, 1, instr(item, '/') - 1) ELSE item END";
+
+/**
+ * Adds `length` to `roots` and sums it from `pages`, once, for an index from before it (v0.5.4,
+ * #267). One transaction, so a fill that's cut short leaves the column out and the next open
+ * fills it again. Summed here while reading the rows rather than by a GROUP BY, which would sort
+ * every page's root in memory: this holds one total per root.
+ */
+fn fill_root_lengths(conn: &mut Connection) -> rusqlite::Result<()> {
+    log::info!("Summing page lengths per root (one-time, #267)");
+    let tx = conn.transaction()?;
+    tx.execute_batch("ALTER TABLE roots ADD COLUMN length INTEGER NOT NULL DEFAULT 0")?;
+    let mut sums: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT item, length FROM pages")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let item: String = row.get(0)?;
+            *sums.entry(root_of(&item).to_string()).or_default() += row.get::<_, i64>(1)?;
+        }
+        let mut update = tx.prepare("UPDATE roots SET length = ?2 WHERE root = ?1")?;
+        for (root, length) in &sums {
+            update.execute(params![root, length])?;
+        }
+    }
+    tx.commit()
 }
 
 /**
@@ -1344,17 +1393,13 @@ fn bump_root(tx: &Connection, item: &str, pages: i64, queued: i64) -> rusqlite::
  * the two GROUP BYs sort every row's root in memory (temp_store), about 350 MB at 2M pages and
  * 3M queued, which is fine at that size for a one-time step.
  */
-// the root of a queued item: its first path segment (#286)
-const QUEUE_ROOT_OF_ITEM: &str =
-    "CASE WHEN instr(item, '/') > 0 THEN substr(item, 1, instr(item, '/') - 1) ELSE item END";
-
 fn fill_roots(conn: &mut Connection) -> rusqlite::Result<()> {
     log::info!("Counting pages and queued items per root (one-time, #231)");
     let tx = conn.transaction()?;
     tx.execute_batch(ROOTS_SCHEMA)?;
     tx.execute_batch(
-        "INSERT INTO roots (root, pages, queued)
-           SELECT substr(item, 1, instr(item || '/', '/') - 1) AS r, count(*), 0
+        "INSERT INTO roots (root, pages, queued, length)
+           SELECT substr(item, 1, instr(item || '/', '/') - 1) AS r, count(*), 0, sum(length)
            FROM pages GROUP BY r;
          INSERT INTO roots (root, pages, queued)
            SELECT substr(item, 1, instr(item || '/', '/') - 1) AS r, 0, count(*)
@@ -1370,10 +1415,11 @@ fn fill_roots(conn: &mut Connection) -> rusqlite::Result<()> {
  */
 fn recover_unflushed(conn: &mut Connection, flushed_through: u64) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
-    let items: Vec<String> = tx
-        .prepare("SELECT item FROM pages WHERE id > ?1 ORDER BY id")?
-        .query_map([flushed_through as i64], |r| r.get(0))?
+    let rows: Vec<(String, i64)> = tx
+        .prepare("SELECT item, length FROM pages WHERE id > ?1 ORDER BY id")?
+        .query_map([flushed_through as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    let items: Vec<String> = rows.iter().map(|(item, _)| item.clone()).collect();
     if items.is_empty() {
         return Ok(());
     }
@@ -1393,12 +1439,12 @@ fn recover_unflushed(conn: &mut Connection, flushed_through: u64) -> rusqlite::R
     tx.execute("DELETE FROM pages WHERE id > ?1", [flushed_through as i64])?;
     {
         let mut queue = tx.prepare("INSERT OR IGNORE INTO queue (item, root) VALUES (?1, ?2)")?;
-        for item in &items {
-            bump_root(&tx, item, -1, 0)?;
+        for (item, length) in &rows {
+            bump_root(&tx, item, -1, 0, -length)?;
         }
         for item in items.iter().chain(&mirrored) {
             let n = queue.execute([item.as_str(), root_of(item)])?;
-            bump_root(&tx, item, 0, n as i64)?;
+            bump_root(&tx, item, 0, n as i64, 0)?;
         }
     }
     tx.commit()
@@ -2731,6 +2777,48 @@ pub(crate) mod tests {
     }
 
     // roots as a GROUP BY over pages and queue would count them
+    // each root's summed page length in `roots` and by a scan of `pages` (#267), roots with
+    // pages only
+    fn lengths_by_roots_and_scan(store: &Store) -> (Vec<(String, i64)>, Vec<(String, i64)>) {
+        let conn = store.conn.lock().unwrap();
+        let read = |sql: &str| -> Vec<(String, i64)> {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        (
+            read("SELECT root, length FROM roots WHERE pages > 0 ORDER BY root"),
+            read(
+                "SELECT substr(item, 1, instr(item || '/', '/') - 1) AS r, sum(length)
+                 FROM pages GROUP BY r ORDER BY r",
+            ),
+        )
+    }
+
+    // the running totals match the tables they count (#267)
+    fn assert_totals_match_the_tables(store: &Store) {
+        let (by_roots, by_scan) = lengths_by_roots_and_scan(store);
+        assert_eq!(by_roots, by_scan, "lengths per root");
+        let conn = store.conn.lock().unwrap();
+        let (pages, length): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), coalesce(sum(length), 0) FROM pages",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let queued: i64 = conn
+            .query_row("SELECT count(*) FROM queue", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert_eq!(store.page_count(), pages as usize);
+        assert_eq!(store.queue_len(), queued as usize);
+        assert_eq!(store.lengths.load(Ordering::Relaxed), length as u64);
+    }
+
     fn roots_by_scan(store: &Store) -> Vec<(String, usize, usize)> {
         let conn = store.conn.lock().unwrap();
         let mut counts: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
@@ -2796,6 +2884,7 @@ pub(crate) mod tests {
         store.queue_remove(&["d/1".into(), "nope".into()]).unwrap();
         store.delete(&["b/1".to_string()], true).unwrap(); // takes its mirror c/1 too
         assert_eq!(roots_table(&store), roots_by_scan(&store));
+        assert_totals_match_the_tables(&store);
         assert_eq!(
             store.root_counts().unwrap()[0],
             ("a".to_string(), 2, 1, "A root".to_string(), "a".to_string())
@@ -2804,6 +2893,42 @@ pub(crate) mod tests {
         drop(store);
         let store = Store::open(&dir, 0).unwrap();
         assert_eq!(roots_table(&store), roots_by_scan(&store));
+        assert_totals_match_the_tables(&store);
+    }
+
+    #[test]
+    fn roots_without_length_gain_it_on_open() {
+        let dir = temp_dir("roots-length");
+        let store = Store::open(&dir, 0).unwrap();
+        store
+            .upsert("a/1", &page("a/1", "t", &[("x", 2), ("y", 3)]), 1)
+            .unwrap();
+        store
+            .upsert("a/2", &page("a/2", "t", &[("x", 1)]), 1)
+            .unwrap();
+        store.upsert("b", &page("b", "t", &[("z", 4)]), 1).unwrap();
+        store.queue_add(&["c/1".into()]).unwrap();
+        store.flush().unwrap();
+        drop(store);
+        {
+            // as v0.5.4 left it: roots without length
+            let conn = Connection::open(dir.join("index.sqlite")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE roots_old (root TEXT PRIMARY KEY, pages INTEGER NOT NULL,
+                                         queued INTEGER NOT NULL);
+                 INSERT INTO roots_old SELECT root, pages, queued FROM roots;
+                 DROP TABLE roots;
+                 ALTER TABLE roots_old RENAME TO roots;",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&dir, 0).unwrap();
+        assert_eq!(
+            lengths_by_roots_and_scan(&store).0,
+            vec![("a".to_string(), 6), ("b".to_string(), 4)]
+        );
+        assert_totals_match_the_tables(&store);
+        assert_eq!(store.average_length(), 10.0 / 3.0);
     }
 
     #[test]
@@ -2826,6 +2951,7 @@ pub(crate) mod tests {
         std::mem::forget(store); // a crash: no flush on drop
         let store = Store::open(&dir, 0).unwrap();
         assert_eq!(roots_table(&store), roots_by_scan(&store));
+        assert_totals_match_the_tables(&store);
         assert_eq!(
             store.queue_len(),
             3,
