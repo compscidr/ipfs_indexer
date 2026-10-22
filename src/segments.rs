@@ -211,6 +211,8 @@ pub struct Segments {
     computing: Mutex<()>,
     // upgrades of older format files are skipped until then, after one failed
     upgrades_after: Mutex<Option<Instant>>,
+    // files open() didn't read whole for their checksum, for verify_opened (v0.5.6)
+    unverified: Mutex<Vec<PathBuf>>,
     #[cfg(test)]
     hook: Mutex<Option<HookFn>>,
     // the format version new files are written in; tests write v1 files to upgrade
@@ -247,6 +249,8 @@ pub(crate) enum Hook {
     Discarding,
     // a retired file, just before it's erased
     Retiring,
+    // in verify_opened, a file read whole, before its result is used
+    Verified,
 }
 
 #[cfg(test)]
@@ -407,6 +411,7 @@ impl Segments {
             stats: Mutex::new(None),
             computing: Mutex::new(()),
             upgrades_after: Mutex::new(None),
+            unverified: Mutex::new(Vec::new()),
             #[cfg(test)]
             hook: Mutex::new(None),
             #[cfg(test)]
@@ -414,21 +419,41 @@ impl Segments {
         }
     }
 
-    /// Opens (or creates) the segments in `dir`; files the manifest doesn't name, left by a crash
-    /// mid-write, are erased
+    /**
+     * Opens (or creates) the segments in `dir`; files the manifest doesn't name, left by a crash
+     * mid-write, are erased. Each file's structure is checked, but not its checksum: reading
+     * every file whole held the API up for 20 s or more on a big index (v0.5.4's timings), so
+     * verify_opened does that once it's up (v0.5.6).
+     */
     pub fn open(dir: &Path) -> io::Result<Segments> {
+        Segments::open_with(dir, false)
+    }
+
+    /// Opens the segments in `dir` like open, each file read whole for its checksum first: for a
+    /// start after damage was found (#266), so a bad file fails the open as corrupt
+    pub fn open_verified(dir: &Path) -> io::Result<Segments> {
+        Segments::open_with(dir, true)
+    }
+
+    fn open_with(dir: &Path, verify: bool) -> io::Result<Segments> {
         fs::create_dir_all(dir)?;
         let (next_gen, flushed_through, names) = read_manifest(dir)?.unwrap_or((1, 0, Vec::new()));
-        // each file is read whole for its checksum: how long that takes, for slow starts
+        // how long opening takes, for slow starts
         let start = Instant::now();
         let (mut live, mut bytes) = (Vec::new(), 0u64);
         for name in &names {
             let path = dir.join(name);
             bytes += fs::metadata(&path)?.len();
-            live.push(Arc::new(Segment::open(&path)?));
+            let segment = if verify {
+                Segment::open(&path)?
+            } else {
+                Segment::open_written(&path)?
+            };
+            live.push(Arc::new(segment));
         }
         log::info!(
-            "Startup: checked {} segment files ({:.1} GB) in {:.1?}",
+            "Startup: {} {} segment files ({:.1} GB) in {:.1?}",
+            if verify { "checked" } else { "opened" },
             live.len(),
             bytes as f64 / 1e9,
             start.elapsed()
@@ -444,8 +469,62 @@ impl Segments {
         segments
             .flushed_through
             .store(flushed_through, Ordering::SeqCst);
+        if !verify {
+            *lock(&segments.unverified) = live.iter().map(|s| s.path().to_path_buf()).collect();
+        }
         segments.state.write().unwrap().segments = Arc::new(live);
         Ok(segments)
+    }
+
+    /**
+     * Checks the checksum of each file open() didn't (v0.5.6), once; files written since are
+     * checked as they're written. For a thread of its own: it reads them whole, one at a time,
+     * taking the state lock only to look each one up, so merges and searches go on. A file
+     * merged away meanwhile is skipped, even mid-read: erasing it (#249) zeroes it, which would
+     * look like damage. Returns the files and bytes checked, or the first file's error (a
+     * mismatch is corrupt, see store::is_corrupt).
+     */
+    pub fn verify_opened(&self) -> io::Result<(usize, u64)> {
+        let paths = std::mem::take(&mut *lock(&self.unverified));
+        let (mut files, mut bytes) = (0, 0);
+        for path in paths {
+            let found = self
+                .state
+                .read()
+                .unwrap()
+                .segments
+                .iter()
+                .find(|s| s.path() == path)
+                .cloned();
+            let Some(segment) = found else {
+                log::debug!("{} was merged away before it was checked", path.display());
+                continue;
+            };
+            let verified = segment.verify();
+            #[cfg(test)]
+            self.hook(Hook::Verified);
+            match verified {
+                Ok(()) => {
+                    files += 1;
+                    bytes += segment.info().bytes;
+                }
+                Err(_) if !self.is_live(&segment) => {
+                    log::debug!("{} was merged away while it was checked", path.display());
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok((files, bytes))
+    }
+
+    // whether a segment is in the current set
+    fn is_live(&self, segment: &Arc<Segment>) -> bool {
+        self.state
+            .read()
+            .unwrap()
+            .segments
+            .iter()
+            .any(|s| Arc::ptr_eq(s, segment))
     }
 
     pub fn in_memory() -> Segments {
@@ -1391,6 +1470,20 @@ impl Segments {
         self.state.read().unwrap().segments.clone()
     }
 
+    // takes a file out of the set and erases it, as a merge does, minus the merge
+    pub(crate) fn remove_for_test(&self, path: &Path) {
+        let mut state = self.state.write().unwrap();
+        let kept = state
+            .segments
+            .iter()
+            .filter(|s| s.path() != path)
+            .cloned()
+            .collect();
+        state.segments = Arc::new(kept);
+        drop(state);
+        erase_file(path).unwrap();
+    }
+
     pub(crate) fn set_hook(&self, hook: impl Fn(&Segments, Hook) + Send + Sync + 'static) {
         *self.hook.lock().unwrap() = Some(Arc::new(hook));
     }
@@ -2328,5 +2421,93 @@ pub(crate) mod tests {
             vec![true],
             "erasing it, writes is free"
         );
+    }
+
+    // the segment files in dir, by name
+    pub(crate) fn segment_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "seg"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn opening_skips_checksums_and_verify_opened_checks_each_file_then_none() {
+        let dir = temp_dir("segments-verify");
+        let segments = Segments::open(&dir).unwrap();
+        flushed(&segments, &[(1, &[("apple", 1)]), (2, &[("zebra", 1)])]);
+        assert_eq!(segments.verify_opened().unwrap(), (0, 0), "written here");
+        drop(segments);
+        let files = segment_files(&dir);
+        crate::segment::damage_postings(&files[1]);
+
+        let segments = Segments::open(&dir).expect("opening doesn't read the postings");
+        assert_eq!(segments.postings("apple").unwrap(), vec![(1, 1, 1)]);
+        let locked = Arc::new(Mutex::new(Vec::new()));
+        let seen = locked.clone();
+        segments.set_hook(move |segments, at| {
+            if at == Hook::Verified {
+                seen.lock()
+                    .unwrap()
+                    .push(segments.state.try_write().is_ok());
+            }
+        });
+        let err = segments.verify_opened().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let name = files[1].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(err.to_string().contains(&name), "{}", err);
+        assert!(
+            lock(&locked).iter().all(|&free| free),
+            "files are read without the state lock"
+        );
+        assert_eq!(
+            segments.postings("apple").unwrap(),
+            vec![(1, 1, 1)],
+            "still served"
+        );
+        assert_eq!(segments.verify_opened().unwrap(), (0, 0), "checked once");
+        assert!(
+            Segments::open_verified(&dir).is_err(),
+            "a verifying open fails it"
+        );
+
+        // sound files check out, counted
+        let dir = temp_dir("segments-verify-ok");
+        let segments = Segments::open(&dir).unwrap();
+        flushed(&segments, &[(1, &[("apple", 1)]), (2, &[("zebra", 1)])]);
+        drop(segments);
+        let bytes_ok: u64 = segment_files(&dir)
+            .iter()
+            .map(|f| fs::metadata(f).unwrap().len())
+            .sum();
+        assert_eq!(
+            Segments::open(&dir).unwrap().verify_opened().unwrap(),
+            (2, bytes_ok)
+        );
+    }
+
+    #[test]
+    fn a_damaged_file_that_leaves_the_live_set_during_the_check_is_skipped() {
+        let dir = temp_dir("segments-verify-gone");
+        let segments = Segments::open(&dir).unwrap();
+        flushed(&segments, &[(1, &[("apple", 1)]), (2, &[("zebra", 1)])]);
+        drop(segments);
+        let files = segment_files(&dir);
+        for file in &files {
+            crate::segment::damage_postings(file);
+        }
+        let segments = Segments::open(&dir).unwrap();
+        // the first left before the check reached it, the second while it was read
+        segments.remove_for_test(&files[0]);
+        let second = files[1].clone();
+        segments.set_hook(move |segments, at| {
+            if at == Hook::Verified {
+                segments.remove_for_test(&second);
+            }
+        });
+        assert_eq!(segments.verify_opened().unwrap(), (0, 0));
     }
 }

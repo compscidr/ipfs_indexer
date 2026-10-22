@@ -319,17 +319,22 @@ fn keep_running(name: &'static str, run: impl Fn() + Send + 'static) {
 const HEALTH_GRACE: Duration = Duration::from_secs(15 * 60);
 
 /**
- * Whether the crawl is working, for a monitor (#285): Err with the reason while it's paused after
- * repeated gateway errors, or indexing fewer than min_rate pages a minute with work queued. While
- * starting, or with nothing queued, it's Ok.
+ * Whether the crawl is working, for a monitor (#285): Err with the reason while the index is
+ * marked damaged (v0.5.6, before anything else: only a restart clears it), while it's paused
+ * after repeated gateway errors, or indexing fewer than min_rate pages a minute with work queued.
+ * While starting, or with nothing queued, it's Ok.
  */
 fn health(
+    damaged: Option<String>,
     rate: u64,
     queued: usize,
     paused: Option<String>,
     min_rate: u64,
     up_for: Duration,
 ) -> Result<String, String> {
+    if let Some(damage) = damaged {
+        return Err(format!("damaged: {}; restart to check and rebuild", damage));
+    }
     if let Some(paused) = paused {
         return Err(paused);
     }
@@ -352,10 +357,12 @@ struct Health {
     min_rate: u64,
 }
 
-/// 200 while the crawl is working, 503 when it's paused or slow, with the reason (#285)
+/// 200 while the crawl is working, 503 when the index is damaged or the crawl is paused or slow,
+/// with the reason (#285)
 #[get("/health")]
 async fn health_handler(queue: web::Data<IndexQueue>, config: web::Data<Health>) -> HttpResponse {
     match health(
+        queue.damage(),
         queue.indexed_per_minute(),
         queue.queue_length(),
         queue.crawl_paused(),
@@ -537,6 +544,12 @@ async fn main() -> std::io::Result<()> {
             error!("Denylist purge panicked; carrying on");
         }
     });
+    // the segment files' checksums, which opening no longer reads so the API needn't wait for
+    // them (v0.5.6); a bad one marks the index damaged, for /health and the next start
+    if std::env::var("DATA_DIR").is_ok() {
+        let verify_queue = Arc::clone(&index_queue);
+        std::thread::spawn(move || verify_queue.verify_store());
+    }
     // pages that expired while the indexer was down, then a reseed in case the seed was one;
     // the refresh thread does the same daily
     let expire_queue = Arc::clone(&index_queue);
@@ -713,7 +726,7 @@ mod tests {
     #[actix_web::test]
     async fn health_is_ok_while_starting_even_with_no_rate() {
         assert_eq!(
-            health(0, 1000, None, 500, 14 * MIN),
+            health(None, 0, 1000, None, 500, 14 * MIN),
             Ok("starting: 0 pages/min, 1000 queued".to_string())
         );
     }
@@ -721,11 +734,11 @@ mod tests {
     #[actix_web::test]
     async fn health_fails_when_indexing_is_slow_with_work_queued() {
         assert_eq!(
-            health(87, 1857261, None, 500, 15 * MIN),
+            health(None, 87, 1857261, None, 500, 15 * MIN),
             Err("slow: 87 pages/min (minimum 500), 1857261 queued".to_string())
         );
         assert_eq!(
-            health(500, 1857261, None, 500, 15 * MIN),
+            health(None, 500, 1857261, None, 500, 15 * MIN),
             Ok("ok: 500 pages/min, 1857261 queued".to_string())
         );
     }
@@ -733,7 +746,7 @@ mod tests {
     #[actix_web::test]
     async fn health_is_ok_with_nothing_to_crawl() {
         assert_eq!(
-            health(0, 0, None, 500, 60 * MIN),
+            health(None, 0, 0, None, 500, 60 * MIN),
             Ok("ok: 0 pages/min, 0 queued".to_string())
         );
     }
@@ -742,15 +755,30 @@ mod tests {
     async fn health_fails_while_the_crawl_is_paused() {
         let paused = "paused 4m: 16 of the last 20 fetches failed; last: 504".to_string();
         assert_eq!(
-            health(3000, 1000, Some(paused.clone()), 500, MIN),
+            health(None, 3000, 1000, Some(paused.clone()), 500, MIN),
             Err(paused)
+        );
+    }
+
+    #[actix_web::test]
+    async fn health_fails_while_the_index_is_damaged_before_any_other_reason() {
+        let damage = "corrupt segment file 00000000000000a1.seg: checksum doesn't match";
+        let paused = "paused 4m: 16 of the last 20 fetches failed; last: 504".to_string();
+        let want = Err(format!("damaged: {}; restart to check and rebuild", damage));
+        assert_eq!(
+            health(Some(damage.to_string()), 3000, 1000, Some(paused), 500, MIN),
+            want
+        );
+        assert_eq!(
+            health(Some(damage.to_string()), 3000, 0, None, 500, 60 * MIN),
+            want
         );
     }
 
     #[actix_web::test]
     async fn a_min_rate_of_zero_turns_the_rate_check_off() {
         assert_eq!(
-            health(0, 1000, None, 0, 60 * MIN),
+            health(None, 0, 1000, None, 0, 60 * MIN),
             Ok("ok: 0 pages/min, 1000 queued".to_string())
         );
     }
@@ -985,6 +1013,34 @@ mod tests {
             let got = test::read_body(resp).await;
             assert_eq!(std::str::from_utf8(&got).unwrap(), body);
         }
+    }
+
+    #[actix_web::test]
+    async fn health_get_answers_503_while_the_index_is_damaged() {
+        let queue = web::Data::new(IndexQueue::new());
+        queue.store().note_error(&std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt segment file 1.seg: checksum doesn't match",
+        ));
+        let app = test::init_service(
+            App::new()
+                .app_data(queue.clone())
+                .app_data(web::Data::new(Health {
+                    started: Instant::now(),
+                    min_rate: 500,
+                }))
+                .service(health_handler),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status().as_u16(), 503);
+        let got = test::read_body(resp).await;
+        assert_eq!(
+            std::str::from_utf8(&got).unwrap(),
+            "damaged: corrupt segment file 1.seg: checksum doesn't match; restart to check \
+             and rebuild"
+        );
     }
 
     #[actix_web::test]

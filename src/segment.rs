@@ -63,6 +63,22 @@ fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
         .fold(hash, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
+// FNV-1a 64 of a segment file of `bytes` bytes, up to the footer's checksum: the whole file
+// read, a chunk at a time
+fn checksum(file: &File, bytes: u64) -> io::Result<u64> {
+    let checked = bytes - 8 - END.len() as u64;
+    let mut hash = FNV_OFFSET;
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut offset = 0;
+    while offset < checked {
+        let n = (checked - offset).min(chunk.len() as u64) as usize;
+        file.read_exact_at(&mut chunk[..n], offset)?;
+        hash = fnv1a(hash, &chunk[..n]);
+        offset += n as u64;
+    }
+    Ok(hash)
+}
+
 fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = (value & 0x7f) as u8;
@@ -372,6 +388,8 @@ pub struct Segment {
     version: u8,
     // the shortest page: a v1 block's bound's length, having no impacts
     shortest: u32,
+    // the footer's checksum
+    sum: u64,
 }
 
 impl Segment {
@@ -380,8 +398,9 @@ impl Segment {
         Segment::read(path, true)
     }
 
-    /// Opens a segment file this process just wrote and fsynced: its structure is checked, but
-    /// not its checksum, which would re-read the whole file (#247). Open checks it at startup.
+    /// Opens a segment file with its structure checked, but not its checksum, which would
+    /// re-read the whole file (#247): one this process just wrote and fsynced, or one opened at
+    /// startup, checked by verify after the API is up (v0.5.6)
     pub fn open_written(path: &Path) -> io::Result<Segment> {
         Segment::read(path, false)
     }
@@ -397,20 +416,9 @@ impl Segment {
             return Err(corrupt());
         }
         let field = |i: usize| u64::from_le_bytes(footer[i * 8..i * 8 + 8].try_into().unwrap());
-        if verify {
-            let checked = bytes - 8 - END.len() as u64;
-            let mut hash = FNV_OFFSET;
-            let mut chunk = vec![0u8; 1 << 20];
-            let mut offset = 0;
-            while offset < checked {
-                let n = (checked - offset).min(chunk.len() as u64) as usize;
-                file.read_exact_at(&mut chunk[..n], offset)?;
-                hash = fnv1a(hash, &chunk[..n]);
-                offset += n as u64;
-            }
-            if hash != field(7) {
-                return Err(corrupt());
-            }
+        let sum = field(7);
+        if verify && checksum(&file, bytes)? != sum {
+            return Err(corrupt());
         }
         let header = read_at(&file, 0, MAGIC.len() as u64 + 1)?;
         if &header[..MAGIC.len()] != MAGIC {
@@ -473,7 +481,23 @@ impl Segment {
             lengths,
             version,
             shortest,
+            sum,
         })
+    }
+
+    /// Checks the checksum open_written skipped, reading the whole file: for the check after
+    /// startup (v0.5.6). A mismatch is a corrupt error naming the file.
+    pub fn verify(&self) -> io::Result<()> {
+        if checksum(&self.file, self.info.bytes)? != self.sum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt segment file {}: checksum doesn't match",
+                    self.path.display()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// The format version it was written in
@@ -894,6 +918,25 @@ impl Iterator for Terms {
     }
 }
 
+/// Flips a bit in a file's last posting, which opening doesn't read: only its checksum notices
+#[cfg(test)]
+pub(crate) fn damage_postings(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let footer = bytes.len() - FOOTER as usize;
+    let field = |i: usize| {
+        u64::from_le_bytes(
+            bytes[footer + i * 8..footer + i * 8 + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    };
+    let (postings, dict) = (field(1), field(2));
+    assert!(postings < dict, "{} has no postings", path.display());
+    // a varint's last byte: its low bit changes a count, not how the block decodes
+    bytes[dict - 1] ^= 1;
+    std::fs::write(path, bytes).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,6 +1036,24 @@ mod tests {
         assert!(Segment::open(&path).is_err(), "truncated");
         std::fs::write(&path, b"").unwrap();
         assert!(Segment::open(&path).is_err(), "empty");
+    }
+
+    #[test]
+    fn a_damaged_posting_opens_and_serves_and_only_verify_notices() {
+        let path = temp_dir("segment-verify").join("1.seg");
+        write(
+            &path,
+            &[(1, 1), (2, 1)],
+            &[("apple", vec![(1, 1)]), ("zebra", vec![(2, 1)])],
+        );
+        Segment::open_written(&path).unwrap().verify().unwrap();
+        damage_postings(&path);
+        let segment = Segment::open_written(&path).expect("opening doesn't read the postings");
+        assert_eq!(segment.postings(b"apple").unwrap(), vec![(1, 1)]);
+        let err = segment.verify().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("1.seg"), "{}", err);
+        assert!(Segment::open(&path).is_err(), "a verifying open fails it");
     }
 
     // the (count, length) pairs no other beats on both, by brute force, ascending
