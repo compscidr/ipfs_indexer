@@ -26,6 +26,8 @@ pub enum Permit {
 }
 
 pub struct Breaker {
+    // the root this one watches, for the log (#286); None for the whole crawl
+    name: Option<String>,
     min: Duration,
     max: Duration,
     state: Mutex<State>,
@@ -52,7 +54,17 @@ impl Breaker {
     }
 
     pub fn with(min: Duration, max: Duration) -> Breaker {
+        Breaker::build(None, min, max)
+    }
+
+    /// One root's breaker (#286): the log says "root <name>" where it would say "the crawl"
+    pub fn named(name: &str, min: Duration, max: Duration) -> Breaker {
+        Breaker::build(Some(name.to_string()), min, max)
+    }
+
+    fn build(name: Option<String>, min: Duration, max: Duration) -> Breaker {
         Breaker {
+            name,
             min,
             max,
             state: Mutex::new(State {
@@ -86,6 +98,21 @@ impl Breaker {
         self.state().testing = false;
     }
 
+    /// True when permit() would say Wait: paused with time left, or a test out. Changes nothing
+    pub fn blocks(&self) -> bool {
+        self.blocks_at(Instant::now())
+    }
+
+    /// True while paused or testing
+    pub fn is_open(&self) -> bool {
+        self.state().until.is_some()
+    }
+
+    /// The last gateway error seen; empty before any
+    pub fn last_error(&self) -> String {
+        self.state().last_error.clone()
+    }
+
     /// e.g. "paused 4m: 16 of the last 20 fetches failed; last: <error>"; None while crawling
     pub fn status(&self) -> Option<String> {
         self.status_at(Instant::now())
@@ -93,6 +120,28 @@ impl Breaker {
 
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn blocks_at(&self, now: Instant) -> bool {
+        let s = self.state();
+        matches!(s.until, Some(until) if s.testing || now < until)
+    }
+
+    // "the crawl", or "it" for a root (named in the same line)
+    // " of root <name>" for a root's breaker, else nothing
+    fn of_root(&self) -> String {
+        match &self.name {
+            Some(name) => format!(" of root {}", name),
+            None => String::new(),
+        }
+    }
+
+    fn object(&self) -> &'static str {
+        if self.name.is_some() {
+            "it"
+        } else {
+            "the crawl"
+        }
     }
 
     fn permit_at(&self, now: Instant) -> Permit {
@@ -125,9 +174,15 @@ impl Breaker {
             s.failed = failed;
             s.of = s.recent.len();
             s.until = Some(now + s.pause);
+            let of_what = self.of_root();
             warn!(
-                "{} of the last {} fetches failed at the gateway: pausing the crawl for {:?} (last: {})",
-                s.failed, s.of, s.pause, s.last_error
+                "{} of the last {} fetches{} failed at the gateway: pausing {} for {:?} (last: {})",
+                s.failed,
+                s.of,
+                of_what,
+                self.object(),
+                s.pause,
+                s.last_error
             );
         }
     }
@@ -140,15 +195,21 @@ impl Breaker {
                 s.until = None;
                 s.recent.clear();
                 s.pause = self.min;
-                info!("The gateway answered the test fetch: crawling again");
+                match &self.name {
+                    Some(name) => info!("Root {} answered the test fetch: crawling it again", name),
+                    None => info!("The gateway answered the test fetch: crawling again"),
+                }
             }
             Some(err) => {
                 s.last_error = err.to_string();
                 s.pause = (s.pause * 2).min(self.max);
                 s.until = Some(now + s.pause);
                 warn!(
-                    "The test fetch failed at the gateway: pausing the crawl for {:?} (last: {})",
-                    s.pause, err
+                    "The test fetch{} failed at the gateway: pausing {} for {:?} (last: {})",
+                    self.of_root(),
+                    self.object(),
+                    s.pause,
+                    err
                 );
             }
         }
@@ -322,5 +383,17 @@ mod tests {
             breaker.status_at(t + Duration::from_secs(240)),
             Some(format!("testing after {}", why))
         );
+    }
+
+    #[test]
+    fn blocks_matches_permit_without_taking_the_test() {
+        let breaker = Breaker::with(ms(100), ms(400));
+        let t = Instant::now();
+        assert!(!breaker.blocks_at(t));
+        trip(&breaker, t);
+        assert!(breaker.blocks_at(t));
+        assert!(!breaker.blocks_at(t + ms(100)));
+        assert_eq!(breaker.permit_at(t + ms(100)), Permit::Test);
+        assert!(breaker.blocks_at(t + ms(100)));
     }
 }

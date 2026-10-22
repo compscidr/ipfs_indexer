@@ -21,6 +21,7 @@ mod ens;
 mod entry;
 mod index_queue;
 mod index_result;
+mod pauses;
 mod rate;
 mod search;
 mod segment;
