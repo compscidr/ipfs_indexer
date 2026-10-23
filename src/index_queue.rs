@@ -1,5 +1,6 @@
 use crate::breaker::{PauseRule, Permit};
 use crate::denylist::{normalize_item, Denylist};
+use crate::entry::Entry;
 use crate::index_result::IndexResult;
 use crate::pauses::Pauses;
 use crate::rate::Rate;
@@ -383,6 +384,13 @@ pub struct IndexQueue {
     // pages written per minute, for /status (#264)
     indexed: Rate,
 
+    // the seeds file's entries as last read, None until read; its path; and the seeds thread's
+    // wake-up, set when an admin changes a seed (#304)
+    seeds_file: Mutex<Option<Vec<Entry>>>,
+    seeds_path: OnceLock<String>,
+    seeds_due: Mutex<bool>,
+    seeds_wake: Condvar,
+
     // the tunable settings (#304): set by main from the env, or the defaults on first use
     settings: OnceLock<Settings>,
 
@@ -404,6 +412,10 @@ impl IndexQueue {
             throttle: Throttle::new(),
             pauses: OnceLock::new(),
             indexed: Rate::new(),
+            seeds_file: Mutex::new(None),
+            seeds_path: OnceLock::new(),
+            seeds_due: Mutex::new(false),
+            seeds_wake: Condvar::new(),
             settings: OnceLock::new(),
             #[cfg(test)]
             pause_rule_for_test: OnceLock::new(),
@@ -572,6 +584,43 @@ impl IndexQueue {
                 self.store().note_error(&err);
             }
         }
+    }
+
+    /// The seeds file's entries as last read (None before the first read)
+    pub fn seeds_file(&self) -> Option<Vec<Entry>> {
+        self.seeds_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_seeds_file(&self, entries: Vec<Entry>) {
+        *self.seeds_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(entries);
+    }
+
+    /// The seeds file's path, once the seeds thread has one
+    pub fn seeds_path(&self) -> Option<&str> {
+        self.seeds_path.get().map(String::as_str)
+    }
+
+    pub fn set_seeds_path(&self, path: &str) {
+        let _ = self.seeds_path.set(path.to_string());
+    }
+
+    /// Has the seeds thread read again now, after a seed change (#304)
+    pub fn wake_seeds(&self) {
+        *self.seeds_due.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.seeds_wake.notify_all();
+    }
+
+    /// Waits up to `timeout` for wake_seeds, and takes the wake-up
+    pub fn wait_for_seeds(&self, timeout: Duration) {
+        let due = self.seeds_due.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut due, _) = self
+            .seeds_wake
+            .wait_timeout_while(due, timeout, |due| !*due)
+            .unwrap_or_else(|e| e.into_inner());
+        *due = false;
     }
 
     /// Records a name or CID for the resolver (#213); false if it's known already
@@ -964,7 +1013,7 @@ impl IndexQueue {
             || self.local_denylist.read().unwrap().is_blocked(item)
     }
 
-    fn is_blocked(&self, item: &str) -> bool {
+    pub(crate) fn is_blocked(&self, item: &str) -> bool {
         let blocked = self.denylist.read().unwrap().is_blocked(item)
             || self.local_denylist.read().unwrap().is_blocked(item);
         if blocked {

@@ -13,6 +13,8 @@ use log::{info, warn};
 use serde_json::json;
 
 use crate::denylist::{normalize_item, Denylist};
+use crate::discovery::{effective_seeds, SeedChange, SeedMark};
+use crate::entry::{self, Entry};
 use crate::index_queue::IndexQueue;
 use crate::settings::{Applies, Key};
 
@@ -86,7 +88,11 @@ pub fn configure(cfg: &mut web::ServiceConfig, admin: Option<web::Data<Admin>>) 
             .service(recrawl)
             .service(settings_read)
             .service(setting_set)
-            .service(setting_reset);
+            .service(setting_reset)
+            .service(seeds_read)
+            .service(seed_add)
+            .service(seed_remove)
+            .service(seed_reset);
     }
 }
 
@@ -282,20 +288,13 @@ fn change_setting(
     let Some(key) = Key::from_name(name) else {
         return HttpResponse::NotFound().body("No such setting");
     };
-    let actor = req
-        .headers()
-        .get("X-Admin-Actor")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|actor| !actor.is_empty());
-    let Some(actor) = actor else {
-        return HttpResponse::BadRequest().body("X-Admin-Actor is required");
+    let Some(actor) = actor_of(req) else {
+        return HttpResponse::BadRequest().body(ACTOR_REQUIRED);
     };
-    // the in-memory store would lose the change at the next start
-    if !queue.has_persistent_store() {
-        return HttpResponse::BadRequest().body("settings need DATA_DIR");
+    if let Some(refused) = needs_store(queue) {
+        return refused;
     }
-    match change(key, actor) {
+    match change(key, &actor) {
         Ok(applies) => {
             if applies == Applies::Restart {
                 admin.restart.after_reply(key.name());
@@ -304,6 +303,139 @@ fn change_setting(
         }
         Err(reason) => HttpResponse::BadRequest().body(reason),
     }
+}
+
+// who made a change: the X-Admin-Actor header, required on writes
+fn actor_of(req: &HttpRequest) -> Option<String> {
+    req.headers()
+        .get("X-Admin-Actor")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|actor| !actor.is_empty())
+        .map(str::to_string)
+}
+
+const ACTOR_REQUIRED: &str = "X-Admin-Actor is required";
+
+// the in-memory store would lose a change at the next start
+fn needs_store(queue: &IndexQueue) -> Option<HttpResponse> {
+    (!queue.has_persistent_store())
+        .then(|| HttpResponse::BadRequest().body("settings need DATA_DIR"))
+}
+
+#[get("/admin/seeds")]
+async fn seeds_read(
+    req: HttpRequest,
+    queue: web::Data<IndexQueue>,
+    admin: web::Data<Admin>,
+) -> HttpResponse {
+    if !authorized(&req, &admin) {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+    let changes = match queue.store().seed_changes() {
+        Ok(changes) => changes,
+        Err(err) => {
+            queue.store().note_error(&err);
+            return HttpResponse::InternalServerError().body(format!("Couldn't read: {}", err));
+        }
+    };
+    let file = queue.seeds_file().unwrap_or_default();
+    let seeds: Vec<_> = effective_seeds(&file, &changes)
+        .into_iter()
+        .map(|(entry, mark, by)| {
+            json!({
+                "entry": entry,
+                "mark": match mark {
+                    SeedMark::Iac => "iac",
+                    SeedMark::Added => "added",
+                    SeedMark::Removed => "removed",
+                },
+                "actor": by.as_ref().map(|(actor, _)| actor),
+                "set_at": by.as_ref().map(|(_, at)| at),
+            })
+        })
+        .collect();
+    HttpResponse::Ok().json(json!({ "seeds": seeds, "file": queue.seeds_path() }))
+}
+
+#[post("/admin/seeds/add")]
+async fn seed_add(
+    req: HttpRequest,
+    body: String,
+    queue: web::Data<IndexQueue>,
+    admin: web::Data<Admin>,
+) -> HttpResponse {
+    change_seed(&req, &body, &queue, &admin, Some(true))
+}
+
+#[post("/admin/seeds/remove")]
+async fn seed_remove(
+    req: HttpRequest,
+    body: String,
+    queue: web::Data<IndexQueue>,
+    admin: web::Data<Admin>,
+) -> HttpResponse {
+    change_seed(&req, &body, &queue, &admin, Some(false))
+}
+
+#[post("/admin/seeds/reset")]
+async fn seed_reset(
+    req: HttpRequest,
+    body: String,
+    queue: web::Data<IndexQueue>,
+    admin: web::Data<Admin>,
+) -> HttpResponse {
+    change_seed(&req, &body, &queue, &admin, None)
+}
+
+// adds (Some(true)), removes (Some(false)) or clears (None) the change to the seed in `body`,
+// then has the seeds thread read again
+fn change_seed(
+    req: &HttpRequest,
+    body: &str,
+    queue: &IndexQueue,
+    admin: &Admin,
+    add: Option<bool>,
+) -> HttpResponse {
+    if !authorized(req, admin) {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+    let Some(actor) = actor_of(req) else {
+        return HttpResponse::BadRequest().body(ACTOR_REQUIRED);
+    };
+    if let Some(refused) = needs_store(queue) {
+        return refused;
+    }
+    let Some(parsed) = entry::parse(body.trim()) else {
+        return HttpResponse::BadRequest().body("Not a CID or a name");
+    };
+    let entry = parsed.as_str();
+    // as discovery::check refuses a blocked root
+    if add == Some(true) && matches!(parsed, Entry::Cid(_)) && queue.is_blocked(entry) {
+        return HttpResponse::BadRequest().body(format!("{} is blocked", entry));
+    }
+    let store = queue.store();
+    let done = match add {
+        Some(add) => store.set_seed_change(&SeedChange {
+            entry: entry.to_string(),
+            add,
+            actor: actor.clone(),
+            set_at: crate::store::now_secs(),
+        }),
+        None => store.clear_seed_change(entry).map(|_| ()),
+    };
+    if let Err(err) = done {
+        store.note_error(&err);
+        return HttpResponse::InternalServerError().body(format!("Couldn't save: {}", err));
+    }
+    let what = match add {
+        Some(true) => "added",
+        Some(false) => "removed",
+        None => "reset",
+    };
+    info!("Seed {} {} by {}", entry, what, actor);
+    queue.wake_seeds();
+    HttpResponse::Ok().body(format!("Seed {} {}", entry, what))
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -807,6 +939,94 @@ mod tests {
         assert_eq!(
             row(&read_settings(&queue).await, "crawl_workers")["source"],
             "default"
+        );
+    }
+
+    // the seed endpoints (#304)
+
+    async fn seed_call(
+        queue: &web::Data<IndexQueue>,
+        method: &str,
+        path: &str,
+        actor: Option<&str>,
+        body: &str,
+    ) -> (u16, String) {
+        let req = match method {
+            "GET" => test::TestRequest::get(),
+            _ => test::TestRequest::post(),
+        }
+        .uri(path)
+        .insert_header(("Authorization", "Bearer s3cret"))
+        .set_payload(body.to_string());
+        let req = match actor {
+            Some(actor) => req.insert_header(("X-Admin-Actor", actor)),
+            None => req,
+        };
+        send(Some(settings_admin()), queue.clone(), req).await
+    }
+
+    #[actix_web::test]
+    async fn seed_routes_validate_and_wake() {
+        let queue = persistent_queue("seed-routes");
+        let post = |path: &'static str, actor, body| {
+            let queue = queue.clone();
+            async move { seed_call(&queue, "POST", path, actor, body).await }
+        };
+        assert_eq!(
+            post("/admin/seeds/add", Some("ann"), "not a seed!").await.0,
+            400
+        );
+        assert_eq!(post("/admin/seeds/add", None, "x.eth").await.0, 400);
+        // refused writes don't wake the thread
+        queue.wait_for_seeds(Duration::from_millis(10));
+        let (status, _) = post("/admin/seeds/add", Some("ann"), "x.eth\n").await;
+        assert_eq!(status, 200);
+        // the write woke the seeds thread
+        let start = std::time::Instant::now();
+        queue.wait_for_seeds(Duration::from_secs(30));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let (status, body) = seed_call(&queue, "GET", "/admin/seeds", None, "").await;
+        assert_eq!(status, 200);
+        let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let x = read["seeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["entry"] == "x.eth")
+            .unwrap();
+        assert_eq!(
+            (x["mark"].as_str(), x["actor"].as_str()),
+            (Some("added"), Some("ann"))
+        );
+        assert!(read["file"].is_null());
+        assert_eq!(
+            post("/admin/seeds/remove", Some("bob"), "x.eth").await.0,
+            200
+        );
+        // not in a file, so a removal leaves nothing to list
+        let (_, body) = seed_call(&queue, "GET", "/admin/seeds", None, "").await;
+        assert!(!body.contains("x.eth"), "{}", body);
+        assert_eq!(
+            post("/admin/seeds/reset", Some("ann"), "x.eth").await.0,
+            200
+        );
+        let (_, body) = seed_call(&queue, "GET", "/admin/seeds", None, "").await;
+        assert!(!body.contains("x.eth"), "{}", body);
+    }
+
+    #[actix_web::test]
+    async fn a_blocked_seed_and_a_missing_store_are_400() {
+        let queue = persistent_queue("seed-blocked");
+        queue.set_denylist(Denylist::parse(&format!("{}\n", BAD)));
+        let (status, _) = seed_call(&queue, "POST", "/admin/seeds/add", Some("ann"), BAD).await;
+        assert_eq!(status, 400);
+        let memory = web::Data::new(IndexQueue::new());
+        let (status, body) =
+            seed_call(&memory, "POST", "/admin/seeds/add", Some("ann"), "x.eth").await;
+        assert_eq!((status, body.as_str()), (400, "settings need DATA_DIR"));
+        assert_eq!(
+            seed_call(&memory, "GET", "/admin/seeds", None, "").await.0,
+            200
         );
     }
 }

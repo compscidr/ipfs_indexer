@@ -539,15 +539,17 @@ async fn main() -> std::io::Result<()> {
             discovery::run_resolver(&queue, &gateway, &cap)
         });
     }
-    match std::env::var("SEEDS_FILE").ok().filter(|p| !p.is_empty()) {
-        Some(path) => {
-            info!("Seeds file: {}", path);
-            let queue = Arc::clone(&index_queue);
-            keep_running("Seeds file", move || {
-                discovery::run_seeds(&queue, std::path::Path::new(&path))
-            });
-        }
+    // the seeds thread also serves the admin's seed changes, which need a persistent store
+    let seeds_file = std::env::var("SEEDS_FILE").ok().filter(|p| !p.is_empty());
+    match &seeds_file {
+        Some(path) => info!("Seeds file: {}", path),
         None => info!("Seeds file: none (no SEEDS_FILE)"),
+    }
+    if seeds_file.is_some() || index_queue.has_persistent_store() {
+        let queue = Arc::clone(&index_queue);
+        keep_running("Seeds", move || {
+            discovery::run_seeds(&queue, seeds_file.as_deref().map(std::path::Path::new))
+        });
     }
     // the URL carries an API key: only its host is ever logged
     match index_queue.settings().secret(Key::EthRpcUrl) {

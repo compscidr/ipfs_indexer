@@ -1,3 +1,4 @@
+use crate::discovery::SeedChange;
 use crate::index_result::IndexResult;
 use crate::segments::{erase_file, Maintained, Segments};
 use log::debug;
@@ -136,6 +137,13 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS settings (
         name   TEXT PRIMARY KEY,
         value  TEXT NOT NULL,
+        actor  TEXT NOT NULL,
+        set_at INTEGER NOT NULL
+    );
+    -- admin additions and removals layered on the seeds file (#304), by entry
+    CREATE TABLE IF NOT EXISTS seed_changes (
+        entry  TEXT PRIMARY KEY,
+        change TEXT NOT NULL CHECK (change IN ('add','remove')),
         actor  TEXT NOT NULL,
         set_at INTEGER NOT NULL
     );";
@@ -1094,6 +1102,47 @@ impl Store {
         let cleared = conn
             .prepare_cached("DELETE FROM settings WHERE name = ?1")?
             .execute([name])?;
+        Ok(cleared > 0)
+    }
+
+    /// The admin's seed additions and removals (#304), oldest first
+    pub fn seed_changes(&self) -> rusqlite::Result<Vec<SeedChange>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT entry, change, actor, set_at FROM seed_changes ORDER BY set_at, entry",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SeedChange {
+                entry: r.get(0)?,
+                add: r.get::<_, String>(1)? == "add",
+                actor: r.get(2)?,
+                set_at: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_seed_change(&self, change: &SeedChange) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached(
+            "INSERT INTO seed_changes (entry, change, actor, set_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (entry) DO UPDATE SET change = ?2, actor = ?3, set_at = ?4",
+        )?
+        .execute(params![
+            change.entry,
+            if change.add { "add" } else { "remove" },
+            change.actor,
+            change.set_at
+        ])?;
+        Ok(())
+    }
+
+    /// Drops an entry's change; false if it had none
+    pub fn clear_seed_change(&self, entry: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let cleared = conn
+            .prepare_cached("DELETE FROM seed_changes WHERE entry = ?1")?
+            .execute([entry])?;
         Ok(cleared > 0)
     }
 

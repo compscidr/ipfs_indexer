@@ -258,29 +258,117 @@ pub fn add_seeds(queue: &IndexQueue, entries: &[Entry], now: i64) -> usize {
         .count()
 }
 
-/// The seeds thread: reads the file at start and every hour. An unreadable file is logged; the
-/// entries read before are in the store and stay.
-pub fn run_seeds(queue: &IndexQueue, path: &Path) {
-    loop {
+/// An admin's addition to, or removal from, the seeds file's entries (#304)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedChange {
+    pub entry: String,
+    pub add: bool,
+    pub actor: String,
+    pub set_at: i64,
+}
+
+/// Where a seed comes from
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SeedMark {
+    /// in the seeds file
+    Iac,
+    /// added by an admin
+    Added,
+    /// in the seeds file, but taken out by an admin: not seeded
+    Removed,
+}
+
+/// A seed in the list: its entry, where it comes from, and who changed it and when
+pub type SeedRow = (String, SeedMark, Option<(String, i64)>);
+
+/// The seeds file's entries with the admin's changes on top: the file's in order, each `Iac` or
+/// `Removed`, then the additions the file lacks, oldest first, as `Added`. The third part is who
+/// changed it and when. A removed entry stays in the list; it just isn't seeded.
+pub fn effective_seeds(file: &[Entry], changes: &[SeedChange]) -> Vec<SeedRow> {
+    let change_of = |entry: &str| changes.iter().find(|c| c.entry == entry);
+    let mut seeds: Vec<SeedRow> = Vec::new();
+    for entry in file {
+        let entry = entry.as_str();
+        if seeds.iter().any(|(e, _, _)| e == entry) {
+            continue;
+        }
+        seeds.push(match change_of(entry) {
+            Some(c) if !c.add => (
+                entry.to_string(),
+                SeedMark::Removed,
+                Some((c.actor.clone(), c.set_at)),
+            ),
+            _ => (entry.to_string(), SeedMark::Iac, None),
+        });
+    }
+    let mut added: Vec<&SeedChange> = changes
+        .iter()
+        .filter(|c| c.add && !file.iter().any(|e| e.as_str() == c.entry))
+        .collect();
+    added.sort_by(|a, b| (a.set_at, &a.entry).cmp(&(b.set_at, &b.entry)));
+    seeds.extend(added.into_iter().map(|c| {
+        (
+            c.entry.clone(),
+            SeedMark::Added,
+            Some((c.actor.clone(), c.set_at)),
+        )
+    }));
+    seeds
+}
+
+/**
+ * One round of the seeds thread: reads the file (no path means an empty one), keeps its entries
+ * for the admin view, and records and forgets seeds to match the file with the admin's changes
+ * on top. An unreadable file is logged and the entries read before are used; if there were none
+ * (the file was never readable), nothing is forgotten.
+ */
+pub fn seeds_round(queue: &IndexQueue, path: Option<&Path>) {
+    if let Some(path) = path {
         match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let entries = parse_seeds(&text);
-                let new = add_seeds(queue, &entries, now_secs());
-                if new > 0 {
-                    info!("Seeds file: {} new of {} entries", new, entries.len());
-                }
-                let gone = forget_seeds(queue, &entries);
-                if gone > 0 {
-                    info!("Seeds file: {} no longer listed, forgotten", gone);
-                }
-            }
+            Ok(text) => queue.set_seeds_file(parse_seeds(&text)),
             Err(err) => warn!(
                 "Couldn't read seeds file {}: {}; keeping the entries read before",
                 path.display(),
                 err
             ),
         }
-        std::thread::sleep(Duration::from_secs(HOUR as u64));
+    } else if queue.seeds_file().is_none() {
+        queue.set_seeds_file(Vec::new());
+    }
+    let changes = match queue.store().seed_changes() {
+        Ok(changes) => changes,
+        Err(err) => {
+            warn!("Couldn't read the seed changes: {}", err);
+            queue.store().note_error(&err);
+            return;
+        }
+    };
+    let read = queue.seeds_file();
+    let entries: Vec<Entry> = effective_seeds(read.as_deref().unwrap_or(&[]), &changes)
+        .into_iter()
+        .filter(|(_, mark, _)| *mark != SeedMark::Removed)
+        .filter_map(|(entry, _, _)| entry::parse(&entry))
+        .collect();
+    let new = add_seeds(queue, &entries, now_secs());
+    if new > 0 {
+        info!("Seeds: {} new of {} entries", new, entries.len());
+    }
+    if read.is_some() {
+        let gone = forget_seeds(queue, &entries);
+        if gone > 0 {
+            info!("Seeds: {} no longer listed, forgotten", gone);
+        }
+    }
+}
+
+/// The seeds thread: a round at start, then every hour or when an admin changes a seed
+pub fn run_seeds(queue: &IndexQueue, path: Option<&Path>) {
+    if let Some(path) = path {
+        queue.set_seeds_path(&path.display().to_string());
+    }
+    loop {
+        seeds_round(queue, path);
+        queue.wait_for_seeds(Duration::from_secs(HOUR as u64));
     }
 }
 
@@ -781,6 +869,121 @@ mod tests {
             "only seeds are forgotten"
         );
         assert_eq!(forget_seeds(&queue, &parse_seeds("vitalik.eth\n")), 0);
+    }
+
+    fn change(entry: &str, add: bool, set_at: i64) -> SeedChange {
+        SeedChange {
+            entry: entry.into(),
+            add,
+            actor: "ann".into(),
+            set_at,
+        }
+    }
+
+    fn seeded(queue: &IndexQueue) -> Vec<String> {
+        let mut seeded: Vec<String> = queue
+            .discovered()
+            .into_iter()
+            .filter(|d| d.source == "seeds")
+            .map(|d| d.entry)
+            .collect();
+        seeded.sort();
+        seeded
+    }
+
+    #[test]
+    fn effective_seeds_layers_admin_changes_on_the_file() {
+        let file = parse_seeds("a.eth\nb.eth\n");
+        let changes = [change("c.eth", true, 5), change("b.eth", false, 6)];
+        let ann = Some(("ann".to_string(), 5));
+        assert_eq!(
+            effective_seeds(&file, &changes),
+            vec![
+                ("a.eth".to_string(), SeedMark::Iac, None),
+                (
+                    "b.eth".to_string(),
+                    SeedMark::Removed,
+                    Some(("ann".to_string(), 6))
+                ),
+                ("c.eth".to_string(), SeedMark::Added, ann),
+            ]
+        );
+        // an addition the file has already shows as the file's
+        assert_eq!(
+            effective_seeds(&file, &[change("a.eth", true, 1)])[0],
+            ("a.eth".to_string(), SeedMark::Iac, None)
+        );
+    }
+
+    #[test]
+    fn a_removed_seed_stays_forgotten_after_a_reread() {
+        let dir = crate::store::tests::temp_dir("seeds-removed");
+        let file = dir.join("seeds.txt");
+        std::fs::write(&file, "a.eth\nb.eth\n").unwrap();
+        let open = || {
+            let queue = IndexQueue::new();
+            queue
+                .attach_store(crate::store::Store::open(&dir, 0).unwrap())
+                .unwrap();
+            queue
+        };
+        let queue = open();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth", "b.eth"]);
+        queue
+            .store()
+            .set_seed_change(&change("b.eth", false, 1))
+            .unwrap();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth"]);
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth"]);
+        drop(queue);
+        // a restart
+        let queue = open();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth"]);
+    }
+
+    #[test]
+    fn an_unreadable_file_keeps_the_entries_read_before() {
+        let dir = crate::store::tests::temp_dir("seeds-unreadable");
+        let file = dir.join("seeds.txt");
+        std::fs::write(&file, "a.eth\n").unwrap();
+        let queue = IndexQueue::new();
+        seeds_round(&queue, Some(&file));
+        std::fs::remove_file(&file).unwrap();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth"]);
+        // never readable: nothing is forgotten
+        let queue = IndexQueue::new();
+        queue.discover("old.eth", "seeds").unwrap();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["old.eth"]);
+    }
+
+    #[test]
+    fn admin_seeds_work_without_a_file() {
+        let queue = IndexQueue::new();
+        queue
+            .store()
+            .set_seed_change(&change("x.eth", true, 1))
+            .unwrap();
+        seeds_round(&queue, None);
+        assert_eq!(row(&queue, "x.eth").source, "seeds");
+    }
+
+    #[test]
+    fn a_wake_ends_the_wait() {
+        let queue = IndexQueue::new();
+        queue.wake_seeds();
+        let start = std::time::Instant::now();
+        queue.wait_for_seeds(Duration::from_secs(30));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // taken: the next wait runs its time
+        let start = std::time::Instant::now();
+        queue.wait_for_seeds(Duration::from_millis(100));
+        assert!(start.elapsed() >= Duration::from_millis(100));
     }
 
     // a gateway that answers every request with this status line and body; returns its host:port
