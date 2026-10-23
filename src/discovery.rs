@@ -6,6 +6,7 @@
 use crate::ens::{self, Rpc, RpcError, Scan};
 use crate::entry::{self, Contenthash, Entry};
 use crate::index_queue::{Enqueued, IndexQueue};
+use crate::settings::Key;
 use crate::store::{now_secs, Discovered};
 use log::{debug, info, warn};
 use std::path::Path;
@@ -21,29 +22,28 @@ const ERROR_BODY_CHARS: usize = 200;
 
 /// At most `per_hour` new roots an hour, across every source (0: no limit)
 pub struct HourlyCap {
-    per_hour: u32,
     // the hour and how many it has used
     used: Mutex<(i64, u32)>,
 }
 
 impl HourlyCap {
-    pub fn new(per_hour: u32) -> HourlyCap {
+    pub fn new() -> HourlyCap {
         HourlyCap {
-            per_hour,
             used: Mutex::new((-1, 0)),
         }
     }
 
-    /// Takes one from this hour's allowance; false if it's used up
-    pub fn take(&self, now: i64) -> bool {
-        if self.per_hour == 0 {
+    /// Takes one from this hour's allowance of `per_hour`; false if it's used up. The limit is
+    /// passed on each take, so lowering it stops takes at once (#304).
+    pub fn take(&self, now: i64, per_hour: u32) -> bool {
+        if per_hour == 0 {
             return true;
         }
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         if used.0 != now / HOUR {
             *used = (now / HOUR, 0);
         }
-        if used.1 >= self.per_hour {
+        if used.1 >= per_hour {
             return false;
         }
         used.1 += 1;
@@ -63,9 +63,9 @@ fn retry_after(failures: u32) -> i64 {
 
 /// The root CID the gateway resolves a name to: GET /ipns/<name>/ and the first CID in its
 /// X-Ipfs-Roots header. The body isn't read.
-pub fn resolve(gateway: &str, name: &str) -> Result<String, String> {
+pub fn resolve(gateway: &str, name: &str, timeout: Duration) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
     // a dot segment would be taken as a step up, whatever its encoding
@@ -142,7 +142,8 @@ pub fn check(
         Some(Entry::Cid(cid)) => Ok(cid),
         Some(Entry::Name(name)) => {
             queue.wait_for_gateway();
-            resolve(gateway, &name)
+            let timeout = Duration::from_secs(queue.settings().get(Key::NameTimeoutSecs));
+            resolve(gateway, &name, timeout)
         }
         None => Err("not a CID or a name".to_string()),
     };
@@ -150,7 +151,7 @@ pub fn check(
         Err(err) => Checked::Failed(err),
         Ok(root) => {
             let new = row.root.as_deref() != Some(root.as_str());
-            if new && !cap.take(now) {
+            if new && !cap.take(now, queue.settings().get(Key::DiscoveryPerHour) as u32) {
                 if let Err(err) = store.discovered_postpone(&row.entry, next_hour(now)) {
                     warn!("Couldn't put off {}: {}", row.entry, err);
                     store.note_error(&err);
@@ -257,29 +258,117 @@ pub fn add_seeds(queue: &IndexQueue, entries: &[Entry], now: i64) -> usize {
         .count()
 }
 
-/// The seeds thread: reads the file at start and every hour. An unreadable file is logged; the
-/// entries read before are in the store and stay.
-pub fn run_seeds(queue: &IndexQueue, path: &Path) {
-    loop {
+/// An admin's addition to, or removal from, the seeds file's entries (#304)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedChange {
+    pub entry: String,
+    pub add: bool,
+    pub actor: String,
+    pub set_at: i64,
+}
+
+/// Where a seed comes from
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SeedMark {
+    /// in the seeds file
+    Iac,
+    /// added by an admin
+    Added,
+    /// in the seeds file, but taken out by an admin: not seeded
+    Removed,
+}
+
+/// A seed in the list: its entry, where it comes from, and who changed it and when
+pub type SeedRow = (String, SeedMark, Option<(String, i64)>);
+
+/// The seeds file's entries with the admin's changes on top: the file's in order, each `Iac` or
+/// `Removed`, then the additions the file lacks, oldest first, as `Added`. The third part is who
+/// changed it and when. A removed entry stays in the list; it just isn't seeded.
+pub fn effective_seeds(file: &[Entry], changes: &[SeedChange]) -> Vec<SeedRow> {
+    let change_of = |entry: &str| changes.iter().find(|c| c.entry == entry);
+    let mut seeds: Vec<SeedRow> = Vec::new();
+    for entry in file {
+        let entry = entry.as_str();
+        if seeds.iter().any(|(e, _, _)| e == entry) {
+            continue;
+        }
+        seeds.push(match change_of(entry) {
+            Some(c) if !c.add => (
+                entry.to_string(),
+                SeedMark::Removed,
+                Some((c.actor.clone(), c.set_at)),
+            ),
+            _ => (entry.to_string(), SeedMark::Iac, None),
+        });
+    }
+    let mut added: Vec<&SeedChange> = changes
+        .iter()
+        .filter(|c| c.add && !file.iter().any(|e| e.as_str() == c.entry))
+        .collect();
+    added.sort_by(|a, b| (a.set_at, &a.entry).cmp(&(b.set_at, &b.entry)));
+    seeds.extend(added.into_iter().map(|c| {
+        (
+            c.entry.clone(),
+            SeedMark::Added,
+            Some((c.actor.clone(), c.set_at)),
+        )
+    }));
+    seeds
+}
+
+/**
+ * One round of the seeds thread: reads the file (no path means an empty one), keeps its entries
+ * for the admin view, and records and forgets seeds to match the file with the admin's changes
+ * on top. An unreadable file is logged and the entries read before are used; if there were none
+ * (the file was never readable), nothing is forgotten.
+ */
+pub fn seeds_round(queue: &IndexQueue, path: Option<&Path>) {
+    if let Some(path) = path {
         match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let entries = parse_seeds(&text);
-                let new = add_seeds(queue, &entries, now_secs());
-                if new > 0 {
-                    info!("Seeds file: {} new of {} entries", new, entries.len());
-                }
-                let gone = forget_seeds(queue, &entries);
-                if gone > 0 {
-                    info!("Seeds file: {} no longer listed, forgotten", gone);
-                }
-            }
+            Ok(text) => queue.set_seeds_file(parse_seeds(&text)),
             Err(err) => warn!(
                 "Couldn't read seeds file {}: {}; keeping the entries read before",
                 path.display(),
                 err
             ),
         }
-        std::thread::sleep(Duration::from_secs(HOUR as u64));
+    } else if queue.seeds_file().is_none() {
+        queue.set_seeds_file(Vec::new());
+    }
+    let changes = match queue.store().seed_changes() {
+        Ok(changes) => changes,
+        Err(err) => {
+            warn!("Couldn't read the seed changes: {}", err);
+            queue.store().note_error(&err);
+            return;
+        }
+    };
+    let read = queue.seeds_file();
+    let entries: Vec<Entry> = effective_seeds(read.as_deref().unwrap_or(&[]), &changes)
+        .into_iter()
+        .filter(|(_, mark, _)| *mark != SeedMark::Removed)
+        .filter_map(|(entry, _, _)| entry::parse(&entry))
+        .collect();
+    let new = add_seeds(queue, &entries, now_secs());
+    if new > 0 {
+        info!("Seeds: {} new of {} entries", new, entries.len());
+    }
+    if read.is_some() {
+        let gone = forget_seeds(queue, &entries);
+        if gone > 0 {
+            info!("Seeds: {} no longer listed, forgotten", gone);
+        }
+    }
+}
+
+/// The seeds thread: a round at start, then every hour or when an admin changes a seed
+pub fn run_seeds(queue: &IndexQueue, path: Option<&Path>) {
+    if let Some(path) = path {
+        queue.set_seeds_path(&path.display().to_string());
+    }
+    loop {
+        seeds_round(queue, path);
+        queue.wait_for_seeds(Duration::from_secs(HOUR as u64));
     }
 }
 
@@ -413,9 +502,9 @@ pub fn run_ens(queue: &IndexQueue, rpc: &dyn Rpc, limits: &EnsLimits) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::breaker::PauseRule;
     use crate::denylist::Denylist;
     use crate::ens::fake::{log, FakeRpc};
-    use crate::pauses::Pauses;
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -424,6 +513,7 @@ mod tests {
     const A: &str = "bafybeier6ud42ptljtfaxrdlknktw54b7ohfpg5h33mosxpxjndxs7xzvm";
     const B: &str = "bafybeiesmy6rsaglneqxbzkbdj5degzp2izydfadhl2vu3oyrp7k52fypu";
     const NOW: i64 = 1_800_000_000;
+    const TIMEOUT: Duration = Duration::from_secs(30);
 
     // a gateway answering /ipns/<name>/ with X-Ipfs-Roots: <root>, or 504 if root is None, and
     // /ipfs/<path> with a page naming the path; returns its host:port
@@ -474,13 +564,47 @@ mod tests {
 
     #[test]
     fn the_hourly_cap_counts_per_hour_and_zero_means_none() {
-        let cap = HourlyCap::new(2);
-        assert!(cap.take(NOW));
-        assert!(cap.take(NOW + 1));
-        assert!(!cap.take(NOW + 2));
-        assert!(cap.take(next_hour(NOW)), "a new hour");
-        let none = HourlyCap::new(0);
-        assert!((0..1000).all(|i| none.take(NOW + i)));
+        let cap = HourlyCap::new();
+        assert!(cap.take(NOW, 2));
+        assert!(cap.take(NOW + 1, 2));
+        assert!(!cap.take(NOW + 2, 2));
+        assert!(cap.take(next_hour(NOW), 2), "a new hour");
+        let none = HourlyCap::new();
+        assert!((0..1000).all(|i| none.take(NOW + i, 0)));
+    }
+
+    #[test]
+    fn the_hourly_cap_uses_the_limit_it_is_given() {
+        let cap = HourlyCap::new();
+        assert!(cap.take(NOW, 3));
+        assert!(cap.take(NOW + 1, 3));
+        // lowered mid-hour: the two used already are the limit
+        assert!(!cap.take(NOW + 2, 2));
+        // raised again
+        assert!(cap.take(NOW + 3, 3));
+        // 0 means none, however many are used
+        assert!(cap.take(NOW + 4, 0));
+    }
+
+    #[test]
+    fn a_name_lookup_uses_the_timeout_it_is_given() {
+        // a gateway that accepts and never answers
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gw = listener.local_addr().unwrap().to_string();
+        let held = std::thread::spawn(move || {
+            let conns: Vec<_> = listener.incoming().take(1).collect();
+            std::thread::sleep(Duration::from_secs(4));
+            drop(conns);
+        });
+        let start = std::time::Instant::now();
+        let result = resolve(&gw, "x.eth", Duration::from_secs(1));
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        held.join().unwrap();
     }
 
     #[test]
@@ -496,7 +620,7 @@ mod tests {
         let checked = check(
             &queue,
             &gateway(Some(A)),
-            &HourlyCap::new(10),
+            &HourlyCap::new(),
             &row(&queue, "docs.ipfs.tech"),
             NOW,
         );
@@ -513,7 +637,7 @@ mod tests {
     fn a_changed_root_is_queued_and_an_unchanged_one_again() {
         let queue = IndexQueue::new();
         queue.discover("docs.ipfs.tech", "seeds").unwrap();
-        let cap = HourlyCap::new(10);
+        let cap = HourlyCap::new();
         check(
             &queue,
             &gateway(Some(A)),
@@ -548,7 +672,10 @@ mod tests {
     fn an_unchanged_root_is_queued_again_even_when_capped() {
         let queue = IndexQueue::new();
         queue.discover("docs.ipfs.tech", "seeds").unwrap();
-        let cap = HourlyCap::new(1);
+        queue
+            .settings_set(Key::DiscoveryPerHour, "1", "test")
+            .unwrap();
+        let cap = HourlyCap::new();
         check(
             &queue,
             &gateway(Some(A)),
@@ -572,8 +699,11 @@ mod tests {
     fn a_new_root_over_the_cap_waits_for_the_next_hour() {
         let queue = IndexQueue::new();
         queue.discover("docs.ipfs.tech", "seeds").unwrap();
-        let cap = HourlyCap::new(1);
-        assert!(cap.take(NOW));
+        queue
+            .settings_set(Key::DiscoveryPerHour, "1", "test")
+            .unwrap();
+        let cap = HourlyCap::new();
+        assert!(cap.take(NOW, 1));
         assert_eq!(
             check(
                 &queue,
@@ -596,7 +726,7 @@ mod tests {
     fn a_failure_is_stored_and_backs_off() {
         let queue = IndexQueue::new();
         queue.discover("docs.ipfs.tech", "seeds").unwrap();
-        let cap = HourlyCap::new(10);
+        let cap = HourlyCap::new();
         let gw = gateway(None);
         assert!(matches!(
             check(&queue, &gw, &cap, &row(&queue, "docs.ipfs.tech"), NOW),
@@ -619,7 +749,7 @@ mod tests {
     fn a_cid_entry_is_its_own_root_and_a_blocked_root_is_refused() {
         let queue = IndexQueue::new();
         queue.discover(A, "seeds").unwrap();
-        let cap = HourlyCap::new(10);
+        let cap = HourlyCap::new();
         // no gateway needed
         assert_eq!(
             check(&queue, "127.0.0.1:1", &cap, &row(&queue, A), NOW),
@@ -642,20 +772,17 @@ mod tests {
     #[test]
     fn the_resolver_waits_while_the_crawl_is_paused() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_secs(600),
-            Duration::from_secs(900),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_secs(600),
+            ..PauseRule::DEFAULT
+        });
         // the only root with pages queued is paused, so the whole crawl is (#286)
         queue.enqueue(format!("{}/page", B));
         for _ in 0..16 {
-            queue.pauses().record(B, Some("504"));
+            queue.pauses().record(B, Some("504"), queue.pause_rule());
         }
         queue.discover(A, "seeds").unwrap();
-        assert_eq!(
-            resolve_next(&queue, "127.0.0.1:1", &HourlyCap::new(10)),
-            None
-        );
+        assert_eq!(resolve_next(&queue, "127.0.0.1:1", &HourlyCap::new()), None);
         assert_eq!(row(&queue, A).checked_at, None, "still due");
     }
 
@@ -672,7 +799,7 @@ mod tests {
         ] {
             let paths = Arc::new(Mutex::new(vec![]));
             let gw = gateway_recording(Some(A), paths.clone());
-            let result = resolve(&gw, name);
+            let result = resolve(&gw, name, TIMEOUT);
             let seen = paths.lock().unwrap().clone();
             if name.chars().all(|c| c == '.') {
                 assert!(result.is_err() && seen.is_empty(), "{:?} {:?}", name, seen);
@@ -688,7 +815,7 @@ mod tests {
     fn only_a_name_costs_the_resolver_its_pause() {
         let queue = IndexQueue::new();
         queue.discover(A, "seeds").unwrap();
-        let cap = HourlyCap::new(10);
+        let cap = HourlyCap::new();
         let (checked, used_gateway) = resolve_next(&queue, "127.0.0.1:1", &cap).unwrap();
         assert_eq!(checked, Checked::Queued(A.into()));
         assert!(!used_gateway);
@@ -744,6 +871,121 @@ mod tests {
         assert_eq!(forget_seeds(&queue, &parse_seeds("vitalik.eth\n")), 0);
     }
 
+    fn change(entry: &str, add: bool, set_at: i64) -> SeedChange {
+        SeedChange {
+            entry: entry.into(),
+            add,
+            actor: "ann".into(),
+            set_at,
+        }
+    }
+
+    fn seeded(queue: &IndexQueue) -> Vec<String> {
+        let mut seeded: Vec<String> = queue
+            .discovered()
+            .into_iter()
+            .filter(|d| d.source == "seeds")
+            .map(|d| d.entry)
+            .collect();
+        seeded.sort();
+        seeded
+    }
+
+    #[test]
+    fn effective_seeds_layers_admin_changes_on_the_file() {
+        let file = parse_seeds("a.eth\nb.eth\n");
+        let changes = [change("c.eth", true, 5), change("b.eth", false, 6)];
+        let ann = Some(("ann".to_string(), 5));
+        assert_eq!(
+            effective_seeds(&file, &changes),
+            vec![
+                ("a.eth".to_string(), SeedMark::Iac, None),
+                (
+                    "b.eth".to_string(),
+                    SeedMark::Removed,
+                    Some(("ann".to_string(), 6))
+                ),
+                ("c.eth".to_string(), SeedMark::Added, ann),
+            ]
+        );
+        // an addition the file has already shows as the file's
+        assert_eq!(
+            effective_seeds(&file, &[change("a.eth", true, 1)])[0],
+            ("a.eth".to_string(), SeedMark::Iac, None)
+        );
+    }
+
+    #[test]
+    fn a_removed_seed_stays_forgotten_after_a_reread() {
+        let dir = crate::store::tests::temp_dir("seeds-removed");
+        let file = dir.join("seeds.txt");
+        std::fs::write(&file, "a.eth\nb.eth\n").unwrap();
+        let open = || {
+            let queue = IndexQueue::new();
+            queue
+                .attach_store(crate::store::Store::open(&dir, 0).unwrap())
+                .unwrap();
+            queue
+        };
+        let queue = open();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth", "b.eth"]);
+        queue
+            .store()
+            .set_seed_change(&change("b.eth", false, 1))
+            .unwrap();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth"]);
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth"]);
+        drop(queue);
+        // a restart
+        let queue = open();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth"]);
+    }
+
+    #[test]
+    fn an_unreadable_file_keeps_the_entries_read_before() {
+        let dir = crate::store::tests::temp_dir("seeds-unreadable");
+        let file = dir.join("seeds.txt");
+        std::fs::write(&file, "a.eth\n").unwrap();
+        let queue = IndexQueue::new();
+        seeds_round(&queue, Some(&file));
+        std::fs::remove_file(&file).unwrap();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["a.eth"]);
+        // never readable: nothing is forgotten
+        let queue = IndexQueue::new();
+        queue.discover("old.eth", "seeds").unwrap();
+        seeds_round(&queue, Some(&file));
+        assert_eq!(seeded(&queue), vec!["old.eth"]);
+    }
+
+    #[test]
+    fn admin_seeds_work_without_a_file() {
+        let queue = IndexQueue::new();
+        queue
+            .store()
+            .set_seed_change(&change("x.eth", true, 1))
+            .unwrap();
+        seeds_round(&queue, None);
+        assert_eq!(row(&queue, "x.eth").source, "seeds");
+    }
+
+    #[test]
+    fn a_wake_ends_the_wait() {
+        let queue = IndexQueue::new();
+        queue.wake_seeds();
+        let start = std::time::Instant::now();
+        queue.wait_for_seeds(Duration::from_secs(30));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // taken: the next wait runs its time
+        let start = std::time::Instant::now();
+        queue.wait_for_seeds(Duration::from_millis(100));
+        assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
     // a gateway that answers every request with this status line and body; returns its host:port
     fn gateway_answering(status: &'static str, body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -772,12 +1014,17 @@ mod tests {
             "failed to resolve /ipns/libp2p.io/: DNSLink lookup could not find a TXT record\n",
         );
         assert_eq!(
-            resolve(&gw, "libp2p.io"),
+            resolve(&gw, "libp2p.io", TIMEOUT),
             Err("500 Internal Server Error: failed to resolve /ipns/libp2p.io/: DNSLink lookup could not find a TXT record".to_string())
         );
         // a long body is cut, and its lines joined
         let long: &'static str = Box::leak(format!("a\nb {}", "x".repeat(500)).into_boxed_str());
-        let err = resolve(&gateway_answering("502 Bad Gateway", long), "x.eth").unwrap_err();
+        let err = resolve(
+            &gateway_answering("502 Bad Gateway", long),
+            "x.eth",
+            TIMEOUT,
+        )
+        .unwrap_err();
         assert!(err.starts_with("502 Bad Gateway: a b xxx"), "{}", err);
         assert_eq!(
             err.chars().count(),
@@ -785,7 +1032,11 @@ mod tests {
         );
         // no body: just the status
         assert_eq!(
-            resolve(&gateway_answering("504 Gateway Timeout", ""), "x.eth"),
+            resolve(
+                &gateway_answering("504 Gateway Timeout", ""),
+                "x.eth",
+                TIMEOUT
+            ),
             Err("504 Gateway Timeout".to_string())
         );
     }
@@ -937,7 +1188,7 @@ mod tests {
         add_seeds(&queue, &parse_seeds("site.example\n"), now_secs());
         let gw = gateway(Some(A));
         assert_eq!(
-            resolve_next(&queue, &gw, &HourlyCap::new(10)),
+            resolve_next(&queue, &gw, &HourlyCap::new()),
             Some((Checked::Queued(A.into()), true))
         );
         assert!(queue.process_next(&gw));
