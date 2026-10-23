@@ -843,7 +843,7 @@ mod tests {
         );
         queue.enqueue(format!("{}/x", QM));
         for _ in 0..16 {
-            queue.pauses().record(QM, Some("504"));
+            queue.pauses().record(QM, Some("504"), queue.pause_rule());
         }
         let app = test::init_service(App::new().app_data(queue.clone()).service(roots)).await;
         let body =

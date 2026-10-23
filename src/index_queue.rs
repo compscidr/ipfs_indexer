@@ -1,4 +1,4 @@
-use crate::breaker::Permit;
+use crate::breaker::{PauseRule, Permit};
 use crate::denylist::{normalize_item, Denylist};
 use crate::index_result::IndexResult;
 use crate::pauses::Pauses;
@@ -178,20 +178,18 @@ fn check_marked_damage(dir: &std::path::Path) -> Result<bool, OpenError> {
     }
 }
 
-// skip anything bigger than this rather than pulling it all into memory
-const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
-
-// a page the gateway fails on this many times in all is dropped (#284)
-const MAX_ATTEMPTS: u32 = 3;
-
 /**
  * Fetch a url and return its body, but only if the gateway says it's html and it fits in
- * MAX_BODY_BYTES. Ok(None) means it was skipped: images, video, etc are never downloaded.
+ * `max_bytes` (bigger is skipped rather than pulled all into memory). Ok(None) means it was
+ * skipped: images, video, etc are never downloaded.
  */
-fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, FetchError> {
+fn fetch_html(
+    url: &str,
+    timeout: Duration,
+    max_bytes: u64,
+) -> Result<Option<(String, reqwest::Url)>, FetchError> {
     let client = reqwest::blocking::Client::builder()
-        // public gateways can take ~50s on a cache miss
-        .timeout(Duration::from_secs(90))
+        .timeout(timeout)
         .build()?;
     let response = client.get(url).send()?.error_for_status()?;
     // where the page actually is after redirects (e.g. "wiki" -> "wiki/"); links resolve against it
@@ -208,11 +206,11 @@ fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, FetchError> {
     let mut body = Vec::new();
     // a body cut short (a timeout, a reset) is the gateway failing, not the page (#284)
     response
-        .take(MAX_BODY_BYTES + 1)
+        .take(max_bytes + 1)
         .read_to_end(&mut body)
         .map_err(FetchError::Body)?;
-    if body.len() as u64 > MAX_BODY_BYTES {
-        warn!("Skipping {}: larger than {} bytes", url, MAX_BODY_BYTES);
+    if body.len() as u64 > max_bytes {
+        warn!("Skipping {}: larger than {} bytes", url, max_bytes);
         return Ok(None);
     }
     Ok(Some((
@@ -306,25 +304,28 @@ pub enum Enqueued {
 }
 
 // the test fetch a worker holds for a root (#284, per root since #286): reported with
-// tested(), else handed back on drop, or counted as a failed test if the worker is panicking
+// tested(), else handed back on drop, or counted as a failed test if the worker is panicking.
+// Judged by the pause rule in use when the turn was taken
 struct TestTurn<'a> {
     pauses: &'a Pauses,
     root: String,
+    rule: PauseRule,
     reported: bool,
 }
 
 impl<'a> TestTurn<'a> {
-    fn new(pauses: &'a Pauses, root: &str) -> Self {
+    fn new(pauses: &'a Pauses, root: &str, rule: PauseRule) -> Self {
         TestTurn {
             pauses,
             root: root.to_string(),
+            rule,
             reported: false,
         }
     }
 
     fn tested(mut self, failure: Option<&str>) {
         self.reported = true;
-        self.pauses.tested(&self.root, failure);
+        self.pauses.tested(&self.root, failure, self.rule);
     }
 }
 
@@ -335,7 +336,7 @@ impl Drop for TestTurn<'_> {
         }
         if std::thread::panicking() {
             self.pauses
-                .tested(&self.root, Some("the test fetch panicked"));
+                .tested(&self.root, Some("the test fetch panicked"), self.rule);
         } else {
             self.pauses.hand_back(&self.root);
         }
@@ -384,6 +385,10 @@ pub struct IndexQueue {
 
     // the tunable settings (#304): set by main from the env, or the defaults on first use
     settings: OnceLock<Settings>,
+
+    // a pause rule in place of the settings', for tests that need pauses under a second
+    #[cfg(test)]
+    pause_rule_for_test: OnceLock<PauseRule>,
 }
 
 impl IndexQueue {
@@ -400,6 +405,8 @@ impl IndexQueue {
             pauses: OnceLock::new(),
             indexed: Rate::new(),
             settings: OnceLock::new(),
+            #[cfg(test)]
+            pause_rule_for_test: OnceLock::new(),
         }
     }
 
@@ -503,9 +510,24 @@ impl IndexQueue {
         self.pauses.get_or_init(Pauses::new)
     }
 
+    /// When a root pauses and for how long, from the pause_* settings (#304)
+    pub(crate) fn pause_rule(&self) -> PauseRule {
+        #[cfg(test)]
+        if let Some(rule) = self.pause_rule_for_test.get() {
+            return *rule;
+        }
+        let settings = self.settings();
+        PauseRule {
+            window: settings.get(Key::PauseWindow) as usize,
+            failures: settings.get(Key::PauseFailures) as usize,
+            min: Duration::from_secs(settings.get(Key::PauseMinSecs)),
+            max: Duration::from_secs(settings.get(Key::PauseMaxSecs)),
+        }
+    }
+
     #[cfg(test)]
-    pub(crate) fn set_pauses_for_test(&self, pauses: Pauses) {
-        let _ = self.pauses.set(pauses);
+    pub(crate) fn set_pause_rule_for_test(&self, rule: PauseRule) {
+        let _ = self.pause_rule_for_test.set(rule);
     }
 
     /// Why the crawl is paused (#284): every root with pages queued is paused after repeated
@@ -1153,7 +1175,9 @@ impl IndexQueue {
         };
         match test {
             Some(test) => test.tested(failure),
-            None => self.pauses().record(root_of(&item), failure),
+            None => self
+                .pauses()
+                .record(root_of(&item), failure, self.pause_rule()),
         }
         match fetched {
             // a mirror's links lead to more of the mirror: the original's were followed
@@ -1186,7 +1210,7 @@ impl IndexQueue {
         match self.pauses().permit(root) {
             Permit::Go => Some((next, None)),
             Permit::Test => {
-                let turn = TestTurn::new(self.pauses(), root);
+                let turn = TestTurn::new(self.pauses(), root, self.pause_rule());
                 Some((next, Some(turn)))
             }
             Permit::Wait => {
@@ -1199,10 +1223,11 @@ impl IndexQueue {
         }
     }
 
-    // a page the gateway failed on goes to the back of the queue, until MAX_ATTEMPTS (#284)
+    // a page the gateway failed on goes to the back of the queue, until it has failed
+    // page_attempts times in all (#284, #304)
     fn retry(&self, item: &str, attempts: u32, err: &str) {
         let attempts = attempts + 1;
-        if attempts >= MAX_ATTEMPTS {
+        if u64::from(attempts) >= self.settings().get(Key::PageAttempts) {
             warn!("Dropping {} after {} attempts: {}", item, attempts, err);
             return;
         }
@@ -1216,6 +1241,16 @@ impl IndexQueue {
         }
     }
 
+    // fetch_html with the page_timeout_secs and page_max_bytes settings (#304)
+    fn fetch_page(&self, url: &str) -> Result<Option<(String, reqwest::Url)>, FetchError> {
+        let settings = self.settings();
+        fetch_html(
+            url,
+            Duration::from_secs(settings.get(Key::PageTimeoutSecs)),
+            settings.get(Key::PageMaxBytes),
+        )
+    }
+
     /**
      * Use the http client to obtain the page from the ipfs gateway: the page and its links,
      * nothing to index, or a gateway error to retry (#284)
@@ -1225,7 +1260,7 @@ impl IndexQueue {
         debug!("Retrieving {}", url);
         self.wait_for_gateway();
         let fetch_start = Instant::now();
-        let fetched = fetch_html(&url);
+        let fetched = self.fetch_page(&url);
         debug!("Fetched {} in {:?}", cid, fetch_start.elapsed());
         let health = match &fetched {
             Err(err) if is_gateway_error(err) => Err(err.to_string()),
@@ -1292,7 +1327,7 @@ impl IndexQueue {
                     return None;
                 }
                 self.wait_for_gateway();
-                return match fetch_html(&newurl) {
+                return match self.fetch_page(&newurl) {
                     Ok(Some((html, final_url))) => {
                         Some((fullcid, Html::parse_document(html.as_str()), final_url))
                     }
@@ -1594,11 +1629,18 @@ mod tests {
         );
     }
 
+    // the page_timeout_secs and page_max_bytes defaults
+    const TIMEOUT: Duration = Duration::from_secs(90);
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+
     #[test]
     fn fetch_html_returns_html() {
         let url = serve_once("text/html; charset=utf-8", b"<title>hi</title>".to_vec());
         assert_eq!(
-            fetch_html(&url).unwrap().map(|(body, _)| body).as_deref(),
+            fetch_html(&url, TIMEOUT, MAX_BYTES)
+                .unwrap()
+                .map(|(body, _)| body)
+                .as_deref(),
             Some("<title>hi</title>")
         );
     }
@@ -1606,13 +1648,15 @@ mod tests {
     #[test]
     fn fetch_html_skips_non_html() {
         let url = serve_once("image/png", vec![0x89, b'P', b'N', b'G']);
-        assert_eq!(fetch_html(&url).unwrap(), None);
+        assert_eq!(fetch_html(&url, TIMEOUT, MAX_BYTES).unwrap(), None);
     }
 
     #[test]
-    fn fetch_html_skips_oversized_body() {
-        let url = serve_once("text/html", vec![b'a'; MAX_BODY_BYTES as usize + 1]);
-        assert_eq!(fetch_html(&url).unwrap(), None);
+    fn a_page_over_the_limit_is_skipped() {
+        let url = serve_once("text/html", vec![b'a'; 100]);
+        assert!(fetch_html(&url, TIMEOUT, 100).unwrap().is_some());
+        let url = serve_once("text/html", vec![b'a'; 101]);
+        assert_eq!(fetch_html(&url, TIMEOUT, 100).unwrap(), None);
     }
 
     #[test]
@@ -1622,7 +1666,7 @@ mod tests {
             "text/html",
             b"<p>slow down</p>".to_vec(),
         );
-        assert!(fetch_html(&url).is_err());
+        assert!(fetch_html(&url, TIMEOUT, MAX_BYTES).is_err());
     }
 
     #[test]
@@ -1632,7 +1676,7 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        assert!(fetch_html(&format!("http://127.0.0.1:{}/", port)).is_err());
+        assert!(fetch_html(&format!("http://127.0.0.1:{}/", port), TIMEOUT, MAX_BYTES).is_err());
     }
 
     use crate::store::tests::{page, temp_dir};
@@ -2485,7 +2529,7 @@ mod tests {
     // 16 gateway errors pause a root (#284's rule, per root since #286)
     fn trip(queue: &IndexQueue, root: &str) {
         for _ in 0..16 {
-            queue.pauses().record(root, Some("504"));
+            queue.pauses().record(root, Some("504"), queue.pause_rule());
         }
     }
 
@@ -2516,6 +2560,40 @@ mod tests {
         ));
         assert!(queue.process_next(&gateway));
         assert_eq!(queue.queue_length(), 0);
+    }
+
+    #[test]
+    fn a_page_is_dropped_after_the_configured_attempts() {
+        let queue = IndexQueue::new();
+        queue.settings_set(Key::PageAttempts, "1", "test").unwrap();
+        queue.enqueue(format!("{}/wiki/A", GOOD));
+        let gateway = gateway_of(serve_status_once(
+            "504 Gateway Timeout",
+            "text/plain",
+            b"x".to_vec(),
+        ));
+        assert!(queue.process_next(&gateway));
+        assert_eq!(queue.queue_length(), 0);
+    }
+
+    #[test]
+    fn the_pause_rule_follows_the_settings() {
+        let queue = IndexQueue::new();
+        assert_eq!(queue.pause_rule(), PauseRule::DEFAULT);
+        // failures first: it may not exceed the window
+        queue.settings_set(Key::PauseFailures, "3", "test").unwrap();
+        queue.settings_set(Key::PauseWindow, "4", "test").unwrap();
+        queue.settings_set(Key::PauseMinSecs, "10", "test").unwrap();
+        queue.settings_set(Key::PauseMaxSecs, "25", "test").unwrap();
+        assert_eq!(
+            queue.pause_rule(),
+            PauseRule {
+                window: 4,
+                failures: 3,
+                min: Duration::from_secs(10),
+                max: Duration::from_secs(25),
+            }
+        );
     }
 
     #[test]
@@ -2563,10 +2641,11 @@ mod tests {
     #[test]
     fn a_test_turn_with_nothing_to_fetch_is_handed_back() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(10),
-            Duration::from_millis(40),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(40),
+            ..PauseRule::DEFAULT
+        });
         queue.enqueue(format!("{}/wiki/Blocked", GOOD));
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", GOOD)));
         trip(&queue, GOOD);
@@ -2586,10 +2665,11 @@ mod tests {
     #[test]
     fn a_test_fetch_that_panics_pauses_again_instead_of_stalling_the_crawl() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(10),
-            Duration::from_millis(40),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(40),
+            ..PauseRule::DEFAULT
+        });
         trip(&queue, GOOD);
         std::thread::sleep(Duration::from_millis(15));
         queue.enqueue(format!("{}/wiki/Bad", GOOD));
@@ -2640,10 +2720,11 @@ mod tests {
     fn the_crawl_pauses_while_the_gateway_fails_and_loses_no_pages() {
         use std::sync::atomic::Ordering;
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(50),
-            Duration::from_millis(200),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(50),
+            max: Duration::from_millis(200),
+            ..PauseRule::DEFAULT
+        });
         let items: Vec<String> = (0..20).map(|i| format!("{}/wiki/P{}", GOOD, i)).collect();
         queue.enqueue_many(items);
         let (gateway, up, hits) = serve_flaky();
@@ -2679,10 +2760,6 @@ mod tests {
     #[test]
     fn one_failing_root_does_not_stop_the_others() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-        ));
         let good: Vec<String> = (0..20).map(|i| format!("{}/wiki/P{}", GOOD, i)).collect();
         let qm: Vec<String> = (0..5).map(|i| format!("{}/wiki/P{}", QM, i)).collect();
         queue.enqueue_many(good);
@@ -2717,10 +2794,6 @@ mod tests {
     #[test]
     fn every_root_failing_pauses_the_crawl() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-        ));
         let items: Vec<String> = (0..16)
             .flat_map(|i| {
                 [
@@ -2751,10 +2824,11 @@ mod tests {
     #[test]
     fn a_page_whose_test_was_taken_goes_back_in_place() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(10),
-            Duration::from_millis(40),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(40),
+            ..PauseRule::DEFAULT
+        });
         let (a, b) = (format!("{}/wiki/A", GOOD), format!("{}/wiki/B", GOOD));
         assert!(queue.store().queue_retry(&a, 2).unwrap());
         queue.enqueue(b.clone());
@@ -2771,10 +2845,11 @@ mod tests {
     fn a_resumed_root_crawls_again() {
         use std::sync::atomic::Ordering;
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(10),
-            Duration::from_millis(40),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(40),
+            ..PauseRule::DEFAULT
+        });
         queue.enqueue(format!("{}/wiki/A", GOOD));
         trip(&queue, GOOD);
         assert_eq!(queue.paused_roots(), 1);
