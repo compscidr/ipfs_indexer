@@ -85,6 +85,7 @@ pub fn configure(cfg: &mut web::ServiceConfig, admin: Option<web::Data<Admin>>) 
         cfg.app_data(admin)
             .service(deny)
             .service(undeny)
+            .service(denylist_read)
             .service(recrawl)
             .service(settings_read)
             .service(setting_set)
@@ -321,6 +322,43 @@ const ACTOR_REQUIRED: &str = "X-Admin-Actor is required";
 fn needs_store(queue: &IndexQueue) -> Option<HttpResponse> {
     (!queue.has_persistent_store())
         .then(|| HttpResponse::BadRequest().body("settings need DATA_DIR"))
+}
+
+#[get("/admin/denylist")]
+async fn denylist_read(
+    req: HttpRequest,
+    queue: web::Data<IndexQueue>,
+    admin: web::Data<Admin>,
+) -> HttpResponse {
+    if !authorized(&req, &admin) {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+    // each line says whether /admin/undeny can take it out; this route changes nothing
+    let local: Vec<_> = match &admin.local_denylist {
+        None => Vec::new(),
+        Some(path) => {
+            let _file = file_lock();
+            match std::fs::read_to_string(path) {
+                Ok(text) => text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(|line| json!({ "line": line, "item": entry_item(line) }))
+                    .collect(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(err) => {
+                    return HttpResponse::InternalServerError()
+                        .body(format!("Couldn't read: {}", err));
+                }
+            }
+        }
+    };
+    let (entries, loaded_at) = queue.badbits_summary();
+    HttpResponse::Ok().json(json!({
+        "local": local,
+        "local_file": admin.local_denylist,
+        "badbits": { "entries": entries, "loaded_at": loaded_at },
+    }))
 }
 
 #[get("/admin/seeds")]
@@ -1028,5 +1066,60 @@ mod tests {
             seed_call(&memory, "GET", "/admin/seeds", None, "").await.0,
             200
         );
+    }
+
+    #[actix_web::test]
+    async fn the_denylist_read_lists_lines_and_marks_undoable_ones() {
+        let (admin, _path) = admin_with(&format!(
+            "# note\n{GOOD}\n\n//abcd\n{GOOD}/wiki/X\n",
+            GOOD = GOOD
+        ));
+        let queue = web::Data::new(IndexQueue::new());
+        queue.set_denylist(Denylist::parse(&format!("//{}\n", "ab".repeat(32))));
+        let req = test::TestRequest::get()
+            .uri("/admin/denylist")
+            .insert_header(("Authorization", "Bearer s3cret"));
+        let (status, body) = send(Some(admin), queue, req).await;
+        assert_eq!(status, 200, "{}", body);
+        let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let local = read["local"].as_array().unwrap();
+        assert_eq!(local.len(), 4);
+        assert_eq!(local[0], json!({"line": "# note", "item": null}));
+        assert_eq!(local[1]["item"], GOOD);
+        assert_eq!(local[2], json!({"line": "//abcd", "item": null}));
+        assert_eq!(local[3]["item"], format!("{}/wiki/X", GOOD));
+        assert!(read["local_file"].is_string());
+        assert_eq!(read["badbits"]["entries"], 1);
+        assert!(read["badbits"]["loaded_at"].as_i64().unwrap() > 0);
+    }
+
+    #[actix_web::test]
+    async fn the_denylist_read_without_a_local_file_is_empty() {
+        let admin = web::Data::new(Admin {
+            token: "s3cret".to_string(),
+            local_denylist: None,
+            restart: web::Data::new(Restart::default()),
+        });
+        let req = test::TestRequest::get()
+            .uri("/admin/denylist")
+            .insert_header(("Authorization", "Bearer s3cret"));
+        let (status, body) = send(Some(admin), web::Data::new(IndexQueue::new()), req).await;
+        assert_eq!(status, 200, "{}", body);
+        let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(read["local"], json!([]));
+        assert!(read["local_file"].is_null());
+        assert_eq!(read["badbits"]["entries"], 0);
+    }
+
+    #[actix_web::test]
+    async fn the_denylist_read_needs_the_token() {
+        let (admin, _path) = admin_with("");
+        let queue = web::Data::new(IndexQueue::new());
+        let req = test::TestRequest::get().uri("/admin/denylist");
+        assert_eq!(send(Some(admin.clone()), queue.clone(), req).await.0, 401);
+        let req = test::TestRequest::get()
+            .uri("/admin/denylist")
+            .insert_header(("Authorization", "Bearer wrong"));
+        assert_eq!(send(Some(admin), queue, req).await.0, 401);
     }
 }

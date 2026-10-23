@@ -16,6 +16,7 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::io::Read;
 use std::ops::Not;
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use std::time::Instant;
@@ -356,6 +357,8 @@ pub struct IndexQueue {
     // badbits and the hand-maintained local list, checked before every enqueue and fetch
     denylist: RwLock<Denylist>,
     local_denylist: RwLock<Denylist>,
+    // unix secs when badbits was last installed, 0 before the first load
+    badbits_loaded_at: AtomicI64,
 
     // when the gateway last answered a fetch, and the error if it didn't
     last_fetch: Mutex<Option<(Instant, Result<(), String>)>>,
@@ -404,6 +407,7 @@ impl IndexQueue {
         IndexQueue {
             denylist: RwLock::new(Denylist::empty()),
             local_denylist: RwLock::new(Denylist::empty()),
+            badbits_loaded_at: AtomicI64::new(0),
             last_fetch: Mutex::new(None),
             store: OnceLock::new(),
             writes: RwLock::new(()),
@@ -666,11 +670,21 @@ impl IndexQueue {
             let mut current = self.denylist.write().unwrap();
             let added = denylist.adds_to(&current);
             *current = denylist;
+            self.badbits_loaded_at
+                .store(now_secs(), AtomicOrdering::SeqCst);
             added
         };
         if added && self.store.get().is_some() {
             self.request_purge();
         }
+    }
+
+    /// How many entries the badbits list has and when it was installed (unix secs, 0 if never)
+    pub fn badbits_summary(&self) -> (usize, i64) {
+        (
+            self.denylist.read().unwrap().len(),
+            self.badbits_loaded_at.load(AtomicOrdering::SeqCst),
+        )
     }
 
     /// Same as set_denylist, for the local takedown list
@@ -3543,5 +3557,19 @@ mod tests {
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
         queue.purge_for_test();
         assert_eq!(queue.index_length(), 0);
+    }
+
+    #[test]
+    fn badbits_summary_counts_and_dates_the_list() {
+        let queue = IndexQueue::new();
+        assert_eq!(queue.badbits_summary(), (0, 0));
+        let before = now_secs();
+        queue.set_denylist(Denylist::parse(&format!("//{}\n", "ab".repeat(32))));
+        let (entries, loaded_at) = queue.badbits_summary();
+        assert_eq!(entries, 1);
+        assert!(loaded_at >= before && loaded_at <= now_secs());
+        // the local list isn't counted
+        queue.set_local_denylist(Denylist::parse(&format!("//{}\n", "cd".repeat(32))));
+        assert_eq!(queue.badbits_summary().0, 1);
     }
 }
