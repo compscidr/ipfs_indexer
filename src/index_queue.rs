@@ -4,6 +4,7 @@ use crate::index_result::IndexResult;
 use crate::pauses::Pauses;
 use crate::rate::Rate;
 use crate::search::{self, Query, Scorer, Total, MAX_RANKED};
+use crate::settings::Settings;
 use crate::store::{self, now_secs, root_of, OpenError, Queued, Store, Upserted};
 use actix_web::body::MessageBody;
 use cid::Cid;
@@ -386,6 +387,9 @@ pub struct IndexQueue {
 
     // pages written per minute, for /status (#264)
     indexed: Rate,
+
+    // the tunable settings (#304): set by main from the env, or the defaults on first use
+    settings: OnceLock<Settings>,
 }
 
 impl IndexQueue {
@@ -401,6 +405,19 @@ impl IndexQueue {
             throttle: OnceLock::new(),
             pauses: OnceLock::new(),
             indexed: Rate::new(),
+            settings: OnceLock::new(),
+        }
+    }
+
+    pub fn settings(&self) -> &Settings {
+        self.settings.get_or_init(Settings::defaults)
+    }
+
+    /// Use `settings` for this queue (call before anything reads them, and before attach_store,
+    /// which loads the stored overrides into them)
+    pub fn set_settings(&self, settings: Settings) {
+        if self.settings.set(settings).is_err() {
+            panic!("set_settings must run before the settings are first used");
         }
     }
 
@@ -642,6 +659,8 @@ impl IndexQueue {
     ) -> rusqlite::Result<(usize, usize)> {
         // the startup upkeep (erasures a crash cut short, #249) ran in Store::open
         let counts = (store.page_count(), store.queue_len());
+        // the admin overrides (#304) are kept in the index file
+        self.settings().load(&store);
         if self.store.set(store).is_err() {
             panic!("attach_store must run before the store is first used");
         }
@@ -1742,6 +1761,24 @@ mod tests {
             (1, 1)
         );
         assert_eq!(queue.search("alpha", 0, 10).1.len(), 1);
+    }
+
+    // the admin overrides live in index.sqlite (#304), so they come back with the store
+    #[test]
+    fn attach_store_loads_the_settings_overrides() {
+        use crate::settings::{Key, Settings};
+        let dir = temp_dir("attach-settings");
+        let store = Store::open(&dir, 0).unwrap();
+        Settings::defaults()
+            .set(&store, Key::CrawlWorkers, "42", "a@b")
+            .unwrap();
+        drop(store);
+        let queue = IndexQueue::new();
+        queue.set_settings(Settings::defaults());
+        queue
+            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .unwrap();
+        assert_eq!(queue.settings().get(Key::CrawlWorkers), 42);
     }
 
     #[test]

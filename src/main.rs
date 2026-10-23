@@ -12,6 +12,7 @@ use simple_logger::SimpleLogger;
 use crate::denylist::Denylist;
 use crate::entry::Entry;
 use crate::index_queue::{Enqueued, IndexQueue};
+use crate::settings::{Key, Settings};
 
 mod admin;
 mod breaker;
@@ -26,6 +27,7 @@ mod rate;
 mod search;
 mod segment;
 mod segments;
+mod settings;
 mod store;
 
 // crate version, plus the commit when built with GIT_SHA set (the docker build passes it)
@@ -217,77 +219,6 @@ async fn search_handler(
     }
 }
 
-/// How many crawl workers to run: `CRAWL_WORKERS`, or 10 when unset
-fn crawl_workers(value: Option<String>) -> Result<usize, String> {
-    match value {
-        None => Ok(10),
-        Some(value) => match value.parse::<usize>() {
-            Ok(n) if n > 0 => Ok(n),
-            _ => Err(format!(
-                "CRAWL_WORKERS must be a whole number above 0, got {:?}",
-                value
-            )),
-        },
-    }
-}
-
-/// The lowest healthy indexing rate: `HEALTH_MIN_RATE` pages/min, or 500 when unset; 0 turns the
-/// check off (#285)
-fn health_min_rate(value: Option<String>) -> Result<u64, String> {
-    match value {
-        None => Ok(500),
-        Some(value) => value.parse::<u64>().map_err(|_| {
-            format!(
-                "HEALTH_MIN_RATE must be a whole number of pages a minute (0 turns the check off), got {:?}",
-                value
-            )
-        }),
-    }
-}
-
-/// New discovered roots queued an hour: `DISCOVERY_PER_HOUR`, or 500 when unset; 0 is no limit
-/// (#213)
-fn discovery_per_hour(value: Option<String>) -> Result<u32, String> {
-    match value {
-        None => Ok(500),
-        Some(value) => value.parse::<u32>().map_err(|_| {
-            format!(
-                "DISCOVERY_PER_HOUR must be a whole number of roots an hour (0 = no limit), got {:?}",
-                value
-            )
-        }),
-    }
-}
-
-/// The most blocks one ENS eth_getLogs request asks for: `ETH_LOGS_MAX_BLOCKS`, or 10,000 when
-/// unset; set it to the provider's limit (10 on Alchemy's free plan) (#213)
-fn eth_logs_max_blocks(value: Option<String>) -> Result<u64, String> {
-    match value {
-        None => Ok(10_000),
-        Some(value) => match value.parse::<u64>() {
-            Ok(n) if n > 0 => Ok(n),
-            _ => Err(format!(
-                "ETH_LOGS_MAX_BLOCKS must be a whole number of blocks above 0, got {:?}",
-                value
-            )),
-        },
-    }
-}
-
-/// Seconds between ENS requests: `ETH_REQUEST_SECS`, or 1 when unset; raise it to stay within a
-/// provider's monthly allowance (6 keeps Alchemy's free plan under its 30M compute units) (#213)
-fn eth_request_secs(value: Option<String>) -> Result<u64, String> {
-    match value {
-        None => Ok(1),
-        Some(value) => value.parse::<u64>().map_err(|_| {
-            format!(
-                "ETH_REQUEST_SECS must be a whole number of seconds, got {:?}",
-                value
-            )
-        }),
-    }
-}
-
 /// Starts the ENS scan through `url` (#213); returns the URL's host, the one part safe to log.
 /// The client is built on the scan's own thread: reqwest's blocking client panics when built
 /// inside actix's async main (v0.5.0 crashed at start with ETH_RPC_URL set).
@@ -405,21 +336,17 @@ async fn main() -> std::io::Result<()> {
         gateway = args[1].clone();
     }
 
-    let index_queue = web::Data::new(IndexQueue::new());
-
-    // self-throttle on the public gateway (Filebase allows 200/min; stay well under it, leaving
-    // room for redirect fetches). Your own node (gateway argument): no limit unless configured.
-    let default_rate = if args.len() < 2 { 100 } else { 0 };
-    let gateway_rate = match std::env::var("GATEWAY_REQUESTS_PER_MIN") {
-        Ok(value) => value.parse::<u32>().unwrap_or_else(|_| {
-            error!(
-                "GATEWAY_REQUESTS_PER_MIN must be a whole number, got {:?}",
-                value
-            );
+    // every tunable setting (#304); a bad env value is fatal. The public gateway gets a
+    // request limit by default, an own node (gateway argument) none.
+    let settings = Settings::from_env(|key| std::env::var(key).ok(), args.len() < 2)
+        .unwrap_or_else(|err| {
+            error!("{}", err);
             std::process::exit(1);
-        }),
-        Err(_) => default_rate,
-    };
+        });
+    let index_queue = web::Data::new(IndexQueue::new());
+    index_queue.set_settings(settings);
+
+    let gateway_rate = index_queue.settings().get(Key::GatewayRequestsPerMin) as u32;
     index_queue.set_gateway_rate(gateway_rate);
     if gateway_rate == 0 {
         info!("Gateway requests: no limit");
@@ -481,21 +408,9 @@ async fn main() -> std::io::Result<()> {
 
     // the persisted index (#106): nothing is loaded from it (#231); blocked and expired pages
     // are erased by the purge and expiry threads below. A configured but unusable DATA_DIR is fatal.
-    let max_age_secs = std::env::var("INDEX_MAX_AGE_DAYS")
-        .ok()
-        .and_then(|d| d.parse::<i64>().ok())
-        .unwrap_or(30)
-        * 24
-        * 60
-        * 60;
+    let max_age_secs = index_queue.settings().get(Key::IndexMaxAgeDays) as i64 * 24 * 60 * 60;
     // the most of the index SQLite keeps in memory; the rest stays on disk (#231)
-    let cache_mb = match std::env::var("INDEX_CACHE_MB") {
-        Ok(value) => value.parse::<u32>().unwrap_or_else(|_| {
-            error!("INDEX_CACHE_MB must be a whole number, got {:?}", value);
-            std::process::exit(1);
-        }),
-        Err(_) => 1024,
-    };
+    let cache_mb = index_queue.settings().get(Key::IndexCacheMb) as u32;
     if let Ok(dir) = std::env::var("DATA_DIR") {
         info!("Index cache: at most {} MB in memory", cache_mb);
         let opening = std::time::Instant::now();
@@ -584,25 +499,15 @@ async fn main() -> std::io::Result<()> {
     }
 
     // fetches through Kubo take ~2 s, so the worker count caps the crawl rate (#246)
-    let n_workers = crawl_workers(std::env::var("CRAWL_WORKERS").ok()).unwrap_or_else(|err| {
-        error!("{}", err);
-        std::process::exit(1);
-    });
+    let n_workers = index_queue.settings().get(Key::CrawlWorkers) as usize;
     info!("Crawl workers: {}", n_workers);
-    let min_rate = health_min_rate(std::env::var("HEALTH_MIN_RATE").ok()).unwrap_or_else(|err| {
-        error!("{}", err);
-        std::process::exit(1);
-    });
+    let min_rate = index_queue.settings().get(Key::HealthMinRate);
     // crawling starts now: /health's grace period counts from here
     let health_config = web::Data::new(Health {
         started: Instant::now(),
         min_rate,
     });
-    let per_hour =
-        discovery_per_hour(std::env::var("DISCOVERY_PER_HOUR").ok()).unwrap_or_else(|err| {
-            error!("{}", err);
-            std::process::exit(1);
-        });
+    let per_hour = index_queue.settings().get(Key::DiscoveryPerHour) as u32;
     // per-page lines are debug (about 3 GB a day at info): one line a minute says how the crawl is going
     let summary_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
@@ -647,22 +552,16 @@ async fn main() -> std::io::Result<()> {
         None => info!("Seeds file: none (no SEEDS_FILE)"),
     }
     // the URL carries an API key: only its host is ever logged
-    match std::env::var("ETH_RPC_URL").ok().filter(|u| !u.is_empty()) {
+    match index_queue.settings().secret(Key::EthRpcUrl) {
         Some(url) => {
-            let exit = |err: String| -> ! {
+            let limits = discovery::EnsLimits {
+                max_blocks: index_queue.settings().get(Key::EthLogsMaxBlocks),
+                pause: Duration::from_secs(index_queue.settings().get(Key::EthRequestSecs)),
+            };
+            let host = start_ens(Arc::clone(&index_queue), url, limits).unwrap_or_else(|err| {
                 error!("{}", err);
                 std::process::exit(1);
-            };
-            let limits = discovery::EnsLimits {
-                max_blocks: eth_logs_max_blocks(std::env::var("ETH_LOGS_MAX_BLOCKS").ok())
-                    .unwrap_or_else(|err| exit(err)),
-                pause: Duration::from_secs(
-                    eth_request_secs(std::env::var("ETH_REQUEST_SECS").ok())
-                        .unwrap_or_else(|err| exit(err)),
-                ),
-            };
-            let host =
-                start_ens(Arc::clone(&index_queue), url, limits).unwrap_or_else(|err| exit(err));
+            });
             info!(
                 "ENS scan: through {}, at most {} blocks a request, {:?} apart",
                 host, limits.max_blocks, limits.pause
@@ -788,30 +687,6 @@ mod tests {
         );
     }
 
-    #[actix_web::test]
-    async fn health_min_rate_defaults_to_500_and_rejects_non_numbers() {
-        assert_eq!(health_min_rate(None), Ok(500));
-        assert_eq!(health_min_rate(Some("0".to_string())), Ok(0));
-        assert_eq!(health_min_rate(Some("1200".to_string())), Ok(1200));
-        for bad in ["", "-1", "fast", "1.5"] {
-            assert!(health_min_rate(Some(bad.to_string())).is_err(), "{:?}", bad);
-        }
-    }
-
-    #[actix_web::test]
-    async fn discovery_per_hour_defaults_to_500_and_rejects_non_numbers() {
-        assert_eq!(discovery_per_hour(None), Ok(500));
-        assert_eq!(discovery_per_hour(Some("0".to_string())), Ok(0));
-        assert_eq!(discovery_per_hour(Some("2000".to_string())), Ok(2000));
-        for bad in ["", "-1", "lots", "1.5"] {
-            assert!(
-                discovery_per_hour(Some(bad.to_string())).is_err(),
-                "{:?}",
-                bad
-            );
-        }
-    }
-
     // main runs inside actix's async runtime, where building reqwest's blocking client panics
     // (v0.5.0 crashed at start with ETH_RPC_URL set)
     #[actix_web::test]
@@ -833,28 +708,6 @@ mod tests {
             discovery::EnsLimits::default()
         )
         .is_err());
-    }
-
-    #[actix_web::test]
-    async fn eth_limits_default_to_a_paid_plan_and_reject_bad_values() {
-        assert_eq!(eth_logs_max_blocks(None), Ok(10_000));
-        assert_eq!(eth_logs_max_blocks(Some("10".to_string())), Ok(10));
-        assert_eq!(eth_request_secs(None), Ok(1));
-        assert_eq!(eth_request_secs(Some("6".to_string())), Ok(6));
-        for bad in ["", "0", "-1", "ten", "1.5"] {
-            assert!(
-                eth_logs_max_blocks(Some(bad.to_string())).is_err(),
-                "{:?}",
-                bad
-            );
-        }
-        for bad in ["", "-1", "six"] {
-            assert!(
-                eth_request_secs(Some(bad.to_string())).is_err(),
-                "{:?}",
-                bad
-            );
-        }
     }
 
     #[actix_web::test]
@@ -1046,23 +899,6 @@ mod tests {
             "damaged: corrupt segment file 1.seg: checksum doesn't match; restart to check \
              and rebuild"
         );
-    }
-
-    #[actix_web::test]
-    async fn crawl_workers_default_to_ten() {
-        assert_eq!(crawl_workers(None), Ok(10));
-    }
-
-    #[actix_web::test]
-    async fn crawl_workers_take_the_configured_count() {
-        assert_eq!(crawl_workers(Some("30".to_string())), Ok(30));
-    }
-
-    #[actix_web::test]
-    async fn crawl_workers_reject_zero_and_non_numbers() {
-        for bad in ["0", "-1", "ten", ""] {
-            assert!(crawl_workers(Some(bad.to_string())).is_err(), "{:?}", bad);
-        }
     }
 
     #[actix_web::test]

@@ -131,6 +131,13 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS discovery_state (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
+    );
+    -- admin overrides of the settings (#304), by setting name; no history is kept
+    CREATE TABLE IF NOT EXISTS settings (
+        name   TEXT PRIMARY KEY,
+        value  TEXT NOT NULL,
+        actor  TEXT NOT NULL,
+        set_at INTEGER NOT NULL
     );";
 
 // indexed pages and queued items per root CID, kept in step with them for /roots (#231), and
@@ -1050,6 +1057,41 @@ impl Store {
         )?
         .execute(params![key, value])?;
         Ok(())
+    }
+
+    /// The admin overrides of the settings (#304): (name, value, actor, set_at)
+    pub fn settings_overrides(&self) -> rusqlite::Result<Vec<(String, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT name, value, actor, set_at FROM settings")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect()
+    }
+
+    #[allow(dead_code)] // for the admin endpoints (#304)
+    pub fn set_setting(
+        &self,
+        name: &str,
+        value: &str,
+        actor: &str,
+        at: i64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached(
+            "INSERT INTO settings (name, value, actor, set_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (name) DO UPDATE SET value = ?2, actor = ?3, set_at = ?4",
+        )?
+        .execute(params![name, value, actor, at])?;
+        Ok(())
+    }
+
+    /// Drops a setting's override; false if it had none
+    #[allow(dead_code)] // for the admin endpoints (#304)
+    pub fn clear_setting(&self, name: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let cleared = conn
+            .prepare_cached("DELETE FROM settings WHERE name = ?1")?
+            .execute([name])?;
+        Ok(cleared > 0)
     }
 
     pub fn queue_len(&self) -> usize {
