@@ -386,7 +386,9 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    // the darksearch admin area's takedown endpoints; off (404) without a token
+    // the darksearch admin area's takedown and settings endpoints; off (404) without a token.
+    // A restart setting stops the server once it's built (see below); Docker starts it again.
+    let restart = web::Data::new(admin::Restart::default());
     let admin = std::env::var("ADMIN_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -394,6 +396,7 @@ async fn main() -> std::io::Result<()> {
             web::Data::new(admin::Admin {
                 token,
                 local_denylist: local_denylist.clone().map(std::path::PathBuf::from),
+                restart: restart.clone(),
             })
         });
     info!(
@@ -567,7 +570,7 @@ async fn main() -> std::io::Result<()> {
 
     let gateway_data = web::Data::new(Gateway(gateway));
     let flush_queue = Arc::clone(&index_queue);
-    let served = HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new()
             .app_data(index_queue.clone())
             .app_data(gateway_data.clone())
@@ -585,8 +588,9 @@ async fn main() -> std::io::Result<()> {
     })
     // localhost by default; set BIND_ADDR=0.0.0.0:9090 to accept remote connections
     .bind(std::env::var("BIND_ADDR").unwrap_or("127.0.0.1:9090".to_string()))?
-    .run()
-    .await;
+    .run();
+    restart.set(server.handle());
+    let served = server.await;
     // what's still buffered is written; a crash instead re-queues it on the next start
     flush_queue.flush_store();
     served

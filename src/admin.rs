@@ -1,18 +1,59 @@
 //! Token-protected admin endpoints for darksearch.xyz's admin area: edit the local takedown
-//! list. Registered only when ADMIN_TOKEN is set; without it the routes don't exist (404).
+//! list, and read and change the settings (#304). Registered only when ADMIN_TOKEN is set;
+//! without it the routes don't exist (404).
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
-use actix_web::{post, web, HttpRequest, HttpResponse};
+use actix_web::dev::ServerHandle;
+use actix_web::{delete, get, post, web, HttpRequest, HttpResponse};
 use cid::Cid;
-use log::warn;
+use log::{info, warn};
+use serde_json::json;
 
 use crate::denylist::{normalize_item, Denylist};
 use crate::index_queue::IndexQueue;
+use crate::settings::{Applies, Key};
 
 pub struct Admin {
     pub token: String,
     pub local_denylist: Option<PathBuf>,
+    pub restart: web::Data<Restart>,
+}
+
+/// The running server, so a restart setting can stop it; main sets it once the server is built
+#[derive(Default)]
+pub struct Restart(OnceLock<ServerHandle>);
+
+impl Restart {
+    pub fn set(&self, handle: ServerHandle) {
+        let _ = self.0.set(handle);
+    }
+
+    // stops the server a second after the reply has gone out; main then flushes the index and
+    // exits 0, and Docker (unless-stopped) starts it again with the new value
+    fn after_reply(&self, name: &str) {
+        info!("Restarting to apply {}", name);
+        // unset only in tests, which have no server to stop
+        if let Some(handle) = self.0.get().cloned() {
+            run_after(Duration::from_secs(1), move || async move {
+                handle.stop(true).await;
+            });
+        }
+    }
+}
+
+// runs `f` after `delay` on the actix runtime, without holding up the caller
+fn run_after<F, Fut>(delay: Duration, f: F)
+where
+    F: FnOnce() -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    actix_web::rt::spawn(async move {
+        actix_web::rt::time::sleep(delay).await;
+        f().await;
+    });
 }
 
 // serializes edits of the local denylist file with each other and with the periodic re-read
@@ -42,7 +83,10 @@ pub fn configure(cfg: &mut web::ServiceConfig, admin: Option<web::Data<Admin>>) 
         cfg.app_data(admin)
             .service(deny)
             .service(undeny)
-            .service(recrawl);
+            .service(recrawl)
+            .service(settings_read)
+            .service(setting_set)
+            .service(setting_reset);
     }
 }
 
@@ -180,6 +224,88 @@ async fn undeny(
     )
 }
 
+#[get("/admin/settings")]
+async fn settings_read(
+    req: HttpRequest,
+    queue: web::Data<IndexQueue>,
+    admin: web::Data<Admin>,
+) -> HttpResponse {
+    if !authorized(&req, &admin) {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+    // the report shows the secret only as "set" or "not set"
+    HttpResponse::Ok().json(json!({
+        "settings": queue.settings().report(),
+        "persistent": queue.has_persistent_store(),
+    }))
+}
+
+#[post("/admin/settings/{name}")]
+async fn setting_set(
+    req: HttpRequest,
+    name: web::Path<String>,
+    body: String,
+    queue: web::Data<IndexQueue>,
+    admin: web::Data<Admin>,
+) -> HttpResponse {
+    // a trailing newline from curl or a form isn't part of the value
+    change_setting(&req, &name, &queue, &admin, |key, actor| {
+        queue.settings_set(key, body.trim(), actor)
+    })
+}
+
+#[delete("/admin/settings/{name}")]
+async fn setting_reset(
+    req: HttpRequest,
+    name: web::Path<String>,
+    queue: web::Data<IndexQueue>,
+    admin: web::Data<Admin>,
+) -> HttpResponse {
+    change_setting(&req, &name, &queue, &admin, |key, actor| {
+        queue.settings_reset(key, actor)
+    })
+}
+
+// checks a set or reset request, makes the change with `change(key, actor)`, and restarts if
+// the setting is only read at startup. Settings::set/reset do the logging, so the secret has
+// one code path; their errors never contain it.
+fn change_setting(
+    req: &HttpRequest,
+    name: &str,
+    queue: &IndexQueue,
+    admin: &Admin,
+    change: impl FnOnce(Key, &str) -> Result<Applies, String>,
+) -> HttpResponse {
+    if !authorized(req, admin) {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+    let Some(key) = Key::from_name(name) else {
+        return HttpResponse::NotFound().body("No such setting");
+    };
+    let actor = req
+        .headers()
+        .get("X-Admin-Actor")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|actor| !actor.is_empty());
+    let Some(actor) = actor else {
+        return HttpResponse::BadRequest().body("X-Admin-Actor is required");
+    };
+    // the in-memory store would lose the change at the next start
+    if !queue.has_persistent_store() {
+        return HttpResponse::BadRequest().body("settings need DATA_DIR");
+    }
+    match change(key, actor) {
+        Ok(applies) => {
+            if applies == Applies::Restart {
+                admin.restart.after_reply(key.name());
+            }
+            HttpResponse::Ok().json(json!({ "applies": applies.label() }))
+        }
+        Err(reason) => HttpResponse::BadRequest().body(reason),
+    }
+}
+
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{} {}", n, if n == 1 { one } else { many })
 }
@@ -206,6 +332,7 @@ mod tests {
         let admin = Admin {
             token: "s3cret".to_string(),
             local_denylist: Some(path.clone()),
+            restart: web::Data::new(Restart::default()),
         };
         (web::Data::new(admin), path)
     }
@@ -217,17 +344,25 @@ mod tests {
         token: &str,
         body: &str,
     ) -> (u16, String) {
+        let req = test::TestRequest::post()
+            .uri(uri)
+            .insert_header(("Authorization", format!("Bearer {}", token)))
+            .set_payload(body.to_string());
+        send(admin, queue, req).await
+    }
+
+    async fn send(
+        admin: Option<web::Data<Admin>>,
+        queue: web::Data<IndexQueue>,
+        req: test::TestRequest,
+    ) -> (u16, String) {
         let app = test::init_service(
             App::new()
                 .app_data(queue)
                 .configure(|cfg| configure(cfg, admin)),
         )
         .await;
-        let req = test::TestRequest::post()
-            .uri(uri)
-            .insert_header(("Authorization", format!("Bearer {}", token)))
-            .set_payload(body.to_string())
-            .to_request();
+        let req = req.to_request();
         let resp = test::call_service(&app, req).await;
         let status = resp.status().as_u16();
         (
@@ -401,6 +536,7 @@ mod tests {
         let admin = web::Data::new(Admin {
             token: "s3cret".to_string(),
             local_denylist: None,
+            restart: web::Data::new(Restart::default()),
         });
         let queue = web::Data::new(IndexQueue::new());
         assert_eq!(
@@ -408,6 +544,269 @@ mod tests {
                 .await
                 .0,
             400
+        );
+    }
+
+    // the settings endpoints (#304)
+
+    fn settings_admin() -> web::Data<Admin> {
+        web::Data::new(Admin {
+            token: "s3cret".to_string(),
+            local_denylist: None,
+            restart: web::Data::new(Restart::default()),
+        })
+    }
+
+    // a queue with a store from a DATA_DIR, so settings can be saved
+    fn persistent_queue(name: &str) -> web::Data<IndexQueue> {
+        let queue = IndexQueue::new();
+        let dir = crate::store::tests::temp_dir(name);
+        queue
+            .attach_store(crate::store::Store::open(&dir, 0).unwrap())
+            .unwrap();
+        web::Data::new(queue)
+    }
+
+    // a settings request with the token, and the actor when given
+    fn settings_req(
+        method: &str,
+        name: &str,
+        actor: Option<&str>,
+        body: &str,
+    ) -> test::TestRequest {
+        let uri = match name {
+            "" => "/admin/settings".to_string(),
+            name => format!("/admin/settings/{}", name),
+        };
+        let req = match method {
+            "GET" => test::TestRequest::get(),
+            "POST" => test::TestRequest::post(),
+            _ => test::TestRequest::delete(),
+        }
+        .uri(&uri)
+        .insert_header(("Authorization", "Bearer s3cret"))
+        .set_payload(body.to_string());
+        match actor {
+            Some(actor) => req.insert_header(("X-Admin-Actor", actor)),
+            None => req,
+        }
+    }
+
+    async fn read_settings(queue: &web::Data<IndexQueue>) -> serde_json::Value {
+        let (status, body) = send(
+            Some(settings_admin()),
+            queue.clone(),
+            settings_req("GET", "", None, ""),
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        serde_json::from_str(&body).unwrap()
+    }
+
+    fn row<'a>(read: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        read["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap()
+    }
+
+    #[actix_web::test]
+    async fn settings_read_lists_every_key_with_sources() {
+        let queue = web::Data::new(IndexQueue::new());
+        let read = read_settings(&queue).await;
+        assert_eq!(read["settings"].as_array().unwrap().len(), 18);
+        assert_eq!(row(&read, "crawl_workers")["source"], "default");
+        assert_eq!(read["persistent"], false);
+        assert_eq!(
+            read_settings(&persistent_queue("settings-read")).await["persistent"],
+            true
+        );
+    }
+
+    #[actix_web::test]
+    async fn setting_a_value_needs_an_actor_and_a_valid_value() {
+        let queue = persistent_queue("settings-set");
+        let post = |actor: Option<&'static str>, body: &'static str| {
+            send(
+                Some(settings_admin()),
+                queue.clone(),
+                settings_req("POST", "crawl_workers", actor, body),
+            )
+        };
+        assert_eq!(
+            post(None, "25").await,
+            (400, "X-Admin-Actor is required".to_string())
+        );
+        assert_eq!(post(Some(" "), "25").await.0, 400, "an empty actor");
+        let (status, body) = post(Some("ann@x"), "abc").await;
+        assert_eq!(status, 400);
+        assert!(
+            body.contains("crawl_workers") || body.contains("CRAWL_WORKERS"),
+            "{}",
+            body
+        );
+        assert_eq!(
+            row(&read_settings(&queue).await, "crawl_workers")["source"],
+            "default"
+        );
+
+        assert_eq!(
+            post(Some("ann@x"), "25\n").await,
+            (200, r#"{"applies":"live"}"#.to_string())
+        );
+        let read = read_settings(&queue).await;
+        let workers = row(&read, "crawl_workers");
+        assert_eq!(workers["value"], 25);
+        assert_eq!(workers["source"], "admin");
+        assert_eq!(workers["actor"], "ann@x");
+    }
+
+    #[actix_web::test]
+    async fn resetting_falls_back() {
+        let queue = persistent_queue("settings-reset");
+        let call = |method: &'static str, actor: Option<&'static str>| {
+            send(
+                Some(settings_admin()),
+                queue.clone(),
+                settings_req(method, "crawl_workers", actor, "25"),
+            )
+        };
+        assert_eq!(call("POST", Some("ann@x")).await.0, 200);
+        assert_eq!(
+            call("DELETE", None).await,
+            (400, "X-Admin-Actor is required".to_string())
+        );
+        assert_eq!(
+            call("DELETE", Some("ann@x")).await,
+            (200, r#"{"applies":"live"}"#.to_string())
+        );
+        let read = read_settings(&queue).await;
+        let workers = row(&read, "crawl_workers");
+        assert_eq!(workers["value"], 10);
+        assert_eq!(workers["source"], "default");
+    }
+
+    #[actix_web::test]
+    async fn an_unknown_setting_is_404() {
+        let queue = persistent_queue("settings-unknown");
+        for method in ["POST", "DELETE"] {
+            let (status, _) = send(
+                Some(settings_admin()),
+                queue.clone(),
+                settings_req(method, "data_dir", Some("ann@x"), "/tmp"),
+            )
+            .await;
+            assert_eq!(status, 404, "{}", method);
+        }
+    }
+
+    #[actix_web::test]
+    async fn the_secret_never_comes_back() {
+        let queue = persistent_queue("settings-secret");
+        let (status, body) = send(
+            Some(settings_admin()),
+            queue.clone(),
+            settings_req(
+                "POST",
+                "eth_rpc_url",
+                Some("ann@x"),
+                "https://x.example/v2/SECRETKEY",
+            ),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, r#"{"applies":"restart"}"#));
+        let read = read_settings(&queue).await;
+        assert!(!read.to_string().contains("SECRETKEY"), "{}", read);
+        assert_eq!(row(&read, "eth_rpc_url")["value"], "set");
+
+        // a bad value isn't echoed either
+        let (status, body) = send(
+            Some(settings_admin()),
+            queue.clone(),
+            settings_req("POST", "eth_rpc_url", Some("ann@x"), "ftp://SECRETKEY"),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(!body.contains("SECRETKEY"), "{}", body);
+    }
+
+    #[actix_web::test]
+    async fn a_restart_setting_answers_before_stopping() {
+        // no server handle in tests: the restart is skipped, the answer still comes back
+        let queue = persistent_queue("settings-restart");
+        let (status, body) = send(
+            Some(settings_admin()),
+            queue.clone(),
+            settings_req("POST", "eth_logs_max_blocks", Some("ann@x"), "50"),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, r#"{"applies":"restart"}"#));
+        assert_eq!(
+            row(&read_settings(&queue).await, "eth_logs_max_blocks")["value"],
+            50
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_scheduled_stop_runs_only_after_the_delay() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stopped);
+        run_after(Duration::from_millis(200), move || async move {
+            flag.store(true, Ordering::SeqCst);
+        });
+        actix_web::rt::time::sleep(Duration::from_millis(50)).await;
+        assert!(!stopped.load(Ordering::SeqCst), "ran before the delay");
+        actix_web::rt::time::sleep(Duration::from_millis(500)).await;
+        assert!(stopped.load(Ordering::SeqCst), "never ran");
+    }
+
+    #[actix_web::test]
+    async fn without_data_dir_writes_are_refused() {
+        let queue = web::Data::new(IndexQueue::new());
+        for method in ["POST", "DELETE"] {
+            assert_eq!(
+                send(
+                    Some(settings_admin()),
+                    queue.clone(),
+                    settings_req(method, "crawl_workers", Some("ann@x"), "25"),
+                )
+                .await,
+                (400, "settings need DATA_DIR".to_string()),
+                "{}",
+                method
+            );
+        }
+        assert_eq!(
+            row(&read_settings(&queue).await, "crawl_workers")["value"],
+            10
+        );
+        assert!(
+            !queue.has_persistent_store(),
+            "the in-memory store doesn't count"
+        );
+    }
+
+    #[actix_web::test]
+    async fn without_the_token_settings_routes_are_401() {
+        let queue = persistent_queue("settings-401");
+        for method in ["GET", "POST", "DELETE"] {
+            let name = if method == "GET" { "" } else { "crawl_workers" };
+            let req = settings_req(method, name, Some("ann@x"), "25")
+                .insert_header(("Authorization", "Bearer nope"));
+            let (status, _) = send(Some(settings_admin()), queue.clone(), req).await;
+            assert_eq!(status, 401, "{}", method);
+            let req = settings_req(method, name, Some("ann@x"), "25");
+            let (status, _) = send(None, queue.clone(), req).await;
+            assert_eq!(status, 404, "{} without ADMIN_TOKEN", method);
+        }
+        assert_eq!(
+            row(&read_settings(&queue).await, "crawl_workers")["source"],
+            "default"
         );
     }
 }

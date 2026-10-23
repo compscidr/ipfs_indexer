@@ -49,7 +49,7 @@ pub enum Source {
 }
 
 impl Applies {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Applies::Live => "live",
             Applies::Restart => "restart",
@@ -284,7 +284,6 @@ impl Key {
         self.spec().name
     }
 
-    #[allow(dead_code)] // for the admin endpoints (#304)
     pub fn from_name(name: &str) -> Option<Key> {
         Key::ALL.into_iter().find(|key| key.name() == name)
     }
@@ -538,7 +537,6 @@ impl Settings {
     }
 
     /// Every setting, in table order, for the admin page; the secret is only "set" or "not set"
-    #[allow(dead_code)] // for the admin endpoints (#304)
     pub fn report(&self) -> Value {
         let overrides = self.overrides.read().unwrap();
         let shown = |value: Option<Val>| match value {

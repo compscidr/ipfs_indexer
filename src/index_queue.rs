@@ -460,6 +460,12 @@ impl IndexQueue {
         store.merge();
     }
 
+    /// Whether a store from DATA_DIR is attached, so settings can be saved (#304); the in-memory
+    /// one made without DATA_DIR doesn't count
+    pub fn has_persistent_store(&self) -> bool {
+        self.store.get().is_some_and(Store::is_persistent)
+    }
+
     /// Writes buffered postings to disk, for a clean shutdown
     pub fn flush_store(&self) {
         if let Some(store) = self.store.get() {
@@ -472,7 +478,6 @@ impl IndexQueue {
 
     /// Sets `key` to `raw` by `actor` (see Settings::set) and applies it where it isn't just
     /// read on each use
-    #[allow(dead_code)] // for the admin endpoints (#304)
     pub fn settings_set(&self, key: Key, raw: &str, actor: &str) -> Result<Applies, String> {
         let applies = self.settings().set(self.store(), key, raw, actor)?;
         self.apply_setting(key);
@@ -480,7 +485,6 @@ impl IndexQueue {
     }
 
     /// Drops `key`'s override (see Settings::reset) and applies the value now in use
-    #[allow(dead_code)] // for the admin endpoints (#304)
     pub fn settings_reset(&self, key: Key, actor: &str) -> Result<Applies, String> {
         let applies = self.settings().reset(self.store(), key, actor)?;
         self.apply_setting(key);

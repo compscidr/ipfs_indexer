@@ -215,6 +215,11 @@ impl Store {
         )
     }
 
+    /// Whether this store is DATA_DIR's index.sqlite rather than an in-memory one
+    pub fn is_persistent(&self) -> bool {
+        self.path.is_some()
+    }
+
     fn init(
         mut conn: Connection,
         path: Option<PathBuf>,
