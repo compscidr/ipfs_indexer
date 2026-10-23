@@ -6,6 +6,7 @@
 use crate::ens::{self, Rpc, RpcError, Scan};
 use crate::entry::{self, Contenthash, Entry};
 use crate::index_queue::{Enqueued, IndexQueue};
+use crate::settings::Key;
 use crate::store::{now_secs, Discovered};
 use log::{debug, info, warn};
 use std::path::Path;
@@ -21,29 +22,28 @@ const ERROR_BODY_CHARS: usize = 200;
 
 /// At most `per_hour` new roots an hour, across every source (0: no limit)
 pub struct HourlyCap {
-    per_hour: u32,
     // the hour and how many it has used
     used: Mutex<(i64, u32)>,
 }
 
 impl HourlyCap {
-    pub fn new(per_hour: u32) -> HourlyCap {
+    pub fn new() -> HourlyCap {
         HourlyCap {
-            per_hour,
             used: Mutex::new((-1, 0)),
         }
     }
 
-    /// Takes one from this hour's allowance; false if it's used up
-    pub fn take(&self, now: i64) -> bool {
-        if self.per_hour == 0 {
+    /// Takes one from this hour's allowance of `per_hour`; false if it's used up. The limit is
+    /// passed on each take, so lowering it stops takes at once (#304).
+    pub fn take(&self, now: i64, per_hour: u32) -> bool {
+        if per_hour == 0 {
             return true;
         }
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         if used.0 != now / HOUR {
             *used = (now / HOUR, 0);
         }
-        if used.1 >= self.per_hour {
+        if used.1 >= per_hour {
             return false;
         }
         used.1 += 1;
@@ -63,9 +63,9 @@ fn retry_after(failures: u32) -> i64 {
 
 /// The root CID the gateway resolves a name to: GET /ipns/<name>/ and the first CID in its
 /// X-Ipfs-Roots header. The body isn't read.
-pub fn resolve(gateway: &str, name: &str) -> Result<String, String> {
+pub fn resolve(gateway: &str, name: &str, timeout: Duration) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
     // a dot segment would be taken as a step up, whatever its encoding
@@ -142,7 +142,8 @@ pub fn check(
         Some(Entry::Cid(cid)) => Ok(cid),
         Some(Entry::Name(name)) => {
             queue.wait_for_gateway();
-            resolve(gateway, &name)
+            let timeout = Duration::from_secs(queue.settings().get(Key::NameTimeoutSecs));
+            resolve(gateway, &name, timeout)
         }
         None => Err("not a CID or a name".to_string()),
     };
@@ -150,7 +151,7 @@ pub fn check(
         Err(err) => Checked::Failed(err),
         Ok(root) => {
             let new = row.root.as_deref() != Some(root.as_str());
-            if new && !cap.take(now) {
+            if new && !cap.take(now, queue.settings().get(Key::DiscoveryPerHour) as u32) {
                 if let Err(err) = store.discovered_postpone(&row.entry, next_hour(now)) {
                     warn!("Couldn't put off {}: {}", row.entry, err);
                     store.note_error(&err);
@@ -424,6 +425,7 @@ mod tests {
     const A: &str = "bafybeier6ud42ptljtfaxrdlknktw54b7ohfpg5h33mosxpxjndxs7xzvm";
     const B: &str = "bafybeiesmy6rsaglneqxbzkbdj5degzp2izydfadhl2vu3oyrp7k52fypu";
     const NOW: i64 = 1_800_000_000;
+    const TIMEOUT: Duration = Duration::from_secs(30);
 
     // a gateway answering /ipns/<name>/ with X-Ipfs-Roots: <root>, or 504 if root is None, and
     // /ipfs/<path> with a page naming the path; returns its host:port
@@ -474,13 +476,47 @@ mod tests {
 
     #[test]
     fn the_hourly_cap_counts_per_hour_and_zero_means_none() {
-        let cap = HourlyCap::new(2);
-        assert!(cap.take(NOW));
-        assert!(cap.take(NOW + 1));
-        assert!(!cap.take(NOW + 2));
-        assert!(cap.take(next_hour(NOW)), "a new hour");
-        let none = HourlyCap::new(0);
-        assert!((0..1000).all(|i| none.take(NOW + i)));
+        let cap = HourlyCap::new();
+        assert!(cap.take(NOW, 2));
+        assert!(cap.take(NOW + 1, 2));
+        assert!(!cap.take(NOW + 2, 2));
+        assert!(cap.take(next_hour(NOW), 2), "a new hour");
+        let none = HourlyCap::new();
+        assert!((0..1000).all(|i| none.take(NOW + i, 0)));
+    }
+
+    #[test]
+    fn the_hourly_cap_uses_the_limit_it_is_given() {
+        let cap = HourlyCap::new();
+        assert!(cap.take(NOW, 3));
+        assert!(cap.take(NOW + 1, 3));
+        // lowered mid-hour: the two used already are the limit
+        assert!(!cap.take(NOW + 2, 2));
+        // raised again
+        assert!(cap.take(NOW + 3, 3));
+        // 0 means none, however many are used
+        assert!(cap.take(NOW + 4, 0));
+    }
+
+    #[test]
+    fn a_name_lookup_uses_the_timeout_it_is_given() {
+        // a gateway that accepts and never answers
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gw = listener.local_addr().unwrap().to_string();
+        let held = std::thread::spawn(move || {
+            let conns: Vec<_> = listener.incoming().take(1).collect();
+            std::thread::sleep(Duration::from_secs(4));
+            drop(conns);
+        });
+        let start = std::time::Instant::now();
+        let result = resolve(&gw, "x.eth", Duration::from_secs(1));
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        held.join().unwrap();
     }
 
     #[test]
@@ -496,7 +532,7 @@ mod tests {
         let checked = check(
             &queue,
             &gateway(Some(A)),
-            &HourlyCap::new(10),
+            &HourlyCap::new(),
             &row(&queue, "docs.ipfs.tech"),
             NOW,
         );
@@ -513,7 +549,7 @@ mod tests {
     fn a_changed_root_is_queued_and_an_unchanged_one_again() {
         let queue = IndexQueue::new();
         queue.discover("docs.ipfs.tech", "seeds").unwrap();
-        let cap = HourlyCap::new(10);
+        let cap = HourlyCap::new();
         check(
             &queue,
             &gateway(Some(A)),
@@ -548,7 +584,10 @@ mod tests {
     fn an_unchanged_root_is_queued_again_even_when_capped() {
         let queue = IndexQueue::new();
         queue.discover("docs.ipfs.tech", "seeds").unwrap();
-        let cap = HourlyCap::new(1);
+        queue
+            .settings_set(Key::DiscoveryPerHour, "1", "test")
+            .unwrap();
+        let cap = HourlyCap::new();
         check(
             &queue,
             &gateway(Some(A)),
@@ -572,8 +611,11 @@ mod tests {
     fn a_new_root_over_the_cap_waits_for_the_next_hour() {
         let queue = IndexQueue::new();
         queue.discover("docs.ipfs.tech", "seeds").unwrap();
-        let cap = HourlyCap::new(1);
-        assert!(cap.take(NOW));
+        queue
+            .settings_set(Key::DiscoveryPerHour, "1", "test")
+            .unwrap();
+        let cap = HourlyCap::new();
+        assert!(cap.take(NOW, 1));
         assert_eq!(
             check(
                 &queue,
@@ -596,7 +638,7 @@ mod tests {
     fn a_failure_is_stored_and_backs_off() {
         let queue = IndexQueue::new();
         queue.discover("docs.ipfs.tech", "seeds").unwrap();
-        let cap = HourlyCap::new(10);
+        let cap = HourlyCap::new();
         let gw = gateway(None);
         assert!(matches!(
             check(&queue, &gw, &cap, &row(&queue, "docs.ipfs.tech"), NOW),
@@ -619,7 +661,7 @@ mod tests {
     fn a_cid_entry_is_its_own_root_and_a_blocked_root_is_refused() {
         let queue = IndexQueue::new();
         queue.discover(A, "seeds").unwrap();
-        let cap = HourlyCap::new(10);
+        let cap = HourlyCap::new();
         // no gateway needed
         assert_eq!(
             check(&queue, "127.0.0.1:1", &cap, &row(&queue, A), NOW),
@@ -652,10 +694,7 @@ mod tests {
             queue.pauses().record(B, Some("504"));
         }
         queue.discover(A, "seeds").unwrap();
-        assert_eq!(
-            resolve_next(&queue, "127.0.0.1:1", &HourlyCap::new(10)),
-            None
-        );
+        assert_eq!(resolve_next(&queue, "127.0.0.1:1", &HourlyCap::new()), None);
         assert_eq!(row(&queue, A).checked_at, None, "still due");
     }
 
@@ -672,7 +711,7 @@ mod tests {
         ] {
             let paths = Arc::new(Mutex::new(vec![]));
             let gw = gateway_recording(Some(A), paths.clone());
-            let result = resolve(&gw, name);
+            let result = resolve(&gw, name, TIMEOUT);
             let seen = paths.lock().unwrap().clone();
             if name.chars().all(|c| c == '.') {
                 assert!(result.is_err() && seen.is_empty(), "{:?} {:?}", name, seen);
@@ -688,7 +727,7 @@ mod tests {
     fn only_a_name_costs_the_resolver_its_pause() {
         let queue = IndexQueue::new();
         queue.discover(A, "seeds").unwrap();
-        let cap = HourlyCap::new(10);
+        let cap = HourlyCap::new();
         let (checked, used_gateway) = resolve_next(&queue, "127.0.0.1:1", &cap).unwrap();
         assert_eq!(checked, Checked::Queued(A.into()));
         assert!(!used_gateway);
@@ -772,12 +811,17 @@ mod tests {
             "failed to resolve /ipns/libp2p.io/: DNSLink lookup could not find a TXT record\n",
         );
         assert_eq!(
-            resolve(&gw, "libp2p.io"),
+            resolve(&gw, "libp2p.io", TIMEOUT),
             Err("500 Internal Server Error: failed to resolve /ipns/libp2p.io/: DNSLink lookup could not find a TXT record".to_string())
         );
         // a long body is cut, and its lines joined
         let long: &'static str = Box::leak(format!("a\nb {}", "x".repeat(500)).into_boxed_str());
-        let err = resolve(&gateway_answering("502 Bad Gateway", long), "x.eth").unwrap_err();
+        let err = resolve(
+            &gateway_answering("502 Bad Gateway", long),
+            "x.eth",
+            TIMEOUT,
+        )
+        .unwrap_err();
         assert!(err.starts_with("502 Bad Gateway: a b xxx"), "{}", err);
         assert_eq!(
             err.chars().count(),
@@ -785,7 +829,11 @@ mod tests {
         );
         // no body: just the status
         assert_eq!(
-            resolve(&gateway_answering("504 Gateway Timeout", ""), "x.eth"),
+            resolve(
+                &gateway_answering("504 Gateway Timeout", ""),
+                "x.eth",
+                TIMEOUT
+            ),
             Err("504 Gateway Timeout".to_string())
         );
     }
@@ -937,7 +985,7 @@ mod tests {
         add_seeds(&queue, &parse_seeds("site.example\n"), now_secs());
         let gw = gateway(Some(A));
         assert_eq!(
-            resolve_next(&queue, &gw, &HourlyCap::new(10)),
+            resolve_next(&queue, &gw, &HourlyCap::new()),
             Some((Checked::Queued(A.into()), true))
         );
         assert!(queue.process_next(&gw));

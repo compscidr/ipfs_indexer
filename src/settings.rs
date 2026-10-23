@@ -482,7 +482,6 @@ impl Settings {
 
     /// Overrides `key` with `raw` by `actor`, saved in `store`, after checking it alone and
     /// against the other values in use
-    #[allow(dead_code)] // for the admin endpoints (#304)
     pub fn set(&self, store: &Store, key: Key, raw: &str, actor: &str) -> Result<Applies, String> {
         let value = check(key, raw, By::Admin)?;
         // held across the check and the write, so two sets can't break a pair rule between them
@@ -519,7 +518,6 @@ impl Settings {
 
     /// Drops `key`'s override, so the env value or the default is used, unless that would break
     /// a pair rule
-    #[allow(dead_code)] // for the admin endpoints (#304)
     pub fn reset(&self, store: &Store, key: Key, actor: &str) -> Result<Applies, String> {
         let mut overrides = self.overrides.write().unwrap();
         if key != Key::EthRpcUrl {

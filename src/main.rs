@@ -246,9 +246,6 @@ fn keep_running(name: &'static str, run: impl Fn() + Send + 'static) {
     });
 }
 
-// the rate is a 10-minute average, so it means little until this long after a start
-const HEALTH_GRACE: Duration = Duration::from_secs(15 * 60);
-
 /**
  * Whether the crawl is working, for a monitor (#285): Err with the reason while the index is
  * marked damaged (v0.5.6, before anything else: only a restart clears it), while it's paused
@@ -262,6 +259,7 @@ fn health(
     paused: Option<String>,
     min_rate: u64,
     up_for: Duration,
+    grace: Duration,
 ) -> Result<String, String> {
     if let Some(damage) = damaged {
         return Err(format!("damaged: {}; restart to check and rebuild", damage));
@@ -270,7 +268,8 @@ fn health(
         return Err(paused);
     }
     let counts = format!("{} pages/min, {} queued", rate, queued);
-    if up_for < HEALTH_GRACE {
+    // the rate is a 10-minute average, so it means little until the grace after a start
+    if up_for < grace {
         return Ok(format!("starting: {}", counts));
     }
     if queued > 0 && rate < min_rate {
@@ -282,10 +281,9 @@ fn health(
     Ok(format!("ok: {}", counts))
 }
 
-// when the process started and HEALTH_MIN_RATE, for /health
+// when the process started, for /health
 struct Health {
     started: Instant,
-    min_rate: u64,
 }
 
 /// 200 while the crawl is working, 503 when the index is damaged or the crawl is paused or slow,
@@ -297,8 +295,9 @@ async fn health_handler(queue: web::Data<IndexQueue>, config: web::Data<Health>)
         queue.indexed_per_minute(),
         queue.queue_length(),
         queue.crawl_paused(),
-        config.min_rate,
+        queue.settings().get(Key::HealthMinRate),
         config.started.elapsed(),
+        Duration::from_secs(queue.settings().get(Key::HealthGraceSecs)),
     ) {
         Ok(why) => HttpResponse::Ok().body(why),
         Err(why) => HttpResponse::ServiceUnavailable().body(why),
@@ -306,7 +305,8 @@ async fn health_handler(queue: web::Data<IndexQueue>, config: web::Data<Health>)
 }
 
 /// Drops pages past the max age, then re-seeds: at startup and daily after the denylist refresh
-fn expire_and_reseed(queue: &IndexQueue, max_age_secs: i64) {
+fn expire_and_reseed(queue: &IndexQueue) {
+    let max_age_secs = queue.settings().get(Key::IndexMaxAgeDays) as i64 * 24 * 60 * 60;
     let expired = queue.expire(max_age_secs);
     if expired > 0 {
         info!("Expired {} pages older than the max age", expired);
@@ -346,8 +346,8 @@ async fn main() -> std::io::Result<()> {
     let index_queue = web::Data::new(IndexQueue::new());
     index_queue.set_settings(settings);
 
-    let gateway_rate = index_queue.settings().get(Key::GatewayRequestsPerMin) as u32;
-    index_queue.set_gateway_rate(gateway_rate);
+    // (an admin override loaded with the store may change it; each request reads the setting)
+    let gateway_rate = index_queue.settings().get(Key::GatewayRequestsPerMin);
     if gateway_rate == 0 {
         info!("Gateway requests: no limit");
     } else {
@@ -408,13 +408,12 @@ async fn main() -> std::io::Result<()> {
 
     // the persisted index (#106): nothing is loaded from it (#231); blocked and expired pages
     // are erased by the purge and expiry threads below. A configured but unusable DATA_DIR is fatal.
-    let max_age_secs = index_queue.settings().get(Key::IndexMaxAgeDays) as i64 * 24 * 60 * 60;
     // the most of the index SQLite keeps in memory; the rest stays on disk (#231)
     let cache_mb = index_queue.settings().get(Key::IndexCacheMb) as u32;
     if let Ok(dir) = std::env::var("DATA_DIR") {
         info!("Index cache: at most {} MB in memory", cache_mb);
         let opening = std::time::Instant::now();
-        let attached = index_queue.open_store(std::path::Path::new(&dir), cache_mb, max_age_secs);
+        let attached = index_queue.open_store(std::path::Path::new(&dir), cache_mb);
         match attached {
             Ok((pages, queued)) => info!(
                 "Opened {}/index.sqlite: {} pages, {} queued, in {:.1?}",
@@ -473,7 +472,7 @@ async fn main() -> std::io::Result<()> {
     // pages that expired while the indexer was down, then a reseed in case the seed was one;
     // the refresh thread does the same daily
     let expire_queue = Arc::clone(&index_queue);
-    std::thread::spawn(move || expire_and_reseed(&expire_queue, max_age_secs));
+    std::thread::spawn(move || expire_and_reseed(&expire_queue));
 
     let refresh_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
@@ -485,7 +484,7 @@ async fn main() -> std::io::Result<()> {
             }
             Err(err) => warn!("Couldn't refresh denylist, keeping the old one: {}", err),
         }
-        expire_and_reseed(&refresh_queue, max_age_secs);
+        expire_and_reseed(&refresh_queue);
     });
 
     if let Some(path) = local_denylist {
@@ -501,13 +500,10 @@ async fn main() -> std::io::Result<()> {
     // fetches through Kubo take ~2 s, so the worker count caps the crawl rate (#246)
     let n_workers = index_queue.settings().get(Key::CrawlWorkers) as usize;
     info!("Crawl workers: {}", n_workers);
-    let min_rate = index_queue.settings().get(Key::HealthMinRate);
     // crawling starts now: /health's grace period counts from here
     let health_config = web::Data::new(Health {
         started: Instant::now(),
-        min_rate,
     });
-    let per_hour = index_queue.settings().get(Key::DiscoveryPerHour) as u32;
     // per-page lines are debug (about 3 GB a day at info): one line a minute says how the crawl is going
     let summary_queue = Arc::clone(&index_queue);
     std::thread::spawn(move || loop {
@@ -534,7 +530,7 @@ async fn main() -> std::io::Result<()> {
 
     // discovery (#213): the resolver always runs, since submitted names need it; each source runs
     // only when configured
-    let cap = Arc::new(discovery::HourlyCap::new(per_hour));
+    let cap = Arc::new(discovery::HourlyCap::new());
     {
         let (queue, gateway, cap) = (Arc::clone(&index_queue), gateway.clone(), Arc::clone(&cap));
         keep_running("Discovery resolver", move || {
@@ -626,11 +622,21 @@ mod tests {
     }
 
     const MIN: Duration = Duration::from_secs(60);
+    const GRACE: Duration = Duration::from_secs(15 * 60);
+
+    #[actix_web::test]
+    async fn health_uses_the_grace_it_is_given() {
+        let slow = |up_for, grace| health(None, 0, 1000, None, 500, up_for, grace);
+        assert!(slow(5 * MIN, 10 * MIN).unwrap().starts_with("starting"));
+        assert!(slow(5 * MIN, 2 * MIN).unwrap_err().starts_with("slow"));
+        // 0: no grace
+        assert!(slow(Duration::ZERO, Duration::ZERO).is_err());
+    }
 
     #[actix_web::test]
     async fn health_is_ok_while_starting_even_with_no_rate() {
         assert_eq!(
-            health(None, 0, 1000, None, 500, 14 * MIN),
+            health(None, 0, 1000, None, 500, 14 * MIN, GRACE),
             Ok("starting: 0 pages/min, 1000 queued".to_string())
         );
     }
@@ -638,11 +644,11 @@ mod tests {
     #[actix_web::test]
     async fn health_fails_when_indexing_is_slow_with_work_queued() {
         assert_eq!(
-            health(None, 87, 1857261, None, 500, 15 * MIN),
+            health(None, 87, 1857261, None, 500, 15 * MIN, GRACE),
             Err("slow: 87 pages/min (minimum 500), 1857261 queued".to_string())
         );
         assert_eq!(
-            health(None, 500, 1857261, None, 500, 15 * MIN),
+            health(None, 500, 1857261, None, 500, 15 * MIN, GRACE),
             Ok("ok: 500 pages/min, 1857261 queued".to_string())
         );
     }
@@ -650,7 +656,7 @@ mod tests {
     #[actix_web::test]
     async fn health_is_ok_with_nothing_to_crawl() {
         assert_eq!(
-            health(None, 0, 0, None, 500, 60 * MIN),
+            health(None, 0, 0, None, 500, 60 * MIN, GRACE),
             Ok("ok: 0 pages/min, 0 queued".to_string())
         );
     }
@@ -659,7 +665,7 @@ mod tests {
     async fn health_fails_while_the_crawl_is_paused() {
         let paused = "paused 4m: 16 of the last 20 fetches failed; last: 504".to_string();
         assert_eq!(
-            health(None, 3000, 1000, Some(paused.clone()), 500, MIN),
+            health(None, 3000, 1000, Some(paused.clone()), 500, MIN, GRACE),
             Err(paused)
         );
     }
@@ -670,11 +676,27 @@ mod tests {
         let paused = "paused 4m: 16 of the last 20 fetches failed; last: 504".to_string();
         let want = Err(format!("damaged: {}; restart to check and rebuild", damage));
         assert_eq!(
-            health(Some(damage.to_string()), 3000, 1000, Some(paused), 500, MIN),
+            health(
+                Some(damage.to_string()),
+                3000,
+                1000,
+                Some(paused),
+                500,
+                MIN,
+                GRACE
+            ),
             want
         );
         assert_eq!(
-            health(Some(damage.to_string()), 3000, 0, None, 500, 60 * MIN),
+            health(
+                Some(damage.to_string()),
+                3000,
+                0,
+                None,
+                500,
+                60 * MIN,
+                GRACE
+            ),
             want
         );
     }
@@ -682,7 +704,7 @@ mod tests {
     #[actix_web::test]
     async fn a_min_rate_of_zero_turns_the_rate_check_off() {
         assert_eq!(
-            health(None, 0, 1000, None, 0, 60 * MIN),
+            health(None, 0, 1000, None, 0, 60 * MIN, GRACE),
             Ok("ok: 0 pages/min, 1000 queued".to_string())
         );
     }
@@ -858,10 +880,7 @@ mod tests {
             let app = test::init_service(
                 App::new()
                     .app_data(queue.clone())
-                    .app_data(web::Data::new(Health {
-                        started,
-                        min_rate: 500,
-                    }))
+                    .app_data(web::Data::new(Health { started }))
                     .service(health_handler),
             )
             .await;
@@ -885,7 +904,6 @@ mod tests {
                 .app_data(queue.clone())
                 .app_data(web::Data::new(Health {
                     started: Instant::now(),
-                    min_rate: 500,
                 }))
                 .service(health_handler),
         )
@@ -921,7 +939,7 @@ mod tests {
         let dir = store::tests::temp_dir("resources");
         let queue = IndexQueue::new();
         queue
-            .attach_store(store::Store::open(&dir, 0).unwrap(), 86400)
+            .attach_store(store::Store::open(&dir, 0).unwrap())
             .unwrap();
         assert!(queue.persist(
             "bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze",

@@ -1067,7 +1067,6 @@ impl Store {
         rows.collect()
     }
 
-    #[allow(dead_code)] // for the admin endpoints (#304)
     pub fn set_setting(
         &self,
         name: &str,
@@ -1085,13 +1084,29 @@ impl Store {
     }
 
     /// Drops a setting's override; false if it had none
-    #[allow(dead_code)] // for the admin endpoints (#304)
     pub fn clear_setting(&self, name: &str) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let cleared = conn
             .prepare_cached("DELETE FROM settings WHERE name = ?1")?
             .execute([name])?;
         Ok(cleared > 0)
+    }
+
+    /// Sets the writer's page cache to `mb` MB; 0 restores SQLite's default (-2000, 2 MB). The
+    /// readers keep the default: see open_with.
+    pub fn set_cache_mb(&self, mb: u32) -> rusqlite::Result<()> {
+        let kib = if mb == 0 { -2000 } else { -(mb as i64) * 1024 };
+        self.conn
+            .lock()
+            .unwrap()
+            .pragma_update(None, "cache_size", kib)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_size_for_test(&self) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap()
     }
 
     pub fn queue_len(&self) -> usize {
@@ -1595,6 +1610,16 @@ pub(crate) mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     pub(crate) use crate::segments::tests::dir_has;
+
+    #[test]
+    fn the_cache_size_is_reapplied() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_cache_mb(64).unwrap();
+        assert_eq!(store.cache_size_for_test(), -65536);
+        // 0 is SQLite's default
+        store.set_cache_mb(0).unwrap();
+        assert_eq!(store.cache_size_for_test(), -2000);
+    }
 
     // a fresh, unique directory under the system temp dir
     pub(crate) fn temp_dir(name: &str) -> PathBuf {

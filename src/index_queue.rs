@@ -4,7 +4,7 @@ use crate::index_result::IndexResult;
 use crate::pauses::Pauses;
 use crate::rate::Rate;
 use crate::search::{self, Query, Scorer, Total, MAX_RANKED};
-use crate::settings::Settings;
+use crate::settings::{Applies, Key, Settings};
 use crate::store::{self, now_secs, root_of, OpenError, Queued, Store, Upserted};
 use actix_web::body::MessageBody;
 use cid::Cid;
@@ -26,35 +26,29 @@ pub const SEED_CIDS: &[&str] = &["bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwip
 /**
  * Spaces out gateway requests across all workers: at most `per_min` a minute, 0 meaning no limit.
  * Public gateways rate-limit by client (Filebase: 200/min), and ten workers hitting cached pages
- * burst far past that.
+ * burst far past that. The rate is passed on each wait, so a change applies at once (#304).
  */
 pub struct Throttle {
-    interval: Duration,
     next: Mutex<Instant>,
 }
 
 impl Throttle {
-    pub fn per_minute(per_min: u32) -> Throttle {
-        let interval = if per_min == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs(60) / per_min
-        };
+    pub fn new() -> Throttle {
         Throttle {
-            interval,
             next: Mutex::new(Instant::now()),
         }
     }
 
     /// Blocks until this caller's slot; each call reserves the next slot under the lock
-    pub fn wait(&self) {
-        if self.interval.is_zero() {
+    pub fn wait(&self, per_min: u32) {
+        if per_min == 0 {
             return;
         }
+        let interval = Duration::from_secs(60) / per_min;
         let slot = {
             let mut next = self.next.lock().unwrap();
             let slot = (*next).max(Instant::now());
-            *next = slot + self.interval;
+            *next = slot + interval;
             slot
         };
         let now = Instant::now();
@@ -378,8 +372,8 @@ pub struct IndexQueue {
     purge_due: Mutex<bool>,
     purge_wake: Condvar,
 
-    // spaces out gateway requests; unset means no limit
-    throttle: OnceLock<Throttle>,
+    // spaces out gateway requests, at the gateway_requests_per_min setting
+    throttle: Throttle,
 
     // pauses a root while the gateway keeps failing on its pages (#284, per root since #286);
     // set on first use, or by a test
@@ -402,7 +396,7 @@ impl IndexQueue {
             writes: RwLock::new(()),
             purge_due: Mutex::new(false),
             purge_wake: Condvar::new(),
-            throttle: OnceLock::new(),
+            throttle: Throttle::new(),
             pauses: OnceLock::new(),
             indexed: Rate::new(),
             settings: OnceLock::new(),
@@ -469,15 +463,40 @@ impl IndexQueue {
         }
     }
 
-    /// Limit gateway requests to `per_min` a minute across all workers (0 = no limit)
-    pub fn set_gateway_rate(&self, per_min: u32) {
-        let _ = self.throttle.set(Throttle::per_minute(per_min));
+    /// Sets `key` to `raw` by `actor` (see Settings::set) and applies it where it isn't just
+    /// read on each use
+    #[allow(dead_code)] // for the admin endpoints (#304)
+    pub fn settings_set(&self, key: Key, raw: &str, actor: &str) -> Result<Applies, String> {
+        let applies = self.settings().set(self.store(), key, raw, actor)?;
+        self.apply_setting(key);
+        Ok(applies)
+    }
+
+    /// Drops `key`'s override (see Settings::reset) and applies the value now in use
+    #[allow(dead_code)] // for the admin endpoints (#304)
+    pub fn settings_reset(&self, key: Key, actor: &str) -> Result<Applies, String> {
+        let applies = self.settings().reset(self.store(), key, actor)?;
+        self.apply_setting(key);
+        Ok(applies)
+    }
+
+    // the settings that are state rather than read on each use: the writer's cache size
+    fn apply_setting(&self, key: Key) {
+        if key == Key::IndexCacheMb {
+            self.apply_cache_size();
+        }
+    }
+
+    fn apply_cache_size(&self) {
+        let mb = self.settings().get(Key::IndexCacheMb) as u32;
+        if let Err(err) = self.store().set_cache_mb(mb) {
+            warn!("Couldn't set the index cache to {} MB: {}", mb, err);
+        }
     }
 
     pub(crate) fn wait_for_gateway(&self) {
-        if let Some(throttle) = self.throttle.get() {
-            throttle.wait();
-        }
+        self.throttle
+            .wait(self.settings().get(Key::GatewayRequestsPerMin) as u32);
     }
 
     pub(crate) fn pauses(&self) -> &Pauses {
@@ -604,7 +623,6 @@ impl IndexQueue {
         &self,
         dir: &std::path::Path,
         cache_mb: u32,
-        max_age_secs: i64,
     ) -> Result<(usize, usize), OpenError> {
         let open = |verify: bool| -> Result<_, OpenError> {
             let store = if verify {
@@ -612,7 +630,7 @@ impl IndexQueue {
             } else {
                 Store::open(dir, cache_mb)?
             };
-            Ok(self.attach_store(store, max_age_secs)?)
+            Ok(self.attach_store(store)?)
         };
         let verify = check_marked_damage(dir)?;
         match open(verify) {
@@ -652,11 +670,7 @@ impl IndexQueue {
      * index was down are hidden by search's check and erased by the purge queued here; expiry
      * runs from main. Returns the pages and queued items there are.
      */
-    pub fn attach_store(
-        &self,
-        store: Store,
-        _max_age_secs: i64,
-    ) -> rusqlite::Result<(usize, usize)> {
+    pub fn attach_store(&self, store: Store) -> rusqlite::Result<(usize, usize)> {
         // the startup upkeep (erasures a crash cut short, #249) ran in Store::open
         let counts = (store.page_count(), store.queue_len());
         // the admin overrides (#304) are kept in the index file
@@ -664,6 +678,8 @@ impl IndexQueue {
         if self.store.set(store).is_err() {
             panic!("attach_store must run before the store is first used");
         }
+        // an override may differ from the size the store was opened with
+        self.apply_cache_size();
         self.request_purge();
         Ok(counts)
     }
@@ -1426,7 +1442,7 @@ mod tests {
     fn root_counts_hide_a_takedown_before_the_purge() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test(); // the one attach_store queued
         queue.persist(BAD, &page(BAD, "secret title", &[]));
@@ -1518,12 +1534,12 @@ mod tests {
     #[test]
     fn throttle_spaces_requests_across_threads() {
         // 600/min = one request per 100ms; four requests from four threads span >= 300ms
-        let throttle = std::sync::Arc::new(Throttle::per_minute(600));
+        let throttle = std::sync::Arc::new(Throttle::new());
         let start = Instant::now();
         let threads: Vec<_> = (0..4)
             .map(|_| {
                 let throttle = std::sync::Arc::clone(&throttle);
-                std::thread::spawn(move || throttle.wait())
+                std::thread::spawn(move || throttle.wait(600))
             })
             .collect();
         threads.into_iter().for_each(|t| t.join().unwrap());
@@ -1534,16 +1550,35 @@ mod tests {
 
     #[test]
     fn unlimited_throttle_never_waits() {
-        let throttle = Throttle::per_minute(0);
+        let throttle = Throttle::new();
         let start = Instant::now();
-        (0..1000).for_each(|_| throttle.wait());
+        (0..1000).for_each(|_| throttle.wait(0));
         assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn throttle_follows_the_rate_it_is_given() {
+        let throttle = Throttle::new();
+        let start = Instant::now();
+        throttle.wait(0);
+        assert!(start.elapsed() < Duration::from_millis(50));
+        // 600/min: the second wait is a slot of 100ms after the first
+        throttle.wait(600);
+        throttle.wait(600);
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
     fn page_fetches_go_through_the_throttle() {
         let queue = IndexQueue::new();
-        queue.set_gateway_rate(300); // one request per 200ms
+        // one request per 200ms
+        queue
+            .settings_set(Key::GatewayRequestsPerMin, "300", "test")
+            .unwrap();
         let start = Instant::now();
         for _ in 0..3 {
             let gateway = serve_once("text/html", b"<title>t</title>".to_vec())
@@ -1614,9 +1649,7 @@ mod tests {
     fn a_takedown_hides_the_page_at_once_and_erases_it_from_every_file() {
         let dir = temp_dir("takedown-segments");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(BAD, &page(BAD, "t", &[("zzqxsegmentterm91", 2)]));
         queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
         queue.flush_for_test();
@@ -1640,9 +1673,7 @@ mod tests {
     fn a_takedown_of_an_old_versions_redirected_cid_erases_it() {
         let dir = temp_dir("takedown-version");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         // GOOD's item once redirected to BAD's cid; it now resolves elsewhere
         let old = page(BAD, "t", &[("zzqxredirectterm", 1)]); // its cid is BAD
         queue.persist(GOOD, &old);
@@ -1671,9 +1702,7 @@ mod tests {
     fn expiry_erases_old_versions_of_a_current_page() {
         let dir = temp_dir("expire-version");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(GOOD, &page(GOOD, "t", &[("zzqxoldversionterm", 1)]));
         for i in 0..5 {
             let item = format!("{}/other{}", GOOD, i);
@@ -1755,9 +1784,7 @@ mod tests {
         drop(store);
         let queue = IndexQueue::new();
         assert_eq!(
-            queue
-                .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-                .unwrap(),
+            queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap(),
             (1, 1)
         );
         assert_eq!(queue.search("alpha", 0, 10).1.len(), 1);
@@ -1775,10 +1802,33 @@ mod tests {
         drop(store);
         let queue = IndexQueue::new();
         queue.set_settings(Settings::defaults());
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert_eq!(queue.settings().get(Key::CrawlWorkers), 42);
+    }
+
+    // the stored override differs from the cache size the store was opened with
+    #[test]
+    fn attach_store_applies_the_stored_cache_size() {
+        use crate::settings::Settings;
+        let dir = temp_dir("attach-cache");
+        let store = Store::open(&dir, 0).unwrap();
+        Settings::defaults()
+            .set(&store, Key::IndexCacheMb, "64", "a@b")
+            .unwrap();
+        drop(store);
+        let queue = IndexQueue::new();
+        queue.set_settings(Settings::defaults());
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
+        assert_eq!(queue.store().cache_size_for_test(), -65536);
+    }
+
+    #[test]
+    fn settings_set_reapplies_the_cache_size() {
+        let queue = IndexQueue::new();
+        queue.settings_set(Key::IndexCacheMb, "64", "test").unwrap();
+        assert_eq!(queue.store().cache_size_for_test(), -65536);
+        queue.settings_reset(Key::IndexCacheMb, "test").unwrap();
+        assert_eq!(queue.store().cache_size_for_test(), -1024 * 1024);
     }
 
     #[test]
@@ -1838,7 +1888,7 @@ mod tests {
         )
         .unwrap();
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "garbagetext");
     }
 
@@ -1863,13 +1913,13 @@ mod tests {
         assert!(std::fs::metadata(&file).unwrap().len() > 3 * 4096);
         damage(&file, 2 * 4096);
         let err = Store::open(&dir, 0)
-            .and_then(|s| Ok(IndexQueue::new().attach_store(s, 30 * DAY)?))
+            .and_then(|s| Ok(IndexQueue::new().attach_store(s)?))
             .err()
             .expect("the damage is noticed");
         assert!(store::is_corrupt(&*err), "{}", err);
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "damagedtitle");
     }
 
@@ -1920,7 +1970,7 @@ mod tests {
         .unwrap();
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "markedtitle");
         assert!(
             !store::damage_marker(&dir).exists(),
@@ -1939,7 +1989,7 @@ mod tests {
         .unwrap();
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (400, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (400, 0));
         assert!(!store::damage_marker(&dir).exists(), "the marker goes");
         assert_eq!(queue.search("shared", 0, 10).0.n, 400, "and is searched");
     }
@@ -1948,7 +1998,7 @@ mod tests {
     fn open_store_wipes_an_index_with_a_damaged_segment() {
         let dir = temp_dir("wipe-segment");
         let queue = IndexQueue::new();
-        queue.open_store(&dir, 0, 30 * DAY).unwrap();
+        queue.open_store(&dir, 0).unwrap();
         queue.persist(BAD, &page(BAD, "t", &[("segmenttext77", 1)]));
         queue.flush_for_test();
         drop(queue);
@@ -1960,7 +2010,7 @@ mod tests {
         damage(&segment, 16);
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "segmenttext77");
     }
 
@@ -1968,7 +2018,7 @@ mod tests {
     fn a_segment_the_background_check_fails_is_marked_and_the_next_start_wipes_it() {
         let dir = temp_dir("verify-segment");
         let queue = IndexQueue::new();
-        queue.open_store(&dir, 0, 30 * DAY).unwrap();
+        queue.open_store(&dir, 0).unwrap();
         queue.persist(GOOD, &page(GOOD, "t", &[("checkedtext77", 1)]));
         queue.flush_for_test();
         drop(queue);
@@ -1977,7 +2027,7 @@ mod tests {
 
         // opening doesn't read it whole: the index opens and serves
         let queue = IndexQueue::new();
-        queue.open_store(&dir, 0, 30 * DAY).unwrap();
+        queue.open_store(&dir, 0).unwrap();
         assert_eq!(queue.search("checkedtext77", 0, 10).1.len(), 1);
         assert_eq!(queue.damage(), None);
         queue.verify_store();
@@ -1994,7 +2044,7 @@ mod tests {
 
         // the marker has the next start check every file
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "checkedtext77");
         assert!(!store::damage_marker(&dir).exists());
     }
@@ -2011,16 +2061,13 @@ mod tests {
                  INSERT INTO pages VALUES (1, 'bafyA', 'bafyA', 'oldformattitle', 'e', 5);",
             )
             .unwrap();
-        let err = IndexQueue::new()
-            .open_store(&dir, 0, 30 * DAY)
-            .err()
-            .unwrap();
+        let err = IndexQueue::new().open_store(&dir, 0).err().unwrap();
         assert!(err.is::<store::OldFormat>(), "{}", err);
         assert!(dir_has(&dir, "oldformattitle"), "kept for the operator");
 
         let file = dir.join("a-file");
         std::fs::write(&file, b"keepme").unwrap();
-        assert!(IndexQueue::new().open_store(&file, 0, 30 * DAY).is_err());
+        assert!(IndexQueue::new().open_store(&file, 0).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"keepme");
     }
 
@@ -2029,9 +2076,7 @@ mod tests {
         let dir = temp_dir("attach");
         seed(&dir, &[(GOOD, "goodtitle", now_secs())]);
         let queue = IndexQueue::new();
-        let (pages, queued) = queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        let (pages, queued) = queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert_eq!((pages, queued), (1, 0));
         assert_eq!(queue.search("goodtitle", 0, usize::MAX).1.len(), 1);
         assert_eq!(queue.search("shared", 0, usize::MAX).1.len(), 1);
@@ -2055,9 +2100,7 @@ mod tests {
         let queue = IndexQueue::new();
         // local takedown list loaded before attach, as main.rs does
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.purge_for_test(); // the one attach_store queued
         assert_eq!(queue.expire(30 * DAY), 1);
         assert_eq!(queue.index_length(), 1);
@@ -2077,9 +2120,7 @@ mod tests {
             ],
         );
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert!(file_has(&dir, "purgetitle"));
 
         queue.set_denylist(Denylist::parse(&format!("{}\n", BAD)));
@@ -2094,9 +2135,7 @@ mod tests {
         let dir = temp_dir("expire");
         seed(&dir, &[(GOOD, "agingtitle", now_secs() - 10 * DAY)]);
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert_eq!(queue.expire(30 * DAY), 0);
         assert_eq!(queue.expire(5 * DAY), 1);
         assert_eq!(queue.index_length(), 0);
@@ -2107,9 +2146,7 @@ mod tests {
     fn crawled_pages_are_persisted_but_not_if_blocked_meanwhile() {
         let dir = temp_dir("crawl");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(GOOD, &page(GOOD, "crawledtitle", &[]));
         assert!(file_has(&dir, "crawledtitle"));
 
@@ -2124,9 +2161,7 @@ mod tests {
         // review #1: a worker that checked against the OLD list must not write after the purge
         let dir = temp_dir("race");
         let queue = std::sync::Arc::new(IndexQueue::new());
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
 
         let swap = queue.writes.write().unwrap(); // a setter is mid swap+purge
         let worker = {
@@ -2149,9 +2184,7 @@ mod tests {
         let seed = SEED_CIDS[0];
         seed_rows(&dir, seed, now_secs() - 40 * DAY);
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 50 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert_eq!(queue.reseed(), 0, "seed already indexed: nothing queued");
         assert_eq!(queue.expire(30 * DAY), 1);
         assert_eq!(queue.reseed(), 1, "seed queued again so the crawl restarts");
@@ -2235,9 +2268,7 @@ mod tests {
         // #220: per-page counts duplicated the inverted index in RAM and bloated /search output
         let dir = temp_dir("counts");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 3)]));
         let (_, results) = queue.search("alpha", 0, usize::MAX);
         assert_eq!(results.len(), 1, "still searchable");
@@ -2252,7 +2283,7 @@ mod tests {
         // and after a reload: searchable
         let reloaded = IndexQueue::new();
         reloaded
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .attach_store(Store::open(&dir, 0).unwrap())
             .unwrap();
         assert_eq!(reloaded.search("alpha", 0, usize::MAX).1.len(), 1);
     }
@@ -2771,9 +2802,7 @@ mod tests {
     fn the_frontier_survives_a_restart() {
         let dir = temp_dir("frontier");
         let first = IndexQueue::new();
-        first
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        first.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         first.enqueue_many(vec![
             format!("{}/wiki/A", GOOD),
             format!("{}/wiki/B", GOOD),
@@ -2792,9 +2821,7 @@ mod tests {
 
         let second = IndexQueue::new();
         second.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
-        second
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        second.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         // all of it, in order (#231): an indexed item is fetched again, as a recrawl would
         assert_eq!(
             Store::open(&dir, 0).unwrap().queue_load().unwrap(),
@@ -2816,9 +2843,7 @@ mod tests {
     fn processed_items_leave_the_saved_frontier() {
         let dir = temp_dir("processed");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.enqueue(GOOD.to_string());
         let gateway = serve_once(
             "text/html",
@@ -2853,9 +2878,7 @@ mod tests {
     fn a_mirror_of_an_indexed_page_is_neither_indexed_nor_followed() {
         let dir = temp_dir("mirrors");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         let (original, mirror) = (format!("{}/wiki/A", GOOD), format!("{}/wiki/A", BAD));
         // the same text; the links (attributes, not text) differ
         let links = crawl(
@@ -2898,9 +2921,7 @@ mod tests {
         // remembered across a restart, and expires with the original
         drop(queue);
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert_eq!((queue.index_length(), queue.mirror_length()), (3, 1));
         // indexed this second: a cutoff just past now
         assert_eq!(queue.expire(-1), 3);
@@ -2932,9 +2953,7 @@ mod tests {
     fn takedowns_drop_mirrors() {
         let dir = temp_dir("mirrortakedown");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         let hashed = |item: &str| page(item, "t", &[]).with_text_hash(b"h".to_vec());
         let (good_b, bad_b) = (format!("{}/b", GOOD), format!("{}/b", BAD));
         assert!(queue.persist(GOOD, &hashed(GOOD)));
@@ -2967,9 +2986,7 @@ mod tests {
         }
         let queue = IndexQueue::new();
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.purge_for_test(); // the one attach_store queued
         assert_eq!((queue.index_length(), queue.mirror_length()), (1, 0));
         assert!(!file_has(&dir, &bad_b));
@@ -2979,9 +2996,7 @@ mod tests {
     fn store_write_failure_does_not_panic() {
         let dir = temp_dir("fail");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         // e.g. disk full / read-only remount
         queue.store.get().unwrap().break_for_test();
         // upsert fails: logs, doesn't panic, and its links are still followed
@@ -2997,9 +3012,7 @@ mod tests {
         let dir = temp_dir("expire-fails");
         seed(&dir, &[(GOOD, "agingtitle", now_secs() - 10 * DAY)]);
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         // finding the old pages works, deleting them doesn't
         queue.store.get().unwrap().drop_table_for_test("mirrors");
         assert_eq!(queue.expire(5 * DAY), 0);
@@ -3177,9 +3190,7 @@ mod tests {
         // they used to linger in the in-memory index, only filtered out at search time
         let dir = temp_dir("purge-postings");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(
             GOOD,
             &page(GOOD, "t", &[("takedownword", 1), ("shared", 1)]),
@@ -3234,9 +3245,7 @@ mod tests {
         };
         let attached = |dir: &std::path::Path| {
             let queue = IndexQueue::new();
-            queue
-                .attach_store(Store::open(dir, 0).unwrap(), 30 * DAY)
-                .unwrap();
+            queue.attach_store(Store::open(dir, 0).unwrap()).unwrap();
             queue
         };
         let segments = |queue: &IndexQueue| queue.store.get().unwrap().segment_count();
@@ -3279,7 +3288,7 @@ mod tests {
     fn an_unchanged_local_list_queues_no_purge() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test(); // the one attach_store queued
         let list = format!("{}\n", BAD);
@@ -3297,9 +3306,7 @@ mod tests {
     fn a_takedown_is_hidden_at_once_and_erased_by_the_purge() {
         let dir = temp_dir("purge-erases");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.purge_for_test();
         queue.persist(BAD, &page(BAD, "t", &[("zzqxpurgeterm", 1)]));
         queue.flush_for_test();
@@ -3322,7 +3329,7 @@ mod tests {
     fn undeny_before_the_purge_keeps_the_page() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test();
         queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
@@ -3337,7 +3344,7 @@ mod tests {
     fn a_denylist_change_during_a_purge_runs_another() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         // the purge thread has taken the due flag and is scanning...
         assert!(queue.take_purge_due());
@@ -3353,7 +3360,7 @@ mod tests {
     fn a_purge_the_store_fails_queues_another_round() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test(); // the one attach_store queued
         queue.persist(BAD, &page(BAD, "t", &[("alpha", 1)]));
@@ -3370,7 +3377,7 @@ mod tests {
     fn a_purge_whose_old_versions_fail_to_read_queues_another_round() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test(); // the one attach_store queued
         queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
