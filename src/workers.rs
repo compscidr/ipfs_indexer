@@ -25,7 +25,18 @@ fn run(
     let wanted = Arc::new(AtomicUsize::new(0));
     let mut last = None;
     loop {
-        let want = target();
+        // a panicking read mustn't end the supervisor, and with it every later resize
+        let want = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&target)) {
+            Ok(want) => want,
+            Err(_) => {
+                let kept = last.unwrap_or(0);
+                error!(
+                    "Reading the crawl workers setting panicked; keeping {}",
+                    kept
+                );
+                kept
+            }
+        };
         wanted.store(want, Ordering::SeqCst);
         match last {
             None => info!("Crawl workers: {}", want),
@@ -178,6 +189,39 @@ mod tests {
         done.sort();
         assert_eq!(done, (0..50).collect::<Vec<_>>());
         target.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_panicking_target_keeps_the_last_one() {
+        let work: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(10));
+            true
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let target = Arc::new(AtomicUsize::new(2));
+        let set = Arc::new(Mutex::new(BTreeSet::new()));
+        let (c, t, s) = (Arc::clone(&calls), Arc::clone(&target), Arc::clone(&set));
+        std::thread::spawn(move || {
+            let read = move || {
+                // the second read panics, once
+                if c.fetch_add(1, Ordering::SeqCst) == 1 {
+                    panic!("a setting read that panics");
+                }
+                t.load(Ordering::SeqCst)
+            };
+            run(s, read, TICK, work)
+        });
+        wait_for("past the panic", Duration::from_secs(1), || {
+            calls.load(Ordering::SeqCst) >= 3
+        });
+        assert_eq!(running(&set), 2);
+        // the supervisor is still there to follow a change
+        target.store(3, Ordering::SeqCst);
+        wait_for("3 running", Duration::from_secs(1), || running(&set) == 3);
+        target.store(0, Ordering::SeqCst);
+        wait_for("none running", Duration::from_secs(1), || {
+            running(&set) == 0
+        });
     }
 
     #[test]

@@ -345,14 +345,6 @@ async fn main() -> std::io::Result<()> {
     let index_queue = web::Data::new(IndexQueue::new());
     index_queue.set_settings(settings);
 
-    // (an admin override loaded with the store may change it; each request reads the setting)
-    let gateway_rate = index_queue.settings().get(Key::GatewayRequestsPerMin);
-    if gateway_rate == 0 {
-        info!("Gateway requests: no limit");
-    } else {
-        info!("Gateway requests: at most {} per minute", gateway_rate);
-    }
-
     // fail closed: don't crawl anything until the badbits denylist is loaded. Fetched on a plain
     // thread since the blocking client can't run inside the actix runtime.
     match std::thread::spawn(Denylist::fetch).join().unwrap() {
@@ -413,7 +405,6 @@ async fn main() -> std::io::Result<()> {
     // the most of the index SQLite keeps in memory; the rest stays on disk (#231)
     let cache_mb = index_queue.settings().get(Key::IndexCacheMb) as u32;
     if let Ok(dir) = std::env::var("DATA_DIR") {
-        info!("Index cache: at most {} MB in memory", cache_mb);
         let opening = std::time::Instant::now();
         let attached = index_queue.open_store(std::path::Path::new(&dir), cache_mb);
         match attached {
@@ -429,6 +420,19 @@ async fn main() -> std::io::Result<()> {
                 std::process::exit(1);
             }
         }
+        // after the store, so an admin override loaded with it shows
+        info!(
+            "Index cache: at most {} MB in memory",
+            index_queue.settings().get(Key::IndexCacheMb)
+        );
+    }
+
+    // the effective value, overrides loaded; each request reads the setting, so it may change
+    let gateway_rate = index_queue.settings().get(Key::GatewayRequestsPerMin);
+    if gateway_rate == 0 {
+        info!("Gateway requests: no limit");
+    } else {
+        info!("Gateway requests: at most {} per minute", gateway_rate);
     }
 
     // after the store: the queue lives in it (#231)

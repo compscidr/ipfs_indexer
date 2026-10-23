@@ -448,12 +448,13 @@ mod tests {
     fn a_rule_change_applies_on_the_next_record() {
         let breaker = Breaker::new();
         let t = Instant::now();
-        for _ in 0..15 {
+        for _ in 0..14 {
             breaker.record_at(t, Some("504"), PauseRule::DEFAULT);
         }
         assert_eq!(breaker.permit_at(t), Permit::Go);
+        // 15 failures would not trip the default of 16, so only the lowered rule can
         let rule = PauseRule {
-            failures: 16,
+            failures: 15,
             ..PauseRule::DEFAULT
         };
         breaker.record_at(t, Some("504"), rule);

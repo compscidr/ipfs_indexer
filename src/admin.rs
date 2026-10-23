@@ -339,10 +339,11 @@ async fn denylist_read(
         Some(path) => {
             let _file = file_lock();
             match std::fs::read_to_string(path) {
+                // each line as written (lines() drops the \n and a \r before it), blank ones
+                // left out; entry_item trims, as the denylist reads the line
                 Ok(text) => text
                     .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
+                    .filter(|line| !line.trim().is_empty())
                     .map(|line| json!({ "line": line, "item": entry_item(line) }))
                     .collect(),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -1071,7 +1072,7 @@ mod tests {
     #[actix_web::test]
     async fn the_denylist_read_lists_lines_and_marks_undoable_ones() {
         let (admin, _path) = admin_with(&format!(
-            "# note\n{GOOD}\n\n//abcd\n{GOOD}/wiki/X\n",
+            "# note\n{GOOD}\n  \n//abcd\r\n  {GOOD}/wiki/X \n",
             GOOD = GOOD
         ));
         let queue = web::Data::new(IndexQueue::new());
@@ -1087,6 +1088,8 @@ mod tests {
         assert_eq!(local[0], json!({"line": "# note", "item": null}));
         assert_eq!(local[1]["item"], GOOD);
         assert_eq!(local[2], json!({"line": "//abcd", "item": null}));
+        // as written, but the item from the trimmed text
+        assert_eq!(local[3]["line"], format!("  {}/wiki/X ", GOOD));
         assert_eq!(local[3]["item"], format!("{}/wiki/X", GOOD));
         assert!(read["local_file"].is_string());
         assert_eq!(read["badbits"]["entries"], 1);

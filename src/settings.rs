@@ -9,7 +9,7 @@ use crate::store::{now_secs, Store};
 use log::{info, warn};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Key {
@@ -154,7 +154,7 @@ const SPECS: [Spec; 18] = [
         "INDEX_CACHE_MB",
         "MB of the index SQLite keeps in memory",
         1024,
-        (0, 65_536),
+        (0, 16_384),
         Live,
     ),
     spec(
@@ -325,12 +325,20 @@ fn check(key: Key, raw: &str, by: By) -> Result<Val, String> {
     match raw.parse::<u64>() {
         Ok(n) if (spec.min..=spec.max).contains(&n) => Ok(Val::Num(n)),
         _ => Err(format!(
-            "{} must be a whole number from {} to {}, got {:?}",
+            "{} must be a whole number from {} to {}, got {}",
             called(key, by),
             spec.min,
             spec.max,
-            raw
+            shown_raw(raw)
         )),
+    }
+}
+
+// a bad value as an error shows it; a long one or a URL may be a pasted secret, so isn't echoed
+fn shown_raw(raw: &str) -> String {
+    match raw.contains("://") || raw.chars().count() > 32 {
+        true => "a non-number".to_string(),
+        false => format!("{:?}", raw),
     }
 }
 
@@ -369,6 +377,8 @@ pub struct Settings {
     public_gateway: bool,
     env: HashMap<Key, Val>,
     overrides: RwLock<Overrides>,
+    // serializes set and reset, so readers wait only for the in-memory change, not the store
+    writes: Mutex<()>,
 }
 
 impl Settings {
@@ -392,6 +402,7 @@ impl Settings {
             public_gateway,
             env: values,
             overrides: RwLock::new(HashMap::new()),
+            writes: Mutex::new(()),
         };
         check_pairs(|key| settings.fallback_num(key), By::Env)?;
         Ok(settings)
@@ -403,6 +414,7 @@ impl Settings {
             public_gateway: false,
             env: HashMap::new(),
             overrides: RwLock::new(HashMap::new()),
+            writes: Mutex::new(()),
         }
     }
 
@@ -484,10 +496,11 @@ impl Settings {
     pub fn set(&self, store: &Store, key: Key, raw: &str, actor: &str) -> Result<Applies, String> {
         let value = check(key, raw, By::Admin)?;
         // held across the check and the write, so two sets can't break a pair rule between them
-        let mut overrides = self.overrides.write().unwrap();
+        let _writing = self.writes.lock().unwrap();
         let saved = match &value {
             Val::Num(n) => {
                 let n = *n;
+                let overrides = self.overrides.read().unwrap();
                 check_pairs(
                     |k| if k == key { n } else { self.num(&overrides, k) },
                     By::Admin,
@@ -500,7 +513,7 @@ impl Settings {
         store
             .set_setting(key.name(), &saved, actor, at)
             .map_err(|err| format!("Couldn't save {}: {}", key.name(), err))?;
-        overrides.insert(
+        self.overrides.write().unwrap().insert(
             key,
             Override {
                 value: Ok(value),
@@ -518,8 +531,9 @@ impl Settings {
     /// Drops `key`'s override, so the env value or the default is used, unless that would break
     /// a pair rule
     pub fn reset(&self, store: &Store, key: Key, actor: &str) -> Result<Applies, String> {
-        let mut overrides = self.overrides.write().unwrap();
+        let _writing = self.writes.lock().unwrap();
         if key != Key::EthRpcUrl {
+            let overrides = self.overrides.read().unwrap();
             check_pairs(
                 |k| match k == key {
                     true => self.fallback_num(k),
@@ -531,7 +545,7 @@ impl Settings {
         store
             .clear_setting(key.name())
             .map_err(|err| format!("Couldn't reset {}: {}", key.name(), err))?;
-        overrides.remove(&key);
+        self.overrides.write().unwrap().remove(&key);
         info!("Setting {} reset by {}", key.name(), actor);
         Ok(key.spec().applies)
     }
@@ -866,6 +880,35 @@ mod tests {
         }
         assert_eq!(store.settings_overrides().unwrap(), before);
         assert_eq!(settings.get(Key::CrawlWorkers), 10);
+    }
+
+    #[test]
+    fn a_bad_number_that_may_be_a_secret_is_not_echoed() {
+        let store = Store::open_in_memory().unwrap();
+        let settings = Settings::defaults();
+        let err = settings
+            .set(
+                &store,
+                Key::CrawlWorkers,
+                "https://x.example/v2/SECRETKEY",
+                "a@b",
+            )
+            .err()
+            .unwrap();
+        assert!(!err.contains("SECRETKEY"), "{}", err);
+        assert!(err.contains("got a non-number"), "{}", err);
+        let long = "a".repeat(33);
+        let err = settings
+            .set(&store, Key::CrawlWorkers, &long, "a@b")
+            .err()
+            .unwrap();
+        assert!(!err.contains(&long), "{}", err);
+        // a short value is still shown
+        let err = settings
+            .set(&store, Key::CrawlWorkers, "abc", "a@b")
+            .err()
+            .unwrap();
+        assert!(err.contains("got \"abc\""), "{}", err);
     }
 
     #[test]
