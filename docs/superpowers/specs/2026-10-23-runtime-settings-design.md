@@ -138,7 +138,7 @@ call: wide enough not to get in the way, narrow enough that a typo can't hurt (n
 - No new way to edit the file: adding stays the existing `/admin/deny`, from a report or a
   CID typed into the admin.
 
-## No change history (decided)
+## No change history (my call)
 The page shows only the current state: one row per override, with who set it and when. There's
 no history table or history page. Each set or reset is logged (`Setting <name> set to <value> by
 <actor>`, or `reset by <actor>`; for the secret, only `ETH RPC URL changed by <actor>`), so the
