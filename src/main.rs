@@ -3,8 +3,6 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use threadpool::ThreadPool;
-
 use actix_web::{get, web, App, HttpResponse, HttpServer};
 use log::{debug, error, info, warn};
 use simple_logger::SimpleLogger;
@@ -29,6 +27,7 @@ mod segment;
 mod segments;
 mod settings;
 mod store;
+mod workers;
 
 // crate version, plus the commit when built with GIT_SHA set (the docker build passes it)
 fn version() -> String {
@@ -497,9 +496,6 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
-    // fetches through Kubo take ~2 s, so the worker count caps the crawl rate (#246)
-    let n_workers = index_queue.settings().get(Key::CrawlWorkers) as usize;
-    info!("Crawl workers: {}", n_workers);
     // crawling starts now: /health's grace period counts from here
     let health_config = web::Data::new(Health {
         started: Instant::now(),
@@ -517,15 +513,18 @@ async fn main() -> std::io::Result<()> {
         // drops the pauses of roots crawling normally with nothing queued (#286)
         summary_queue.prune_pauses();
     });
-    let pool = ThreadPool::new(n_workers);
-
-    // todo: find some way to shutdown the pool when the server stops
-    for _ in 0..n_workers {
-        let inner_config = Arc::clone(&index_queue);
-        let inner_gateway = gateway.clone();
-        pool.execute(move || {
-            inner_config.start(inner_gateway);
-        });
+    // fetches through Kubo take ~2 s, so the worker count caps the crawl rate (#246); it follows
+    // the setting without a restart (#304)
+    {
+        let target = {
+            let q = Arc::clone(&index_queue);
+            move || q.settings().get(Key::CrawlWorkers) as usize
+        };
+        let work: Arc<dyn Fn() -> bool + Send + Sync> = {
+            let (q, g) = (Arc::clone(&index_queue), gateway.clone());
+            Arc::new(move || q.process_next(&g))
+        };
+        std::thread::spawn(move || workers::supervise(target, Duration::from_secs(1), work));
     }
 
     // discovery (#213): the resolver always runs, since submitted names need it; each source runs

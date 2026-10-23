@@ -1145,15 +1145,6 @@ impl IndexQueue {
         (total, results.collect())
     }
 
-    pub fn start(&self, gateway: String) {
-        loop {
-            if !self.process_next(&gateway) {
-                // idle workers spun at 100% CPU each (#224)
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
-
     /// Fetch and index the next queued item; false if it took none (nothing queued outside the
     /// roots paused while the gateway keeps failing on them)
     pub fn process_next(&self, gateway: &str) -> bool {
