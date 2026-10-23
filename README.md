@@ -33,9 +33,10 @@ RUST_LOG=info ./target/debug/ipfs_indexer 127.0.0.1:8080   # your own gateway (h
 | `DISCOVERY_PER_HOUR` | `500` | The most new discovered roots queued an hour, across every source (`0` = no limit). |
 | `ETH_LOGS_MAX_BLOCKS` | `10000` | The most blocks one ENS `eth_getLogs` request asks for. Set it to your provider's limit: `10` on Alchemy's free plan. |
 | `ETH_REQUEST_SECS` | `1` | Seconds between ENS requests. Raise it to stay within a provider's monthly allowance: `6` keeps Alchemy's free plan (30M compute units a month, 60 per request) under its limit. |
+| `HEALTH_GRACE_SECS`, `PAUSE_WINDOW`, `PAUSE_FAILURES`, `PAUSE_MIN_SECS`, `PAUSE_MAX_SECS`, `PAGE_ATTEMPTS`, `PAGE_TIMEOUT_SECS`, `PAGE_MAX_BYTES`, `NAME_TIMEOUT_SECS` | see [Runtime settings](#runtime-settings) | The health grace period, the crawl pause rule, page retries, timeout and size limit, and the name-resolution timeout. All are settings. |
 | `RUST_LOG` | unset | Log level, e.g. `info`: startup, warnings and errors, and one line a minute with the indexing rate, index size and queue length. `debug` adds several lines per page fetched, per queue write and per search query (about 3 GB a day at 4,000 pages a minute). |
 
-The indexer **exits at startup** if it can't download the badbits list, read a configured `LOCAL_DENYLIST`, or open a configured `DATA_DIR`, rather than run without them.
+The indexer **exits at startup** if a setting's env value is out of range (see [Runtime settings](#runtime-settings)), it can't download the badbits list, read a configured `LOCAL_DENYLIST`, or open a configured `DATA_DIR`, rather than run without them.
 
 ## HTTP API
 | Endpoint | Returns |
@@ -51,6 +52,43 @@ The indexer **exits at startup** if it can't download the badbits list, read a c
 | `GET /keywords` | The most common keywords. Approximate: counts include deleted pages until their segments are merged away. |
 | `POST /admin/deny`, `POST /admin/undeny` | Only with `ADMIN_TOKEN` set (otherwise 404); needs `Authorization: Bearer <token>`. The body is one `cid`, `cid/path` or `/ipfs/cid/path`: added to or removed from `LOCAL_DENYLIST` and applied at once. Returns `Blocked; removal from disk queued` or `Unblocked; <n> lines removed`. Badbits is never changed. |
 | `POST /admin/recrawl` | Same token. Queues every indexed page to be fetched again, so their links to pages not indexed yet are followed. Pages stay searchable meanwhile; the queue is kept on disk, so a restart carries on with what is left. Returns `Queued <n> pages to crawl again`. |
+| `GET /admin/settings` | Same token. JSON `{"settings": [...], "persistent": bool}`: one object per setting with `name`, `label`, `env_var`, `value`, `source` (`admin`, `iac` or `default`), `iac`, `default`, `min`, `max`, `applies` (`live` or `restart`), and, for an override, `actor` and `set_at`. An override that no longer passes validation shows `ignored: <reason>` and isn't used. `eth_rpc_url` shows only `set` or `not set`. |
+| `POST /admin/settings/{name}`, `DELETE /admin/settings/{name}` | Same token. Sets a setting to the body (a number, or the URL for `eth_rpc_url`) or resets it, dropping the override. Needs `X-Admin-Actor: <who>` (`400` if missing or empty), logged as `Setting <name> set to <value> by <actor>` or `Setting <name> reset by <actor>`. `200` with `{"applies": "live"}` or `{"applies": "restart"}`; `404` for an unknown name; `400` with the reason for a value out of range. `400 settings need DATA_DIR` without it. |
+| `GET /admin/seeds` | Same token. JSON `{"seeds": [...], "file": path}`: each seed from `SEEDS_FILE` or added here, with `entry`, `mark` (`iac` from the file, `added`, or `removed`: in the file but taken out here), and the `actor` and `set_at` of a change. |
+| `POST /admin/seeds/add`, `/admin/seeds/remove`, `/admin/seeds/reset` | Same token and `X-Admin-Actor`. The body is one CID, `cid/path` or name. Adds a seed on top of `SEEDS_FILE`, hides one the file lists, or clears the change; the seeds thread reads again at once. `400` for an invalid entry, a blocked CID or no `DATA_DIR`. |
+| `GET /admin/denylist` | Same token. JSON: `local` (each line of `LOCAL_DENYLIST` with the `item` `/admin/undeny` takes it out by, or `null`), `local_file`, and `badbits` (`entries`, `loaded_at`). Changes nothing. |
+
+## Runtime settings
+The settings below can be read and changed through the admin endpoints (darksearch.xyz's admin area has a page for them), without redeploying. A value comes from, in order: an **admin override**, the **env var** (set by iac), then the **default**. `DELETE /admin/settings/{name}` drops the override. Overrides are kept in `index.sqlite`, so they survive restarts and deploys; they need `DATA_DIR` (reads work without it). Every set and reset is logged with the `X-Admin-Actor` that made it.
+
+| Setting (`name`) | Env var | Default | Range | Applies |
+|---|---|---|---|---|
+| `crawl_workers` | `CRAWL_WORKERS` | 10 | 1-500 | live |
+| `gateway_requests_per_min` | `GATEWAY_REQUESTS_PER_MIN` | 0 with your own gateway, 100 on the public one | 0-100000 | live |
+| `discovery_per_hour` | `DISCOVERY_PER_HOUR` | 500 | 0-100000 | live |
+| `health_min_rate` | `HEALTH_MIN_RATE` | 500 | 0-1000000 | live |
+| `health_grace_secs` | `HEALTH_GRACE_SECS` | 900 | 0-86400 | live |
+| `index_max_age_days` | `INDEX_MAX_AGE_DAYS` | 30 | 1-3650 | live |
+| `index_cache_mb` | `INDEX_CACHE_MB` | 1024 | 0-65536 | live |
+| `pause_window` | `PAUSE_WINDOW` | 20 | 1-1000 | live |
+| `pause_failures` | `PAUSE_FAILURES` | 16 | 1-1000, at most `pause_window` | live |
+| `pause_min_secs` | `PAUSE_MIN_SECS` | 60 | 1-86400 | live |
+| `pause_max_secs` | `PAUSE_MAX_SECS` | 900 | 1-86400, at least `pause_min_secs` | live |
+| `page_attempts` | `PAGE_ATTEMPTS` | 3 | 1-100 | live |
+| `page_timeout_secs` | `PAGE_TIMEOUT_SECS` | 90 | 5-3600 | live |
+| `page_max_bytes` | `PAGE_MAX_BYTES` | 2097152 | 65536-67108864 | live |
+| `name_timeout_secs` | `NAME_TIMEOUT_SECS` | 30 | 5-3600 | live |
+| `eth_logs_max_blocks` | `ETH_LOGS_MAX_BLOCKS` | 10000 | 1-100000 | restart |
+| `eth_request_secs` | `ETH_REQUEST_SECS` | 1 | 0-3600 | restart |
+| `eth_rpc_url` | `ETH_RPC_URL` | unset | an `http(s)://` URL with a host | restart |
+
+- **Live** settings apply at once. Crawl workers are added or stopped within about a second; a worker being stopped finishes its current page first.
+- **Restart** settings (the three ETH ones) are read only at startup, so a change makes the indexer exit cleanly a second after replying, and Docker's restart policy starts it again with the new value.
+- **`ETH_RPC_URL` is write-only:** it holds an API key, so it is never returned, logged or shown. The settings list says only `set` or `not set`, and the log says `ETH RPC URL changed by <actor>`.
+- **Bad values:** an out-of-range env value stops the indexer at startup. A stored override that no longer validates is logged, ignored and listed as `ignored: <reason>`; it never stops startup.
+- **Not settings:** `DATA_DIR`, `BIND_ADDR`, `SEEDS_FILE`, `LOCAL_DENYLIST` and `ADMIN_TOKEN`.
+
+Seeds can be changed the same way: `/admin/seeds/add` and `/admin/seeds/remove` layer changes over `SEEDS_FILE`, which iac keeps; `/admin/seeds/reset` clears one.
 
 ## Denylists
 The badbits denylist is downloaded at startup and refreshed daily.
