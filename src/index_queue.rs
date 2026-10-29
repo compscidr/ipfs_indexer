@@ -1,9 +1,11 @@
-use crate::breaker::Permit;
+use crate::breaker::{PauseRule, Permit};
 use crate::denylist::{normalize_item, Denylist};
+use crate::entry::Entry;
 use crate::index_result::IndexResult;
 use crate::pauses::Pauses;
 use crate::rate::Rate;
 use crate::search::{self, Query, Scorer, Total, MAX_RANKED};
+use crate::settings::{Applies, Key, Settings};
 use crate::store::{self, now_secs, root_of, OpenError, Queued, Store, Upserted};
 use actix_web::body::MessageBody;
 use cid::Cid;
@@ -14,6 +16,7 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::io::Read;
 use std::ops::Not;
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use std::time::Instant;
@@ -25,35 +28,29 @@ pub const SEED_CIDS: &[&str] = &["bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwip
 /**
  * Spaces out gateway requests across all workers: at most `per_min` a minute, 0 meaning no limit.
  * Public gateways rate-limit by client (Filebase: 200/min), and ten workers hitting cached pages
- * burst far past that.
+ * burst far past that. The rate is passed on each wait, so a change applies at once (#304).
  */
 pub struct Throttle {
-    interval: Duration,
     next: Mutex<Instant>,
 }
 
 impl Throttle {
-    pub fn per_minute(per_min: u32) -> Throttle {
-        let interval = if per_min == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs(60) / per_min
-        };
+    pub fn new() -> Throttle {
         Throttle {
-            interval,
             next: Mutex::new(Instant::now()),
         }
     }
 
     /// Blocks until this caller's slot; each call reserves the next slot under the lock
-    pub fn wait(&self) {
-        if self.interval.is_zero() {
+    pub fn wait(&self, per_min: u32) {
+        if per_min == 0 {
             return;
         }
+        let interval = Duration::from_secs(60) / per_min;
         let slot = {
             let mut next = self.next.lock().unwrap();
             let slot = (*next).max(Instant::now());
-            *next = slot + self.interval;
+            *next = slot + interval;
             slot
         };
         let now = Instant::now();
@@ -183,20 +180,18 @@ fn check_marked_damage(dir: &std::path::Path) -> Result<bool, OpenError> {
     }
 }
 
-// skip anything bigger than this rather than pulling it all into memory
-const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
-
-// a page the gateway fails on this many times in all is dropped (#284)
-const MAX_ATTEMPTS: u32 = 3;
-
 /**
  * Fetch a url and return its body, but only if the gateway says it's html and it fits in
- * MAX_BODY_BYTES. Ok(None) means it was skipped: images, video, etc are never downloaded.
+ * `max_bytes` (bigger is skipped rather than pulled all into memory). Ok(None) means it was
+ * skipped: images, video, etc are never downloaded.
  */
-fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, FetchError> {
+fn fetch_html(
+    url: &str,
+    timeout: Duration,
+    max_bytes: u64,
+) -> Result<Option<(String, reqwest::Url)>, FetchError> {
     let client = reqwest::blocking::Client::builder()
-        // public gateways can take ~50s on a cache miss
-        .timeout(Duration::from_secs(90))
+        .timeout(timeout)
         .build()?;
     let response = client.get(url).send()?.error_for_status()?;
     // where the page actually is after redirects (e.g. "wiki" -> "wiki/"); links resolve against it
@@ -213,11 +208,11 @@ fn fetch_html(url: &str) -> Result<Option<(String, reqwest::Url)>, FetchError> {
     let mut body = Vec::new();
     // a body cut short (a timeout, a reset) is the gateway failing, not the page (#284)
     response
-        .take(MAX_BODY_BYTES + 1)
+        .take(max_bytes + 1)
         .read_to_end(&mut body)
         .map_err(FetchError::Body)?;
-    if body.len() as u64 > MAX_BODY_BYTES {
-        warn!("Skipping {}: larger than {} bytes", url, MAX_BODY_BYTES);
+    if body.len() as u64 > max_bytes {
+        warn!("Skipping {}: larger than {} bytes", url, max_bytes);
         return Ok(None);
     }
     Ok(Some((
@@ -311,25 +306,28 @@ pub enum Enqueued {
 }
 
 // the test fetch a worker holds for a root (#284, per root since #286): reported with
-// tested(), else handed back on drop, or counted as a failed test if the worker is panicking
+// tested(), else handed back on drop, or counted as a failed test if the worker is panicking.
+// Judged by the pause rule in use when the turn was taken
 struct TestTurn<'a> {
     pauses: &'a Pauses,
     root: String,
+    rule: PauseRule,
     reported: bool,
 }
 
 impl<'a> TestTurn<'a> {
-    fn new(pauses: &'a Pauses, root: &str) -> Self {
+    fn new(pauses: &'a Pauses, root: &str, rule: PauseRule) -> Self {
         TestTurn {
             pauses,
             root: root.to_string(),
+            rule,
             reported: false,
         }
     }
 
     fn tested(mut self, failure: Option<&str>) {
         self.reported = true;
-        self.pauses.tested(&self.root, failure);
+        self.pauses.tested(&self.root, failure, self.rule);
     }
 }
 
@@ -340,7 +338,7 @@ impl Drop for TestTurn<'_> {
         }
         if std::thread::panicking() {
             self.pauses
-                .tested(&self.root, Some("the test fetch panicked"));
+                .tested(&self.root, Some("the test fetch panicked"), self.rule);
         } else {
             self.pauses.hand_back(&self.root);
         }
@@ -359,6 +357,8 @@ pub struct IndexQueue {
     // badbits and the hand-maintained local list, checked before every enqueue and fetch
     denylist: RwLock<Denylist>,
     local_denylist: RwLock<Denylist>,
+    // unix secs when badbits was last installed, 0 before the first load
+    badbits_loaded_at: AtomicI64,
 
     // when the gateway last answered a fetch, and the error if it didn't
     last_fetch: Mutex<Option<(Instant, Result<(), String>)>>,
@@ -377,8 +377,8 @@ pub struct IndexQueue {
     purge_due: Mutex<bool>,
     purge_wake: Condvar,
 
-    // spaces out gateway requests; unset means no limit
-    throttle: OnceLock<Throttle>,
+    // spaces out gateway requests, at the gateway_requests_per_min setting
+    throttle: Throttle,
 
     // pauses a root while the gateway keeps failing on its pages (#284, per root since #286);
     // set on first use, or by a test
@@ -386,6 +386,20 @@ pub struct IndexQueue {
 
     // pages written per minute, for /status (#264)
     indexed: Rate,
+
+    // the seeds file's entries as last read, None until read; its path; and the seeds thread's
+    // wake-up, set when an admin changes a seed (#304)
+    seeds_file: Mutex<Option<Vec<Entry>>>,
+    seeds_path: OnceLock<String>,
+    seeds_due: Mutex<bool>,
+    seeds_wake: Condvar,
+
+    // the tunable settings (#304): set by main from the env, or the defaults on first use
+    settings: OnceLock<Settings>,
+
+    // a pause rule in place of the settings', for tests that need pauses under a second
+    #[cfg(test)]
+    pause_rule_for_test: OnceLock<PauseRule>,
 }
 
 impl IndexQueue {
@@ -393,14 +407,34 @@ impl IndexQueue {
         IndexQueue {
             denylist: RwLock::new(Denylist::empty()),
             local_denylist: RwLock::new(Denylist::empty()),
+            badbits_loaded_at: AtomicI64::new(0),
             last_fetch: Mutex::new(None),
             store: OnceLock::new(),
             writes: RwLock::new(()),
             purge_due: Mutex::new(false),
             purge_wake: Condvar::new(),
-            throttle: OnceLock::new(),
+            throttle: Throttle::new(),
             pauses: OnceLock::new(),
             indexed: Rate::new(),
+            seeds_file: Mutex::new(None),
+            seeds_path: OnceLock::new(),
+            seeds_due: Mutex::new(false),
+            seeds_wake: Condvar::new(),
+            settings: OnceLock::new(),
+            #[cfg(test)]
+            pause_rule_for_test: OnceLock::new(),
+        }
+    }
+
+    pub fn settings(&self) -> &Settings {
+        self.settings.get_or_init(Settings::defaults)
+    }
+
+    /// Use `settings` for this queue (call before anything reads them, and before attach_store,
+    /// which loads the stored overrides into them)
+    pub fn set_settings(&self, settings: Settings) {
+        if self.settings.set(settings).is_err() {
+            panic!("set_settings must run before the settings are first used");
         }
     }
 
@@ -442,6 +476,12 @@ impl IndexQueue {
         store.merge();
     }
 
+    /// Whether a store from DATA_DIR is attached, so settings can be saved (#304); the in-memory
+    /// one made without DATA_DIR doesn't count
+    pub fn has_persistent_store(&self) -> bool {
+        self.store.get().is_some_and(Store::is_persistent)
+    }
+
     /// Writes buffered postings to disk, for a clean shutdown
     pub fn flush_store(&self) {
         if let Some(store) = self.store.get() {
@@ -452,24 +492,62 @@ impl IndexQueue {
         }
     }
 
-    /// Limit gateway requests to `per_min` a minute across all workers (0 = no limit)
-    pub fn set_gateway_rate(&self, per_min: u32) {
-        let _ = self.throttle.set(Throttle::per_minute(per_min));
+    /// Sets `key` to `raw` by `actor` (see Settings::set) and applies it where it isn't just
+    /// read on each use
+    pub fn settings_set(&self, key: Key, raw: &str, actor: &str) -> Result<Applies, String> {
+        let applies = self.settings().set(self.store(), key, raw, actor)?;
+        self.apply_setting(key);
+        Ok(applies)
+    }
+
+    /// Drops `key`'s override (see Settings::reset) and applies the value now in use
+    pub fn settings_reset(&self, key: Key, actor: &str) -> Result<Applies, String> {
+        let applies = self.settings().reset(self.store(), key, actor)?;
+        self.apply_setting(key);
+        Ok(applies)
+    }
+
+    // the settings that are state rather than read on each use: the writer's cache size
+    fn apply_setting(&self, key: Key) {
+        if key == Key::IndexCacheMb {
+            self.apply_cache_size();
+        }
+    }
+
+    fn apply_cache_size(&self) {
+        let mb = self.settings().get(Key::IndexCacheMb) as u32;
+        if let Err(err) = self.store().set_cache_mb(mb) {
+            warn!("Couldn't set the index cache to {} MB: {}", mb, err);
+        }
     }
 
     pub(crate) fn wait_for_gateway(&self) {
-        if let Some(throttle) = self.throttle.get() {
-            throttle.wait();
-        }
+        self.throttle
+            .wait(self.settings().get(Key::GatewayRequestsPerMin) as u32);
     }
 
     pub(crate) fn pauses(&self) -> &Pauses {
         self.pauses.get_or_init(Pauses::new)
     }
 
+    /// When a root pauses and for how long, from the pause_* settings (#304)
+    pub(crate) fn pause_rule(&self) -> PauseRule {
+        #[cfg(test)]
+        if let Some(rule) = self.pause_rule_for_test.get() {
+            return *rule;
+        }
+        let settings = self.settings();
+        PauseRule {
+            window: settings.get(Key::PauseWindow) as usize,
+            failures: settings.get(Key::PauseFailures) as usize,
+            min: Duration::from_secs(settings.get(Key::PauseMinSecs)),
+            max: Duration::from_secs(settings.get(Key::PauseMaxSecs)),
+        }
+    }
+
     #[cfg(test)]
-    pub(crate) fn set_pauses_for_test(&self, pauses: Pauses) {
-        let _ = self.pauses.set(pauses);
+    pub(crate) fn set_pause_rule_for_test(&self, rule: PauseRule) {
+        let _ = self.pause_rule_for_test.set(rule);
     }
 
     /// Why the crawl is paused (#284): every root with pages queued is paused after repeated
@@ -510,6 +588,43 @@ impl IndexQueue {
                 self.store().note_error(&err);
             }
         }
+    }
+
+    /// The seeds file's entries as last read (None before the first read)
+    pub fn seeds_file(&self) -> Option<Vec<Entry>> {
+        self.seeds_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_seeds_file(&self, entries: Vec<Entry>) {
+        *self.seeds_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(entries);
+    }
+
+    /// The seeds file's path, once the seeds thread has one
+    pub fn seeds_path(&self) -> Option<&str> {
+        self.seeds_path.get().map(String::as_str)
+    }
+
+    pub fn set_seeds_path(&self, path: &str) {
+        let _ = self.seeds_path.set(path.to_string());
+    }
+
+    /// Has the seeds thread read again now, after a seed change (#304)
+    pub fn wake_seeds(&self) {
+        *self.seeds_due.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.seeds_wake.notify_all();
+    }
+
+    /// Waits up to `timeout` for wake_seeds, and takes the wake-up
+    pub fn wait_for_seeds(&self, timeout: Duration) {
+        let due = self.seeds_due.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut due, _) = self
+            .seeds_wake
+            .wait_timeout_while(due, timeout, |due| !*due)
+            .unwrap_or_else(|e| e.into_inner());
+        *due = false;
     }
 
     /// Records a name or CID for the resolver (#213); false if it's known already
@@ -555,11 +670,21 @@ impl IndexQueue {
             let mut current = self.denylist.write().unwrap();
             let added = denylist.adds_to(&current);
             *current = denylist;
+            self.badbits_loaded_at
+                .store(now_secs(), AtomicOrdering::SeqCst);
             added
         };
         if added && self.store.get().is_some() {
             self.request_purge();
         }
+    }
+
+    /// How many entries the badbits list has and when it was installed (unix secs, 0 if never)
+    pub fn badbits_summary(&self) -> (usize, i64) {
+        (
+            self.denylist.read().unwrap().len(),
+            self.badbits_loaded_at.load(AtomicOrdering::SeqCst),
+        )
     }
 
     /// Same as set_denylist, for the local takedown list
@@ -587,7 +712,6 @@ impl IndexQueue {
         &self,
         dir: &std::path::Path,
         cache_mb: u32,
-        max_age_secs: i64,
     ) -> Result<(usize, usize), OpenError> {
         let open = |verify: bool| -> Result<_, OpenError> {
             let store = if verify {
@@ -595,7 +719,7 @@ impl IndexQueue {
             } else {
                 Store::open(dir, cache_mb)?
             };
-            Ok(self.attach_store(store, max_age_secs)?)
+            Ok(self.attach_store(store)?)
         };
         let verify = check_marked_damage(dir)?;
         match open(verify) {
@@ -635,16 +759,16 @@ impl IndexQueue {
      * index was down are hidden by search's check and erased by the purge queued here; expiry
      * runs from main. Returns the pages and queued items there are.
      */
-    pub fn attach_store(
-        &self,
-        store: Store,
-        _max_age_secs: i64,
-    ) -> rusqlite::Result<(usize, usize)> {
+    pub fn attach_store(&self, store: Store) -> rusqlite::Result<(usize, usize)> {
         // the startup upkeep (erasures a crash cut short, #249) ran in Store::open
         let counts = (store.page_count(), store.queue_len());
+        // the admin overrides (#304) are kept in the index file
+        self.settings().load(&store);
         if self.store.set(store).is_err() {
             panic!("attach_store must run before the store is first used");
         }
+        // an override may differ from the size the store was opened with
+        self.apply_cache_size();
         self.request_purge();
         Ok(counts)
     }
@@ -903,7 +1027,7 @@ impl IndexQueue {
             || self.local_denylist.read().unwrap().is_blocked(item)
     }
 
-    fn is_blocked(&self, item: &str) -> bool {
+    pub(crate) fn is_blocked(&self, item: &str) -> bool {
         let blocked = self.denylist.read().unwrap().is_blocked(item)
             || self.local_denylist.read().unwrap().is_blocked(item);
         if blocked {
@@ -1088,15 +1212,6 @@ impl IndexQueue {
         (total, results.collect())
     }
 
-    pub fn start(&self, gateway: String) {
-        loop {
-            if !self.process_next(&gateway) {
-                // idle workers spun at 100% CPU each (#224)
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
-
     /// Fetch and index the next queued item; false if it took none (nothing queued outside the
     /// roots paused while the gateway keeps failing on them)
     pub fn process_next(&self, gateway: &str) -> bool {
@@ -1118,7 +1233,9 @@ impl IndexQueue {
         };
         match test {
             Some(test) => test.tested(failure),
-            None => self.pauses().record(root_of(&item), failure),
+            None => self
+                .pauses()
+                .record(root_of(&item), failure, self.pause_rule()),
         }
         match fetched {
             // a mirror's links lead to more of the mirror: the original's were followed
@@ -1151,7 +1268,7 @@ impl IndexQueue {
         match self.pauses().permit(root) {
             Permit::Go => Some((next, None)),
             Permit::Test => {
-                let turn = TestTurn::new(self.pauses(), root);
+                let turn = TestTurn::new(self.pauses(), root, self.pause_rule());
                 Some((next, Some(turn)))
             }
             Permit::Wait => {
@@ -1164,10 +1281,11 @@ impl IndexQueue {
         }
     }
 
-    // a page the gateway failed on goes to the back of the queue, until MAX_ATTEMPTS (#284)
+    // a page the gateway failed on goes to the back of the queue, until it has failed
+    // page_attempts times in all (#284, #304)
     fn retry(&self, item: &str, attempts: u32, err: &str) {
         let attempts = attempts + 1;
-        if attempts >= MAX_ATTEMPTS {
+        if u64::from(attempts) >= self.settings().get(Key::PageAttempts) {
             warn!("Dropping {} after {} attempts: {}", item, attempts, err);
             return;
         }
@@ -1181,6 +1299,16 @@ impl IndexQueue {
         }
     }
 
+    // fetch_html with the page_timeout_secs and page_max_bytes settings (#304)
+    fn fetch_page(&self, url: &str) -> Result<Option<(String, reqwest::Url)>, FetchError> {
+        let settings = self.settings();
+        fetch_html(
+            url,
+            Duration::from_secs(settings.get(Key::PageTimeoutSecs)),
+            settings.get(Key::PageMaxBytes),
+        )
+    }
+
     /**
      * Use the http client to obtain the page from the ipfs gateway: the page and its links,
      * nothing to index, or a gateway error to retry (#284)
@@ -1190,7 +1318,7 @@ impl IndexQueue {
         debug!("Retrieving {}", url);
         self.wait_for_gateway();
         let fetch_start = Instant::now();
-        let fetched = fetch_html(&url);
+        let fetched = self.fetch_page(&url);
         debug!("Fetched {} in {:?}", cid, fetch_start.elapsed());
         let health = match &fetched {
             Err(err) if is_gateway_error(err) => Err(err.to_string()),
@@ -1257,7 +1385,7 @@ impl IndexQueue {
                     return None;
                 }
                 self.wait_for_gateway();
-                return match fetch_html(&newurl) {
+                return match self.fetch_page(&newurl) {
                     Ok(Some((html, final_url))) => {
                         Some((fullcid, Html::parse_document(html.as_str()), final_url))
                     }
@@ -1407,7 +1535,7 @@ mod tests {
     fn root_counts_hide_a_takedown_before_the_purge() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test(); // the one attach_store queued
         queue.persist(BAD, &page(BAD, "secret title", &[]));
@@ -1499,12 +1627,12 @@ mod tests {
     #[test]
     fn throttle_spaces_requests_across_threads() {
         // 600/min = one request per 100ms; four requests from four threads span >= 300ms
-        let throttle = std::sync::Arc::new(Throttle::per_minute(600));
+        let throttle = std::sync::Arc::new(Throttle::new());
         let start = Instant::now();
         let threads: Vec<_> = (0..4)
             .map(|_| {
                 let throttle = std::sync::Arc::clone(&throttle);
-                std::thread::spawn(move || throttle.wait())
+                std::thread::spawn(move || throttle.wait(600))
             })
             .collect();
         threads.into_iter().for_each(|t| t.join().unwrap());
@@ -1515,16 +1643,35 @@ mod tests {
 
     #[test]
     fn unlimited_throttle_never_waits() {
-        let throttle = Throttle::per_minute(0);
+        let throttle = Throttle::new();
         let start = Instant::now();
-        (0..1000).for_each(|_| throttle.wait());
+        (0..1000).for_each(|_| throttle.wait(0));
         assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn throttle_follows_the_rate_it_is_given() {
+        let throttle = Throttle::new();
+        let start = Instant::now();
+        throttle.wait(0);
+        assert!(start.elapsed() < Duration::from_millis(50));
+        // 600/min: the second wait is a slot of 100ms after the first
+        throttle.wait(600);
+        throttle.wait(600);
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
     fn page_fetches_go_through_the_throttle() {
         let queue = IndexQueue::new();
-        queue.set_gateway_rate(300); // one request per 200ms
+        // one request per 200ms
+        queue
+            .settings_set(Key::GatewayRequestsPerMin, "300", "test")
+            .unwrap();
         let start = Instant::now();
         for _ in 0..3 {
             let gateway = serve_once("text/html", b"<title>t</title>".to_vec())
@@ -1540,11 +1687,18 @@ mod tests {
         );
     }
 
+    // the page_timeout_secs and page_max_bytes defaults
+    const TIMEOUT: Duration = Duration::from_secs(90);
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+
     #[test]
     fn fetch_html_returns_html() {
         let url = serve_once("text/html; charset=utf-8", b"<title>hi</title>".to_vec());
         assert_eq!(
-            fetch_html(&url).unwrap().map(|(body, _)| body).as_deref(),
+            fetch_html(&url, TIMEOUT, MAX_BYTES)
+                .unwrap()
+                .map(|(body, _)| body)
+                .as_deref(),
             Some("<title>hi</title>")
         );
     }
@@ -1552,13 +1706,15 @@ mod tests {
     #[test]
     fn fetch_html_skips_non_html() {
         let url = serve_once("image/png", vec![0x89, b'P', b'N', b'G']);
-        assert_eq!(fetch_html(&url).unwrap(), None);
+        assert_eq!(fetch_html(&url, TIMEOUT, MAX_BYTES).unwrap(), None);
     }
 
     #[test]
-    fn fetch_html_skips_oversized_body() {
-        let url = serve_once("text/html", vec![b'a'; MAX_BODY_BYTES as usize + 1]);
-        assert_eq!(fetch_html(&url).unwrap(), None);
+    fn a_page_over_the_limit_is_skipped() {
+        let url = serve_once("text/html", vec![b'a'; 100]);
+        assert!(fetch_html(&url, TIMEOUT, 100).unwrap().is_some());
+        let url = serve_once("text/html", vec![b'a'; 101]);
+        assert_eq!(fetch_html(&url, TIMEOUT, 100).unwrap(), None);
     }
 
     #[test]
@@ -1568,7 +1724,7 @@ mod tests {
             "text/html",
             b"<p>slow down</p>".to_vec(),
         );
-        assert!(fetch_html(&url).is_err());
+        assert!(fetch_html(&url, TIMEOUT, MAX_BYTES).is_err());
     }
 
     #[test]
@@ -1578,7 +1734,7 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        assert!(fetch_html(&format!("http://127.0.0.1:{}/", port)).is_err());
+        assert!(fetch_html(&format!("http://127.0.0.1:{}/", port), TIMEOUT, MAX_BYTES).is_err());
     }
 
     use crate::store::tests::{page, temp_dir};
@@ -1595,9 +1751,7 @@ mod tests {
     fn a_takedown_hides_the_page_at_once_and_erases_it_from_every_file() {
         let dir = temp_dir("takedown-segments");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(BAD, &page(BAD, "t", &[("zzqxsegmentterm91", 2)]));
         queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
         queue.flush_for_test();
@@ -1621,9 +1775,7 @@ mod tests {
     fn a_takedown_of_an_old_versions_redirected_cid_erases_it() {
         let dir = temp_dir("takedown-version");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         // GOOD's item once redirected to BAD's cid; it now resolves elsewhere
         let old = page(BAD, "t", &[("zzqxredirectterm", 1)]); // its cid is BAD
         queue.persist(GOOD, &old);
@@ -1652,9 +1804,7 @@ mod tests {
     fn expiry_erases_old_versions_of_a_current_page() {
         let dir = temp_dir("expire-version");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(GOOD, &page(GOOD, "t", &[("zzqxoldversionterm", 1)]));
         for i in 0..5 {
             let item = format!("{}/other{}", GOOD, i);
@@ -1736,12 +1886,51 @@ mod tests {
         drop(store);
         let queue = IndexQueue::new();
         assert_eq!(
-            queue
-                .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-                .unwrap(),
+            queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap(),
             (1, 1)
         );
         assert_eq!(queue.search("alpha", 0, 10).1.len(), 1);
+    }
+
+    // the admin overrides live in index.sqlite (#304), so they come back with the store
+    #[test]
+    fn attach_store_loads_the_settings_overrides() {
+        use crate::settings::{Key, Settings};
+        let dir = temp_dir("attach-settings");
+        let store = Store::open(&dir, 0).unwrap();
+        Settings::defaults()
+            .set(&store, Key::CrawlWorkers, "42", "a@b")
+            .unwrap();
+        drop(store);
+        let queue = IndexQueue::new();
+        queue.set_settings(Settings::defaults());
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
+        assert_eq!(queue.settings().get(Key::CrawlWorkers), 42);
+    }
+
+    // the stored override differs from the cache size the store was opened with
+    #[test]
+    fn attach_store_applies_the_stored_cache_size() {
+        use crate::settings::Settings;
+        let dir = temp_dir("attach-cache");
+        let store = Store::open(&dir, 0).unwrap();
+        Settings::defaults()
+            .set(&store, Key::IndexCacheMb, "64", "a@b")
+            .unwrap();
+        drop(store);
+        let queue = IndexQueue::new();
+        queue.set_settings(Settings::defaults());
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
+        assert_eq!(queue.store().cache_size_for_test(), -65536);
+    }
+
+    #[test]
+    fn settings_set_reapplies_the_cache_size() {
+        let queue = IndexQueue::new();
+        queue.settings_set(Key::IndexCacheMb, "64", "test").unwrap();
+        assert_eq!(queue.store().cache_size_for_test(), -65536);
+        queue.settings_reset(Key::IndexCacheMb, "test").unwrap();
+        assert_eq!(queue.store().cache_size_for_test(), -1024 * 1024);
     }
 
     #[test]
@@ -1801,7 +1990,7 @@ mod tests {
         )
         .unwrap();
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "garbagetext");
     }
 
@@ -1826,13 +2015,13 @@ mod tests {
         assert!(std::fs::metadata(&file).unwrap().len() > 3 * 4096);
         damage(&file, 2 * 4096);
         let err = Store::open(&dir, 0)
-            .and_then(|s| Ok(IndexQueue::new().attach_store(s, 30 * DAY)?))
+            .and_then(|s| Ok(IndexQueue::new().attach_store(s)?))
             .err()
             .expect("the damage is noticed");
         assert!(store::is_corrupt(&*err), "{}", err);
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "damagedtitle");
     }
 
@@ -1883,7 +2072,7 @@ mod tests {
         .unwrap();
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "markedtitle");
         assert!(
             !store::damage_marker(&dir).exists(),
@@ -1902,7 +2091,7 @@ mod tests {
         .unwrap();
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (400, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (400, 0));
         assert!(!store::damage_marker(&dir).exists(), "the marker goes");
         assert_eq!(queue.search("shared", 0, 10).0.n, 400, "and is searched");
     }
@@ -1911,7 +2100,7 @@ mod tests {
     fn open_store_wipes_an_index_with_a_damaged_segment() {
         let dir = temp_dir("wipe-segment");
         let queue = IndexQueue::new();
-        queue.open_store(&dir, 0, 30 * DAY).unwrap();
+        queue.open_store(&dir, 0).unwrap();
         queue.persist(BAD, &page(BAD, "t", &[("segmenttext77", 1)]));
         queue.flush_for_test();
         drop(queue);
@@ -1923,7 +2112,7 @@ mod tests {
         damage(&segment, 16);
 
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "segmenttext77");
     }
 
@@ -1931,7 +2120,7 @@ mod tests {
     fn a_segment_the_background_check_fails_is_marked_and_the_next_start_wipes_it() {
         let dir = temp_dir("verify-segment");
         let queue = IndexQueue::new();
-        queue.open_store(&dir, 0, 30 * DAY).unwrap();
+        queue.open_store(&dir, 0).unwrap();
         queue.persist(GOOD, &page(GOOD, "t", &[("checkedtext77", 1)]));
         queue.flush_for_test();
         drop(queue);
@@ -1940,7 +2129,7 @@ mod tests {
 
         // opening doesn't read it whole: the index opens and serves
         let queue = IndexQueue::new();
-        queue.open_store(&dir, 0, 30 * DAY).unwrap();
+        queue.open_store(&dir, 0).unwrap();
         assert_eq!(queue.search("checkedtext77", 0, 10).1.len(), 1);
         assert_eq!(queue.damage(), None);
         queue.verify_store();
@@ -1957,7 +2146,7 @@ mod tests {
 
         // the marker has the next start check every file
         let queue = IndexQueue::new();
-        assert_eq!(queue.open_store(&dir, 0, 30 * DAY).unwrap(), (0, 0));
+        assert_eq!(queue.open_store(&dir, 0).unwrap(), (0, 0));
         assert_wiped_and_working(&queue, &dir, "checkedtext77");
         assert!(!store::damage_marker(&dir).exists());
     }
@@ -1974,16 +2163,13 @@ mod tests {
                  INSERT INTO pages VALUES (1, 'bafyA', 'bafyA', 'oldformattitle', 'e', 5);",
             )
             .unwrap();
-        let err = IndexQueue::new()
-            .open_store(&dir, 0, 30 * DAY)
-            .err()
-            .unwrap();
+        let err = IndexQueue::new().open_store(&dir, 0).err().unwrap();
         assert!(err.is::<store::OldFormat>(), "{}", err);
         assert!(dir_has(&dir, "oldformattitle"), "kept for the operator");
 
         let file = dir.join("a-file");
         std::fs::write(&file, b"keepme").unwrap();
-        assert!(IndexQueue::new().open_store(&file, 0, 30 * DAY).is_err());
+        assert!(IndexQueue::new().open_store(&file, 0).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"keepme");
     }
 
@@ -1992,9 +2178,7 @@ mod tests {
         let dir = temp_dir("attach");
         seed(&dir, &[(GOOD, "goodtitle", now_secs())]);
         let queue = IndexQueue::new();
-        let (pages, queued) = queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        let (pages, queued) = queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert_eq!((pages, queued), (1, 0));
         assert_eq!(queue.search("goodtitle", 0, usize::MAX).1.len(), 1);
         assert_eq!(queue.search("shared", 0, usize::MAX).1.len(), 1);
@@ -2018,9 +2202,7 @@ mod tests {
         let queue = IndexQueue::new();
         // local takedown list loaded before attach, as main.rs does
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.purge_for_test(); // the one attach_store queued
         assert_eq!(queue.expire(30 * DAY), 1);
         assert_eq!(queue.index_length(), 1);
@@ -2040,9 +2222,7 @@ mod tests {
             ],
         );
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert!(file_has(&dir, "purgetitle"));
 
         queue.set_denylist(Denylist::parse(&format!("{}\n", BAD)));
@@ -2057,9 +2237,7 @@ mod tests {
         let dir = temp_dir("expire");
         seed(&dir, &[(GOOD, "agingtitle", now_secs() - 10 * DAY)]);
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert_eq!(queue.expire(30 * DAY), 0);
         assert_eq!(queue.expire(5 * DAY), 1);
         assert_eq!(queue.index_length(), 0);
@@ -2070,9 +2248,7 @@ mod tests {
     fn crawled_pages_are_persisted_but_not_if_blocked_meanwhile() {
         let dir = temp_dir("crawl");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(GOOD, &page(GOOD, "crawledtitle", &[]));
         assert!(file_has(&dir, "crawledtitle"));
 
@@ -2087,9 +2263,7 @@ mod tests {
         // review #1: a worker that checked against the OLD list must not write after the purge
         let dir = temp_dir("race");
         let queue = std::sync::Arc::new(IndexQueue::new());
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
 
         let swap = queue.writes.write().unwrap(); // a setter is mid swap+purge
         let worker = {
@@ -2112,9 +2286,7 @@ mod tests {
         let seed = SEED_CIDS[0];
         seed_rows(&dir, seed, now_secs() - 40 * DAY);
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 50 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert_eq!(queue.reseed(), 0, "seed already indexed: nothing queued");
         assert_eq!(queue.expire(30 * DAY), 1);
         assert_eq!(queue.reseed(), 1, "seed queued again so the crawl restarts");
@@ -2198,9 +2370,7 @@ mod tests {
         // #220: per-page counts duplicated the inverted index in RAM and bloated /search output
         let dir = temp_dir("counts");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 3)]));
         let (_, results) = queue.search("alpha", 0, usize::MAX);
         assert_eq!(results.len(), 1, "still searchable");
@@ -2215,7 +2385,7 @@ mod tests {
         // and after a reload: searchable
         let reloaded = IndexQueue::new();
         reloaded
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
+            .attach_store(Store::open(&dir, 0).unwrap())
             .unwrap();
         assert_eq!(reloaded.search("alpha", 0, usize::MAX).1.len(), 1);
     }
@@ -2417,7 +2587,7 @@ mod tests {
     // 16 gateway errors pause a root (#284's rule, per root since #286)
     fn trip(queue: &IndexQueue, root: &str) {
         for _ in 0..16 {
-            queue.pauses().record(root, Some("504"));
+            queue.pauses().record(root, Some("504"), queue.pause_rule());
         }
     }
 
@@ -2448,6 +2618,40 @@ mod tests {
         ));
         assert!(queue.process_next(&gateway));
         assert_eq!(queue.queue_length(), 0);
+    }
+
+    #[test]
+    fn a_page_is_dropped_after_the_configured_attempts() {
+        let queue = IndexQueue::new();
+        queue.settings_set(Key::PageAttempts, "1", "test").unwrap();
+        queue.enqueue(format!("{}/wiki/A", GOOD));
+        let gateway = gateway_of(serve_status_once(
+            "504 Gateway Timeout",
+            "text/plain",
+            b"x".to_vec(),
+        ));
+        assert!(queue.process_next(&gateway));
+        assert_eq!(queue.queue_length(), 0);
+    }
+
+    #[test]
+    fn the_pause_rule_follows_the_settings() {
+        let queue = IndexQueue::new();
+        assert_eq!(queue.pause_rule(), PauseRule::DEFAULT);
+        // failures first: it may not exceed the window
+        queue.settings_set(Key::PauseFailures, "3", "test").unwrap();
+        queue.settings_set(Key::PauseWindow, "4", "test").unwrap();
+        queue.settings_set(Key::PauseMinSecs, "10", "test").unwrap();
+        queue.settings_set(Key::PauseMaxSecs, "25", "test").unwrap();
+        assert_eq!(
+            queue.pause_rule(),
+            PauseRule {
+                window: 4,
+                failures: 3,
+                min: Duration::from_secs(10),
+                max: Duration::from_secs(25),
+            }
+        );
     }
 
     #[test]
@@ -2495,10 +2699,11 @@ mod tests {
     #[test]
     fn a_test_turn_with_nothing_to_fetch_is_handed_back() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(10),
-            Duration::from_millis(40),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(40),
+            ..PauseRule::DEFAULT
+        });
         queue.enqueue(format!("{}/wiki/Blocked", GOOD));
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", GOOD)));
         trip(&queue, GOOD);
@@ -2518,10 +2723,11 @@ mod tests {
     #[test]
     fn a_test_fetch_that_panics_pauses_again_instead_of_stalling_the_crawl() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(10),
-            Duration::from_millis(40),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(40),
+            ..PauseRule::DEFAULT
+        });
         trip(&queue, GOOD);
         std::thread::sleep(Duration::from_millis(15));
         queue.enqueue(format!("{}/wiki/Bad", GOOD));
@@ -2572,10 +2778,11 @@ mod tests {
     fn the_crawl_pauses_while_the_gateway_fails_and_loses_no_pages() {
         use std::sync::atomic::Ordering;
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(50),
-            Duration::from_millis(200),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(50),
+            max: Duration::from_millis(200),
+            ..PauseRule::DEFAULT
+        });
         let items: Vec<String> = (0..20).map(|i| format!("{}/wiki/P{}", GOOD, i)).collect();
         queue.enqueue_many(items);
         let (gateway, up, hits) = serve_flaky();
@@ -2611,10 +2818,6 @@ mod tests {
     #[test]
     fn one_failing_root_does_not_stop_the_others() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-        ));
         let good: Vec<String> = (0..20).map(|i| format!("{}/wiki/P{}", GOOD, i)).collect();
         let qm: Vec<String> = (0..5).map(|i| format!("{}/wiki/P{}", QM, i)).collect();
         queue.enqueue_many(good);
@@ -2649,10 +2852,6 @@ mod tests {
     #[test]
     fn every_root_failing_pauses_the_crawl() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_secs(60),
-            Duration::from_secs(900),
-        ));
         let items: Vec<String> = (0..16)
             .flat_map(|i| {
                 [
@@ -2683,10 +2882,11 @@ mod tests {
     #[test]
     fn a_page_whose_test_was_taken_goes_back_in_place() {
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(10),
-            Duration::from_millis(40),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(40),
+            ..PauseRule::DEFAULT
+        });
         let (a, b) = (format!("{}/wiki/A", GOOD), format!("{}/wiki/B", GOOD));
         assert!(queue.store().queue_retry(&a, 2).unwrap());
         queue.enqueue(b.clone());
@@ -2703,10 +2903,11 @@ mod tests {
     fn a_resumed_root_crawls_again() {
         use std::sync::atomic::Ordering;
         let queue = IndexQueue::new();
-        queue.set_pauses_for_test(Pauses::with(
-            Duration::from_millis(10),
-            Duration::from_millis(40),
-        ));
+        queue.set_pause_rule_for_test(PauseRule {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(40),
+            ..PauseRule::DEFAULT
+        });
         queue.enqueue(format!("{}/wiki/A", GOOD));
         trip(&queue, GOOD);
         assert_eq!(queue.paused_roots(), 1);
@@ -2734,9 +2935,7 @@ mod tests {
     fn the_frontier_survives_a_restart() {
         let dir = temp_dir("frontier");
         let first = IndexQueue::new();
-        first
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        first.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         first.enqueue_many(vec![
             format!("{}/wiki/A", GOOD),
             format!("{}/wiki/B", GOOD),
@@ -2755,9 +2954,7 @@ mod tests {
 
         let second = IndexQueue::new();
         second.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
-        second
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        second.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         // all of it, in order (#231): an indexed item is fetched again, as a recrawl would
         assert_eq!(
             Store::open(&dir, 0).unwrap().queue_load().unwrap(),
@@ -2779,9 +2976,7 @@ mod tests {
     fn processed_items_leave_the_saved_frontier() {
         let dir = temp_dir("processed");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.enqueue(GOOD.to_string());
         let gateway = serve_once(
             "text/html",
@@ -2816,9 +3011,7 @@ mod tests {
     fn a_mirror_of_an_indexed_page_is_neither_indexed_nor_followed() {
         let dir = temp_dir("mirrors");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         let (original, mirror) = (format!("{}/wiki/A", GOOD), format!("{}/wiki/A", BAD));
         // the same text; the links (attributes, not text) differ
         let links = crawl(
@@ -2861,9 +3054,7 @@ mod tests {
         // remembered across a restart, and expires with the original
         drop(queue);
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         assert_eq!((queue.index_length(), queue.mirror_length()), (3, 1));
         // indexed this second: a cutoff just past now
         assert_eq!(queue.expire(-1), 3);
@@ -2895,9 +3086,7 @@ mod tests {
     fn takedowns_drop_mirrors() {
         let dir = temp_dir("mirrortakedown");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         let hashed = |item: &str| page(item, "t", &[]).with_text_hash(b"h".to_vec());
         let (good_b, bad_b) = (format!("{}/b", GOOD), format!("{}/b", BAD));
         assert!(queue.persist(GOOD, &hashed(GOOD)));
@@ -2930,9 +3119,7 @@ mod tests {
         }
         let queue = IndexQueue::new();
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.purge_for_test(); // the one attach_store queued
         assert_eq!((queue.index_length(), queue.mirror_length()), (1, 0));
         assert!(!file_has(&dir, &bad_b));
@@ -2942,9 +3129,7 @@ mod tests {
     fn store_write_failure_does_not_panic() {
         let dir = temp_dir("fail");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         // e.g. disk full / read-only remount
         queue.store.get().unwrap().break_for_test();
         // upsert fails: logs, doesn't panic, and its links are still followed
@@ -2960,9 +3145,7 @@ mod tests {
         let dir = temp_dir("expire-fails");
         seed(&dir, &[(GOOD, "agingtitle", now_secs() - 10 * DAY)]);
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         // finding the old pages works, deleting them doesn't
         queue.store.get().unwrap().drop_table_for_test("mirrors");
         assert_eq!(queue.expire(5 * DAY), 0);
@@ -3140,9 +3323,7 @@ mod tests {
         // they used to linger in the in-memory index, only filtered out at search time
         let dir = temp_dir("purge-postings");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.persist(
             GOOD,
             &page(GOOD, "t", &[("takedownword", 1), ("shared", 1)]),
@@ -3197,9 +3378,7 @@ mod tests {
         };
         let attached = |dir: &std::path::Path| {
             let queue = IndexQueue::new();
-            queue
-                .attach_store(Store::open(dir, 0).unwrap(), 30 * DAY)
-                .unwrap();
+            queue.attach_store(Store::open(dir, 0).unwrap()).unwrap();
             queue
         };
         let segments = |queue: &IndexQueue| queue.store.get().unwrap().segment_count();
@@ -3242,7 +3421,7 @@ mod tests {
     fn an_unchanged_local_list_queues_no_purge() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test(); // the one attach_store queued
         let list = format!("{}\n", BAD);
@@ -3260,9 +3439,7 @@ mod tests {
     fn a_takedown_is_hidden_at_once_and_erased_by_the_purge() {
         let dir = temp_dir("purge-erases");
         let queue = IndexQueue::new();
-        queue
-            .attach_store(Store::open(&dir, 0).unwrap(), 30 * DAY)
-            .unwrap();
+        queue.attach_store(Store::open(&dir, 0).unwrap()).unwrap();
         queue.purge_for_test();
         queue.persist(BAD, &page(BAD, "t", &[("zzqxpurgeterm", 1)]));
         queue.flush_for_test();
@@ -3285,7 +3462,7 @@ mod tests {
     fn undeny_before_the_purge_keeps_the_page() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test();
         queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
@@ -3300,7 +3477,7 @@ mod tests {
     fn a_denylist_change_during_a_purge_runs_another() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         // the purge thread has taken the due flag and is scanning...
         assert!(queue.take_purge_due());
@@ -3316,7 +3493,7 @@ mod tests {
     fn a_purge_the_store_fails_queues_another_round() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test(); // the one attach_store queued
         queue.persist(BAD, &page(BAD, "t", &[("alpha", 1)]));
@@ -3333,7 +3510,7 @@ mod tests {
     fn a_purge_whose_old_versions_fail_to_read_queues_another_round() {
         let queue = IndexQueue::new();
         queue
-            .attach_store(Store::open_in_memory().unwrap(), 30 * DAY)
+            .attach_store(Store::open_in_memory().unwrap())
             .unwrap();
         queue.purge_for_test(); // the one attach_store queued
         queue.persist(GOOD, &page(GOOD, "t", &[("alpha", 1)]));
@@ -3380,5 +3557,19 @@ mod tests {
         queue.set_local_denylist(Denylist::parse(&format!("{}\n", BAD)));
         queue.purge_for_test();
         assert_eq!(queue.index_length(), 0);
+    }
+
+    #[test]
+    fn badbits_summary_counts_and_dates_the_list() {
+        let queue = IndexQueue::new();
+        assert_eq!(queue.badbits_summary(), (0, 0));
+        let before = now_secs();
+        queue.set_denylist(Denylist::parse(&format!("//{}\n", "ab".repeat(32))));
+        let (entries, loaded_at) = queue.badbits_summary();
+        assert_eq!(entries, 1);
+        assert!(loaded_at >= before && loaded_at <= now_secs());
+        // the local list isn't counted
+        queue.set_local_denylist(Denylist::parse(&format!("//{}\n", "cd".repeat(32))));
+        assert_eq!(queue.badbits_summary().0, 1);
     }
 }

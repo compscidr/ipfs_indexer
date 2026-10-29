@@ -3,14 +3,11 @@
  * own, and the others crawl on. A root's breaker is made on its first outcome and dropped
  * once it is closed and the root has nothing queued; an open one always stays.
  */
-use crate::breaker::{Breaker, Permit, MAX_PAUSE, MIN_PAUSE};
+use crate::breaker::{Breaker, PauseRule, Permit};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
 
 pub struct Pauses {
-    min: Duration,
-    max: Duration,
     breakers: Mutex<HashMap<String, Breaker>>,
     // the most recent failure recorded or tested on any root
     last_error: Mutex<String>,
@@ -18,13 +15,7 @@ pub struct Pauses {
 
 impl Pauses {
     pub fn new() -> Pauses {
-        Pauses::with(MIN_PAUSE, MAX_PAUSE)
-    }
-
-    pub fn with(min: Duration, max: Duration) -> Pauses {
         Pauses {
-            min,
-            max,
             breakers: Mutex::new(HashMap::new()),
             last_error: Mutex::new(String::new()),
         }
@@ -48,20 +39,20 @@ impl Pauses {
         }
     }
 
-    /// A Go fetch's outcome: Some(error) for a gateway error
-    pub fn record(&self, root: &str, failure: Option<&str>) {
+    /// A Go fetch's outcome: Some(error) for a gateway error, judged by `rule`
+    pub fn record(&self, root: &str, failure: Option<&str>, rule: PauseRule) {
         self.note(failure);
         self.breakers()
             .entry(root.to_string())
-            .or_insert_with(|| Breaker::named(root, self.min, self.max))
-            .record(failure);
+            .or_insert_with(|| Breaker::named(root))
+            .record(failure, rule);
     }
 
-    /// The test fetch's outcome
-    pub fn tested(&self, root: &str, failure: Option<&str>) {
+    /// The test fetch's outcome, judged by `rule`
+    pub fn tested(&self, root: &str, failure: Option<&str>, rule: PauseRule) {
         self.note(failure);
         if let Some(b) = self.breakers().get(root) {
-            b.tested(failure);
+            b.tested(failure, rule);
         }
     }
 
@@ -128,16 +119,23 @@ impl Pauses {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::breaker::Permit;
+    use crate::breaker::{PauseRule, Permit};
     use std::time::Duration;
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
 
+    // the default rule with short pauses
+    const RULE: PauseRule = PauseRule {
+        min: Duration::from_millis(50),
+        max: Duration::from_millis(200),
+        ..PauseRule::DEFAULT
+    };
+
     fn trip(pauses: &Pauses, root: &str) {
-        for _ in 0..16 {
-            pauses.record(root, Some("504"));
+        for _ in 0..RULE.failures {
+            pauses.record(root, Some("504"), RULE);
         }
     }
 
@@ -147,7 +145,7 @@ mod tests {
 
     #[test]
     fn a_failing_root_pauses_only_itself() {
-        let pauses = Pauses::with(ms(50), ms(200));
+        let pauses = Pauses::new();
         trip(&pauses, "a");
         assert_eq!(pauses.skip(), roots(&["a"]));
         assert_eq!(pauses.permit("b"), Permit::Go);
@@ -156,7 +154,7 @@ mod tests {
 
     #[test]
     fn a_root_due_for_its_test_is_not_skipped() {
-        let pauses = Pauses::with(ms(50), ms(200));
+        let pauses = Pauses::new();
         trip(&pauses, "a");
         std::thread::sleep(ms(55));
         assert!(pauses.skip().is_empty());
@@ -166,7 +164,7 @@ mod tests {
 
     #[test]
     fn crawl_paused_only_when_every_queued_root_is_paused() {
-        let pauses = Pauses::with(ms(50), ms(200));
+        let pauses = Pauses::new();
         trip(&pauses, "a");
         assert_eq!(pauses.crawl_paused(&roots(&["a", "b"])), None);
         let text = pauses.crawl_paused(&roots(&["a"])).unwrap();
@@ -180,9 +178,9 @@ mod tests {
 
     #[test]
     fn prune_drops_closed_idle_roots() {
-        let pauses = Pauses::with(ms(50), ms(200));
-        pauses.record("a", None);
-        pauses.record("b", None);
+        let pauses = Pauses::new();
+        pauses.record("a", None, RULE);
+        pauses.record("b", None, RULE);
         pauses.prune(&roots(&["b"]));
         assert_eq!(pauses.paused_count(), 0);
         assert_eq!(pauses.len(), 1);
@@ -190,7 +188,7 @@ mod tests {
 
     #[test]
     fn prune_keeps_open_breakers() {
-        let pauses = Pauses::with(ms(50), ms(200));
+        let pauses = Pauses::new();
         trip(&pauses, "a");
         pauses.prune(&[]);
         assert_eq!(pauses.permit("a"), Permit::Wait);
