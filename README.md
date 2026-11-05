@@ -134,7 +134,12 @@ Set `DATA_DIR` to keep the index across restarts: pages, mirrors and the crawl q
 
 Production (ubuntu-cube, with the index on its NVMe) is deployed by the `ipfs_indexer` role in [compscidr/iac](https://github.com/compscidr/iac).
 
-To release: bump `version` in `Cargo.toml`, merge, then push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). That publishes `ghcr.io/compscidr/ipfs_indexer:v0.2.0`; set `ipfs_indexer_version` in the iac role to the tag and deploy.
+To release, do all of these steps. A tag on its own builds the image but doesn't make a release:
+
+1. Bump `version` in `Cargo.toml` and merge.
+2. Push a matching tag: `git tag v0.2.0 && git push origin v0.2.0`. That publishes `ghcr.io/compscidr/ipfs_indexer:v0.2.0`.
+3. Publish a GitHub release for the tag, with a short summary and anything to know before upgrading: `gh release create v0.2.0 --verify-tag --generate-notes --notes-start-tag v0.1.0 --notes-file notes.md`. Use the previous version for `--notes-start-tag`.
+4. Set `ipfs_indexer_version` in the iac role to the tag, and deploy.
 
 ## Development
 CI runs `cargo fmt --all -- --check && cargo test`, then a release build. Run the same before opening a PR. Ideas and planned work live in the [issues](https://github.com/compscidr/ipfs_indexer/issues).
