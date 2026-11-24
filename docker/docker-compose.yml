@@ -15,7 +15,7 @@ services:
         || test -f /denylists/badbits.deny
   ipfs:
     container_name: ipfs
-    image: ipfs/kubo:v0.43.1
+    image: ipfs/kubo:v0.43.2
     restart: always
     # --enable-gc: drop cached blocks once Datastore.StorageMax is reached
     command: ["daemon", "--migrate=true", "--agent-version-suffix=docker", "--enable-gc"]
